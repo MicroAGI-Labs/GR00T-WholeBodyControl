@@ -6,6 +6,7 @@
 #include <mutex>
 #include <sstream>
 #include <array>
+#include <chrono>
 #include <nlohmann/json.hpp>
 #include "PXREARobotSDK.h"
 
@@ -57,6 +58,20 @@ bool RightSecondaryButton;
 
 int64_t TimeStampNs;
 
+// --- Connection / device-event telemetry (for diagnosing freezes) ---
+// Monotonic clock so we can compute "seconds since" robustly.
+using steady_clock = std::chrono::steady_clock;
+bool ConnConnected = false;                 // true after DeviceFind, false after DeviceMissing
+int64_t ConnFindCount = 0;                  // number of PXREADeviceFind events
+int64_t ConnMissingCount = 0;               // number of PXREADeviceMissing events
+bool ConnHasFind = false;                   // whether a find has ever happened
+bool ConnHasMissing = false;                // whether a missing has ever happened
+bool ConnHasStateUpdate = false;            // whether device-state-json has ever arrived
+steady_clock::time_point ConnLastFindTime;  // time of last DeviceFind
+steady_clock::time_point ConnLastMissingTime;     // time of last DeviceMissing
+steady_clock::time_point ConnLastStateUpdateTime; // time of last DeviceStateJson update
+std::mutex connMutex;
+
 std::mutex leftMutex;
 std::mutex rightMutex;
 std::mutex headsetPoseMutex;
@@ -102,9 +117,23 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
         break;
     case PXREADeviceFind:
         std::cout << "device found\n" << (const char*)userData << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(connMutex);
+            ConnConnected = true;
+            ConnFindCount++;
+            ConnHasFind = true;
+            ConnLastFindTime = steady_clock::now();
+        }
         break;
     case PXREADeviceMissing:
         std::cout << "device missing\n" << (const char*)userData << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(connMutex);
+            ConnConnected = false;
+            ConnMissingCount++;
+            ConnHasMissing = true;
+            ConnLastMissingTime = steady_clock::now();
+        }
         break;
     case PXREADeviceConnect:
         std::cout << "device connect\n" << (const char*)userData << status << std::endl;
@@ -117,6 +146,12 @@ void OnPXREAClientCallback(void* context, PXREAClientCallbackType type, int stat
             json data = json::parse(dsj.stateJson);
             if (data.contains("value")) {
                 auto value = json::parse(data["value"].get<std::string>());
+                {
+                    // Fresh device-state JSON successfully arrived & parsed.
+                    std::lock_guard<std::mutex> lock(connMutex);
+                    ConnHasStateUpdate = true;
+                    ConnLastStateUpdateTime = steady_clock::now();
+                }
                 if (value["Controller"].contains("left")) {
                     auto& left = value["Controller"]["left"];
                     {
@@ -477,6 +512,33 @@ int64_t getMotionTimeStampNs() {
     return MotionTimeStampNs;
 }
 
+// Connection / device-event telemetry getter.
+// Returns a dict so callers can diagnose freeze mode:
+//   connected                        - bool, true after DeviceFind, false after DeviceMissing
+//   find_count / missing_count       - cumulative event counts
+//   seconds_since_last_find          - float, -1.0 if no find has occurred yet
+//   seconds_since_last_missing       - float, -1.0 if no missing has occurred yet
+//   seconds_since_last_state_update  - float, -1.0 if no state JSON has arrived yet
+pybind11::dict getConnectionStatus() {
+    std::lock_guard<std::mutex> lock(connMutex);
+    auto now = steady_clock::now();
+    auto secs_since = [&](bool has, const steady_clock::time_point& tp) -> double {
+        if (!has) {
+            return -1.0;
+        }
+        return std::chrono::duration<double>(now - tp).count();
+    };
+
+    pybind11::dict d;
+    d["connected"] = ConnConnected;
+    d["find_count"] = ConnFindCount;
+    d["missing_count"] = ConnMissingCount;
+    d["seconds_since_last_find"] = secs_since(ConnHasFind, ConnLastFindTime);
+    d["seconds_since_last_missing"] = secs_since(ConnHasMissing, ConnLastMissingTime);
+    d["seconds_since_last_state_update"] = secs_since(ConnHasStateUpdate, ConnLastStateUpdateTime);
+    return d;
+}
+
 int DeviceControlJsonWrapper(const std::string& dev_id, const std::string& json_str) {
     const int rc = PXREADeviceControlJson(dev_id.c_str(), json_str.c_str());
     if (rc != 0) {
@@ -537,6 +599,13 @@ PYBIND11_MODULE(xrobotoolkit_sdk, m) {
     m.def("get_motion_tracker_serial_numbers", &getMotionTrackerSerialNumbers, "Get the serial numbers of the motion trackers.");
     m.def("get_motion_timestamp_ns", &getMotionTimeStampNs, "Get the motion data timestamp in nanoseconds.");
     
+
+    // Connection / device-event telemetry (for diagnosing body-tracking freezes)
+    m.def("get_connection_status", &getConnectionStatus,
+          "Get connection/device-event telemetry as a dict: connected (bool), "
+          "find_count, missing_count, seconds_since_last_find, "
+          "seconds_since_last_missing, seconds_since_last_state_update "
+          "(seconds_since_* are -1.0 if the event has never occurred).");
 
     // send json bytes functions
     m.def("device_control_json", &DeviceControlJsonWrapper, "Send a JSON control command to a device");

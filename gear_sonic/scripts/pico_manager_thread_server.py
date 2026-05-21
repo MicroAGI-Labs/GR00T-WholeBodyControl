@@ -779,6 +779,48 @@ class PicoReader:
     def _run(self):
         last_report = time.time()
         while not self._stop.is_set():
+            # --- PICO link health telemetry (replaces RAW POSE DEBUG) ---
+            # Fires every 2s at the TOP of the loop so it reports even when body
+            # frames stop arriving (a frozen feed `continue`s below and would
+            # otherwise be invisible). LIVE = body_ts advancing; STALE = connected
+            # but body_ts frozen (tracker/Full-body stall); NO-BODY = no body data.
+            now_tele = time.time()
+            if now_tele - getattr(self, "_last_tele_t", 0.0) > 2.0:
+                self._last_tele_t = now_tele
+                try:
+                    avail = xrt.is_body_data_available()
+                    # Three INDEPENDENT freshness signals (the PICO app populates them
+                    # separately, so this tells us which layer is stale):
+                    #   pose_chg     - body joint poses actually changing (the real signal)
+                    #   joint_ts_adv - per-joint IMU timestamps advancing
+                    #   body_ts_adv  - body.timeStampNs advancing (suspect PICO-app field)
+                    poses = np.asarray(xrt.get_body_joints_pose(), dtype=float)
+                    pose_sig = float(np.nansum(poses)) if poses.size else 0.0
+                    pose_chg = getattr(self, "_tele_prev_pose_sig", None) is not None \
+                        and pose_sig != self._tele_prev_pose_sig
+                    self._tele_prev_pose_sig = pose_sig
+                    try:
+                        jts = int(max(xrt.get_body_joints_timestamp()))
+                    except Exception:
+                        jts = 0
+                    jts_adv = getattr(self, "_tele_prev_jts", None) is not None and jts != self._tele_prev_jts
+                    self._tele_prev_jts = jts
+                    body_ts = xrt.get_body_timestamp_ns()
+                    bts_adv = getattr(self, "_tele_prev_bts", None) is not None and body_ts != self._tele_prev_bts
+                    self._tele_prev_bts = body_ts
+                    cs = xrt.get_connection_status()
+                    state = "LIVE" if (avail and pose_chg) else (
+                        "STALE(poses frozen)" if avail else "NO-BODY")
+                    print(
+                        f"[PICO] {state} fps={self._fps_ema:5.1f} pose_chg={pose_chg} "
+                        f"joint_ts_adv={jts_adv} body_ts_adv={bts_adv} "
+                        f"connected={cs.get('connected')} miss={cs.get('missing_count')} "
+                        f"s_since_state={cs.get('seconds_since_last_state_update', -1):.2f}",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"[PICO] telemetry error: {e}", flush=True)
+
             if not xrt.is_body_data_available():
                 time.sleep(0.001)
                 continue
@@ -797,19 +839,6 @@ class PicoReader:
             t_monotonic = time.monotonic()
             try:
                 body_poses = xrt.get_body_joints_pose()
-
-                # --- TEMP DEBUG (always fires): prove raw PICO body data is arriving + moving
-                now_dbg = time.time()
-                if now_dbg - getattr(self, "_last_raw_debug_t", 0) > 0.5:
-                    try:
-                        # Indices from example_body_tracking.py: 20=L-Wrist, 21=R-Wrist, 12=Neck
-                        l_wrist = body_poses[20][:3]
-                        r_wrist = body_poses[21][:3]
-                        neck    = body_poses[12][:3]
-                        print(f"[RAW POSE DEBUG] L-wrist={np.round(l_wrist, 3)} | R-wrist={np.round(r_wrist, 3)} | Neck={np.round(neck, 3)}")
-                    except Exception:
-                        pass
-                    self._last_raw_debug_t = now_dbg
 
                 sample = {
                     "body_poses_np": np.array(body_poses),
@@ -1033,17 +1062,6 @@ class ThreePointPose:
 
         # Apply calibration to get the final pose
         vr_3pt_pose = self._apply_calibration(vr_3pt_pose_raw)
-
-        # --- TEMP DEBUG (remove later): prove that movement data is reaching the visualizer ---
-        if not hasattr(self, "_last_pose_debug_t"):
-            self._last_pose_debug_t = 0.0
-        now = time.time()
-        if now - getattr(self, "_last_pose_debug_t", 0) > 0.5:  # print every 0.5s
-            lw = vr_3pt_pose[0, :3]
-            rw = vr_3pt_pose[1, :3]
-            nk = vr_3pt_pose[2, :3]
-            print(f"[POSE DEBUG] L-wrist xyz={lw.round(3)} | R-wrist xyz={rw.round(3)} | Neck xyz={nk.round(3)}")
-            self._last_pose_debug_t = now
 
         if self.vr3pt_visualizer is not None:
             self.vr3pt_visualizer.update_from_vr_pose(vr_3pt_pose, waist_scale=1.0)

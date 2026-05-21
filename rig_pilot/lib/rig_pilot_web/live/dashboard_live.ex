@@ -30,8 +30,8 @@ defmodule RigPilotWeb.DashboardLive do
     socket =
       socket
       |> assign(:page_title, "RigPilot")
-      |> assign(:procs, ManagedProc.all())
       |> assign(:tele, tele)
+      |> assign(:procs, ManagedProc.all(tele))
       |> assign(:history, seed_history(tele))
       |> assign(:estop, false)
       |> assign(:confirm_deploy, false)
@@ -43,13 +43,16 @@ defmodule RigPilotWeb.DashboardLive do
 
   @impl true
   def handle_info(:procs_changed, socket) do
-    {:noreply, assign(socket, :procs, ManagedProc.all())}
+    # re-decorate against the current telemetry so dep/gate cascade stays fresh
+    {:noreply, assign(socket, :procs, ManagedProc.all(socket.assigns.tele))}
   end
 
   def handle_info({:telemetry, tele}, socket) do
     {:noreply,
      socket
      |> assign(:tele, tele)
+     # level/blocked depend on telemetry → recompute the decorated procs
+     |> assign(:procs, ManagedProc.all(tele))
      |> update(:history, &push_history(&1, tele))}
   end
 
@@ -66,18 +69,18 @@ defmodule RigPilotWeb.DashboardLive do
       {:noreply, assign(socket, :confirm_deploy, true)}
     else
       ManagedProc.start(name)
-      {:noreply, assign(socket, :procs, ManagedProc.all())}
+      {:noreply, refresh_procs(socket)}
     end
   end
 
   def handle_event("stop", %{"name" => name}, socket) do
     ManagedProc.stop(String.to_existing_atom(name))
-    {:noreply, assign(socket, :procs, ManagedProc.all())}
+    {:noreply, refresh_procs(socket)}
   end
 
   def handle_event("restart", %{"name" => name}, socket) do
     ManagedProc.restart(String.to_existing_atom(name))
-    {:noreply, assign(socket, :procs, ManagedProc.all())}
+    {:noreply, refresh_procs(socket)}
   end
 
   def handle_event("confirm_deploy", _params, socket) do
@@ -86,7 +89,7 @@ defmodule RigPilotWeb.DashboardLive do
     {:noreply,
      socket
      |> assign(:confirm_deploy, false)
-     |> assign(:procs, ManagedProc.all())}
+     |> refresh_procs()}
   end
 
   def handle_event("cancel_deploy", _params, socket) do
@@ -100,12 +103,16 @@ defmodule RigPilotWeb.DashboardLive do
     {:noreply,
      socket
      |> assign(:estop, true)
-     |> assign(:procs, ManagedProc.all())}
+     |> refresh_procs()}
   end
 
   def handle_event("clear_estop", _params, socket) do
     {:noreply, assign(socket, :estop, false)}
   end
+
+  # Re-decorate the process snapshots against the socket's current telemetry.
+  defp refresh_procs(socket),
+    do: assign(socket, :procs, ManagedProc.all(socket.assigns.tele))
 
   # ── render ────────────────────────────────────────────────────────────────
 
@@ -156,7 +163,7 @@ defmodule RigPilotWeb.DashboardLive do
               Processes
             </h2>
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <.proc_card :for={name <- order()} proc={@procs[name]} />
+              <.proc_card :for={name <- order()} proc={@procs[name]} tele={@tele} />
             </div>
           </section>
 
@@ -210,7 +217,10 @@ defmodule RigPilotWeb.DashboardLive do
 
   defp proc_card(assigns) do
     ~H"""
-    <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-4 flex flex-col gap-3">
+    <div class={[
+      "rounded-xl border bg-slate-900/50 p-4 flex flex-col gap-3",
+      card_border_classes(@proc)
+    ]}>
       <div class="flex items-start justify-between gap-2">
         <div>
           <div class="font-semibold text-slate-100 leading-tight">{@proc.label}</div>
@@ -218,6 +228,45 @@ defmodule RigPilotWeb.DashboardLive do
         </div>
         <.status_badge status={@proc.status} />
       </div>
+
+      <%= if @proc.status == :blocked and @proc.blocked_by do %>
+        <div class={[
+          "rounded-md px-2.5 py-1.5 text-xs font-semibold flex items-center gap-1.5",
+          blocked_badge_classes(@proc.level)
+        ]}>
+          <span>⛔ blocked by {@proc.blocked_by}</span>
+        </div>
+      <% end %>
+
+      <%= if @proc.level in [:warn, :crit] and @proc.reasons != [] do %>
+        <div class={[
+          "rounded-md px-2.5 py-1 text-[11px] flex flex-wrap gap-x-2 gap-y-0.5",
+          level_text_classes(@proc.level)
+        ]}>
+          <span :for={r <- Enum.take(@proc.reasons, 3)} class="whitespace-nowrap">• {r}</span>
+        </div>
+      <% end %>
+
+      <%= if @proc.name == :pico_manager do %>
+        <div class="flex flex-wrap items-center gap-1.5">
+          <.batt_chip label="HMD" pct={@tele.pico.headset_batt} />
+          <.batt_chip label="L ctrl" pct={@tele.pico.controller_l_batt} />
+          <.batt_chip label="R ctrl" pct={@tele.pico.controller_r_batt} />
+          <.batt_chip label="L trk" pct={@tele.pico.tracker_l_batt} />
+          <.batt_chip label="R trk" pct={@tele.pico.tracker_r_batt} />
+        </div>
+      <% end %>
+
+      <%= if @proc.name == :deploy do %>
+        <div class="flex flex-wrap items-center gap-1.5">
+          <.soc_chip pct={@tele.robot.soc} voltage={@tele.robot.voltage} />
+          <%= if @tele.robot.motor_fault != :none do %>
+            <span class="inline-flex items-center gap-1 rounded-md border border-red-500/50 bg-red-500/15 text-red-200 px-2 py-0.5 text-[11px] font-bold">
+              ⚠ motor fault {@tele.robot.motor_fault}
+            </span>
+          <% end %>
+        </div>
+      <% end %>
 
       <div class="flex items-center gap-4 text-xs text-slate-400">
         <span>uptime <span class="text-slate-200 font-mono">{fmt_uptime(@proc)}</span></span>
@@ -250,7 +299,7 @@ defmodule RigPilotWeb.DashboardLive do
         <button
           phx-click="start"
           phx-value-name={@proc.name}
-          disabled={@proc.status in [:running, :starting]}
+          disabled={@proc.status in [:running, :starting, :blocked]}
           class={[
             "rounded-md px-3 py-1.5 text-xs font-semibold transition",
             start_btn_classes(@proc)
@@ -261,7 +310,7 @@ defmodule RigPilotWeb.DashboardLive do
         <button
           phx-click="stop"
           phx-value-name={@proc.name}
-          disabled={@proc.status in [:down, :stopped]}
+          disabled={@proc.status in [:down, :stopped, :starting]}
           class="rounded-md px-3 py-1.5 text-xs font-semibold bg-slate-700 hover:bg-slate-600 disabled:opacity-40 disabled:cursor-not-allowed transition"
         >
           Stop
@@ -286,6 +335,43 @@ defmodule RigPilotWeb.DashboardLive do
     ]}>
       <span class={["h-2 w-2 rounded-full", dot_classes(@status)]}></span>
       {status_label(@status)}
+    </span>
+    """
+  end
+
+  # ── battery / SOC chips ──────────────────────────────────────────────────
+
+  # small battery chip: 🔋 icon tinted green ≥40 / amber 15–39 / red <15
+  defp batt_chip(assigns) do
+    ~H"""
+    <span
+      title={"#{@label} battery #{@pct}%"}
+      class={[
+        "inline-flex items-center gap-1 rounded-md border px-1.5 py-0.5 text-[11px] font-semibold tabular-nums",
+        batt_classes(@pct)
+      ]}
+    >
+      <span>{batt_icon(@pct)}</span>
+      <span class="opacity-80">{@label}</span>
+      <span>{@pct}%</span>
+    </span>
+    """
+  end
+
+  # robot state-of-charge chip (larger, labelled), same colour thresholds
+  defp soc_chip(assigns) do
+    ~H"""
+    <span
+      title={"robot SOC #{@pct}% · #{@voltage} V"}
+      class={[
+        "inline-flex items-center gap-1.5 rounded-md border px-2 py-0.5 text-[11px] font-bold tabular-nums",
+        batt_classes(@pct)
+      ]}
+    >
+      <span>{batt_icon(@pct)}</span>
+      <span class="opacity-80">SOC</span>
+      <span>{@pct}%</span>
+      <span class="opacity-60 font-normal">{@voltage} V</span>
     </span>
     """
   end
@@ -413,6 +499,13 @@ defmodule RigPilotWeb.DashboardLive do
           value={@tele.deploy.output_type}
           ok={@tele.deploy.output_type != "log"}
         />
+        <.kv label="robot SOC" value={"#{@tele.robot.soc}%"} ok={@tele.robot.soc >= 15} />
+        <.kv label="robot voltage" value={"#{@tele.robot.voltage} V"} ok={@tele.robot.voltage > 48} />
+        <.kv
+          label="motor fault"
+          value={if(@tele.robot.motor_fault == :none, do: "none", else: @tele.robot.motor_fault)}
+          ok={@tele.robot.motor_fault == :none}
+        />
       </div>
     </div>
     """
@@ -489,16 +582,18 @@ defmodule RigPilotWeb.DashboardLive do
       hop("deploy", deploy_pipeline_health(procs[:deploy], tele), deploy_pipeline_detail(procs[:deploy], tele)),
       hop("zenoh", proc_health(procs[:zenoh_spark_bridge]), zenoh_detail(tele)),
       hop("Orin", proc_health(procs[:orin_bridge]), short_status(procs[:orin_bridge])),
-      hop("robot", robot_health(tele), "#{tele.dds.lowstate_hz} Hz")
+      hop("robot", robot_health(tele), "SOC #{tele.robot.soc}%")
     ]
   end
 
   defp hop(label, health, detail), do: %{label: label, health: health, detail: detail}
 
   defp proc_health(nil), do: :red
+  defp proc_health(%{status: :running, level: :crit}), do: :amber
   defp proc_health(%{status: :running}), do: :green
   defp proc_health(%{status: :starting}), do: :amber
   defp proc_health(%{status: :wedged}), do: :amber
+  defp proc_health(%{status: :blocked}), do: :red
   defp proc_health(_), do: :red
 
   defp pico_health(%{pico: %{connected: false}}), do: :red
@@ -534,6 +629,8 @@ defmodule RigPilotWeb.DashboardLive do
 
   defp zenoh_detail(tele), do: "#{tele.zenoh.spark_to_orin_sessions} sess"
 
+  defp robot_health(%{robot: %{soc: soc, motor_fault: f}}) when soc < 15 or f != :none, do: :red
+  defp robot_health(%{robot: %{soc: soc}}) when soc < 25, do: :amber
   defp robot_health(%{dds: %{lowstate_hz: hz}}) when hz > 0, do: :green
   defp robot_health(_), do: :red
 
@@ -570,18 +667,48 @@ defmodule RigPilotWeb.DashboardLive do
   defp status_label(:running), do: "RUNNING"
   defp status_label(:wedged), do: "WEDGED"
   defp status_label(:stopped), do: "STOPPED"
+  defp status_label(:blocked), do: "BLOCKED"
 
   defp status_classes(:running), do: "bg-emerald-500/15 text-emerald-300 border border-emerald-500/30"
   defp status_classes(:starting), do: "bg-sky-500/15 text-sky-300 border border-sky-500/30"
   defp status_classes(:wedged), do: "bg-amber-500/15 text-amber-300 border border-amber-500/30"
+  defp status_classes(:blocked), do: "bg-orange-500/15 text-orange-300 border border-orange-500/30"
   defp status_classes(:stopped), do: "bg-slate-600/20 text-slate-300 border border-slate-600/40"
   defp status_classes(:down), do: "bg-red-500/15 text-red-300 border border-red-500/30"
 
   defp dot_classes(:running), do: "bg-emerald-400"
   defp dot_classes(:starting), do: "bg-sky-400 animate-pulse"
   defp dot_classes(:wedged), do: "bg-amber-400 animate-pulse"
+  defp dot_classes(:blocked), do: "bg-orange-400 animate-pulse"
   defp dot_classes(:stopped), do: "bg-slate-400"
   defp dot_classes(:down), do: "bg-red-400"
+
+  # ── level / blocked / battery class helpers ──────────────────────────────
+
+  # card border tinted by rolled-up level; falls back to neutral for plain :ok
+  defp card_border_classes(%{level: :crit}), do: "border-red-500/50"
+  defp card_border_classes(%{level: :warn}), do: "border-amber-500/40"
+  defp card_border_classes(_), do: "border-slate-800"
+
+  defp blocked_badge_classes(:crit), do: "bg-red-500/15 text-red-200 border border-red-500/50"
+  defp blocked_badge_classes(_), do: "bg-orange-500/15 text-orange-200 border border-orange-500/50"
+
+  defp level_text_classes(:crit), do: "text-red-300"
+  defp level_text_classes(_), do: "text-amber-300"
+
+  # battery / SOC chip colour by % (green ≥40 / amber 15–39 / red <15)
+  defp batt_classes(pct) when pct >= 40,
+    do: "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
+
+  defp batt_classes(pct) when pct >= 15,
+    do: "border-amber-500/40 bg-amber-500/10 text-amber-200"
+
+  defp batt_classes(_),
+    do: "border-red-500/50 bg-red-500/15 text-red-200"
+
+  defp batt_icon(pct) when pct >= 40, do: "🔋"
+  defp batt_icon(pct) when pct >= 15, do: "🔋"
+  defp batt_icon(_), do: "🪫"
 
   defp hop_classes(:green), do: "border-emerald-500/40 bg-emerald-500/10 text-emerald-200"
   defp hop_classes(:amber), do: "border-amber-500/40 bg-amber-500/10 text-amber-200"
