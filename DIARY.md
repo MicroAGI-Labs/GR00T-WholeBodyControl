@@ -145,7 +145,39 @@
 - Did the Orin SSH + nmcli edits through a persistent **tmux** session (`tmux-mcp`),
   raw-mode interactive SSH, so the work survives disconnects.
 
+## 2026-05-21 — Full restart test + untethered WiFi teleop
+- Ran a clean shutdown → confirm → cold start of the whole stack. Software cold-starts
+  cleanly: Orin bridge → Spark bridge → roboticsservice/pico_manager → deploy.
+- **Untethered whole-body teleop over WiFi confirmed.** Routed the zenoh Spark↔Orin hop over
+  RobotNet — Spark bridge connects to the Orin's wlan0 IP via
+  `ZENOH_JETSON_ENDPOINT=tcp/<orin-wifi-ip>:7447 ./deploy.sh ... g1zenoh`; the Orin bridge
+  still reads the robot's DDS on its internal `eth0`. Motors execute over WiFi
+  (`motorstate=0`, joints track command) — WiFi is viable for low-level control. lowstate
+  ~1000 Hz with occasional ~110ms jitter spikes (didn't break teleop; wired is steadier).
+- **`0x40000` motor fault = robot-state, not WiFi:** after a power-cycle all 29 motors fault
+  `0x40000` and ignore `lowcmd` (cmd_q not tracked, tiny tau). Cleared by a fresh robot
+  restart + re-entering dev/low-level mode on the remote. (An earlier "WiFi jitter trips the
+  motor watchdog" hypothesis was wrong.) Verify cleared via lowstate `motorstate==0`.
+- **`body.timeStampNs` is a PICO-app bug** — always frozen/0 even when tracking is live;
+  use pose-change / per-joint IMU timestamps as the liveness signal. pico_manager now prints
+  a `[PICO]` health line every 2s (pose_chg/joint_ts_adv/body_ts_adv/connected/miss),
+  replacing the old RAW POSE DEBUG spam.
+- New tooling: `gear_sonic/scripts/pico_watchdog.sh` (auto-restart dead/wedged pico_manager),
+  `gear_sonic/scripts/pico_link_telemetry.py` (standalone PICO link diagnostic).
+
+## 2026-05-21 — Static IPs (UniFi Express 7 DHCP reservations)
+- Reserved fixed RobotNet (192.168.1.x) DHCP leases on the UniFi Express 7 for every device,
+  so IPs stop drifting — the drift repeatedly broke the PICO↔Spark link and the zenoh endpoint:
+  - Spark (DGX) `wlP9s9` MAC `50:2e:91:5b:34:52` → **192.168.1.178**
+  - G1 Orin `wlan0` MAC `4c:bb:47:ab:f8:d8` → **192.168.1.229**
+  - PICO headset → reserved (its RobotNet lease, per UniFi)
+- Result: the PICO PC-Service IP (Spark `192.168.1.178`) and `ZENOH_JETSON_ENDPOINT`
+  (Orin `192.168.1.229:7447`) are now stable across reboots. Resolves the IP-drift issue.
+
 ## Open TODOs
+- [ ] **Make cold-start hands-off:** (a) run `roboticsservice` as a persistent systemd
+  service so pico_manager doesn't bounce it (avoids the PICO needing a manual reconnect),
+  (b) document/automate the robot motor-enable (clear `0x40000` after power-cycle).
 - [ ] **Verify LowCmd CRC across the Zenoh round-trip.** `g1zenoh` mode passes
   `--disable-crc-check` on the assumption the bridge re-serialization may alter bytes.
   Teleop works with it disabled — confirm whether the robot accepts the round-tripped
