@@ -1,0 +1,6 @@
+<!-- Spark side CycloneDDS config (reference copy).
+     deploy.sh g1zenoh mode generates this at $HOME/cyclonedds_spark.xml.
+     Spark-local DDS lives on loopback; the bridge feeds the robot's topics here.
+     Requires: sudo ip link set lo multicast on
+               sudo ip route add 239.255.0.0/16 dev lo -->
+<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="lo" priority="default" multicast="default" /></Interfaces></General></Domain></CycloneDDS>

@@ -1,0 +1,14 @@
+// Spark side Zenoh bridge config (reference copy).
+// deploy.sh g1zenoh mode generates this at $HOME/zenoh-spark-config.json5,
+// substituting ZENOH_JETSON_ENDPOINT (default tcp/192.168.123.164:7447).
+{
+  mode: "peer",
+  connect: { endpoints: ["tcp/192.168.123.164:7447"] },
+  scouting: { multicast: { enabled: false } },
+  plugins: {
+    dds: {
+      domain: 0,
+      allow: ["rt/lowstate", "rt/lowcmd", "rt/secondary_imu"]
+    }
+  }
+}
