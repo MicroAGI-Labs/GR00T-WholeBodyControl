@@ -244,7 +244,74 @@ no FFI into cyclonedds from the BEAM.
 
 ---
 
-## 12. Definition of done (Phase 1)
+## 12. Dependency & state model
+
+"Up/down" is not enough — the two failures that actually cost us time were a *tracker
+battery* red-herring and a *robot SOC* power-cycle. So we model both a dependency DAG and
+rich per-entity state.
+
+### 12.1 Dependencies = a DAG with gates (not the linear pipeline)
+
+Each managed entity declares two things:
+- **`deps`** — other *processes* that must be running first (start order + cascade).
+- **`gates`** — *health predicates* that must hold before it may reach `:running`.
+
+```
+roboticsservice ──► pico_manager ───────────────┐
+                                                  ├──► deploy ──► robot (actuates)
+robot ──► orin_bridge ──► spark_bridge ──► lowstate ┘
+```
+Examples:
+- `deploy.deps  = [pico_manager, spark_bridge]`
+- `deploy.gates = [lowstate_hz > 0, pico.pose_available, output_type != :log]`
+- `orin_bridge.gates = [robot.reachable, robot.publishing_dds]`
+- **mutual exclusion**: `{sim}` ⊻ `{real-robot path}` (can't both drive DDS)
+
+Responsibilities split:
+- **OTP supervisor** → restart *mechanics* (backoff, restart-storm caps).
+- **Dependency layer** (in HealthAggregator) → *policy*: topological start order,
+  start-gating (won't start until deps+gates green), and **cascade** — when a node goes
+  unhealthy, mark dependents `:blocked` with a `blocked_by:` reason instead of letting them
+  flap. (`rest_for_one` only covers a linear chain; our DAG needs explicit edges.)
+
+UI: DAG edges turn red on a broken dependency; a blocked card shows `⛔ blocked by orin_bridge`
+rather than a misleading "down".
+
+### 12.2 Rich per-entity state
+
+Every entity (process *or* external device) carries:
+```elixir
+%Health{
+  status:  :running,   # :down|:starting|:running|:wedged|:degraded|:blocked|:stopped
+  level:   :warn,      # :ok | :warn | :crit  — rolled up from metrics
+  reasons: ["L ankle tracker 14%"],
+  metrics: %{tracker_l_batt: 14, body_feed: :live, fps: 71}
+}
+```
+`level` comes from **threshold rules** over `metrics`, rolled up into the card badge. The
+rules encode the exact failure modes we hit:
+
+| Entity | Metrics surfaced | Rule examples |
+|---|---|---|
+| **PICO** | headset / controller / **ankle-tracker** battery %, full-body active, `pose_chg` | tracker <20% → warn, <10% → crit |
+| **robot** | **SOC / voltage**, per-motor fault code, low-level/debug mode, joint temps | SOC <15% → crit; any motor `0x40000` → crit "re-enable low-level" |
+| **network** | Spark `wlan0` IP, zenoh sessions, lowstate **jitter** | IP changed → warn "PICO target stale"; jitter >50 ms → warn |
+| **deploy** | `output_type`, `lowcmd_hz` | `output_type == log` → warn "dry-run, won't actuate" |
+
+So "is the PICO out of battery" = `pico.metrics.tracker_l_batt` → rule → `level: :crit` → a
+red battery chip on the PICO node with reason "L tracker 8%".
+
+### 12.3 Data sources (Phase-2 sidecar work)
+
+- **Robot SOC + motor faults** → already in `rt/lowstate` (HG `LowState_` power/BMS + per-motor
+  status — we literally saw the `0x40000` faults). Low lift, high value.
+- **PICO headset/controller/tracker batteries** → in the XRoboToolkit **device-state JSON**,
+  but the current pybind only parses poses/buttons. Extend the binding/sidecar to pull battery
+  *if the app includes those fields* (same JSON where the `body_ts` bug lives — must confirm).
+- All of it rides the existing **`"rig:status"` PubSub contract** as extra fields, so the
+  LiveView shape doesn't change.
+
+## 13. Definition of done (Phase 1)
 
 Open a browser on the rig, and within 2 s see — without running a single shell command —
 whether each process is up/wedged/down, whether the PICO body feed is truly LIVE, the
