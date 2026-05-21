@@ -125,6 +125,26 @@
 - Committed the Zenoh bridge setup into the repo: `gear_sonic_deploy/zenoh/`
   (`start_bridge_orin.sh` for the robot Orin, Spark reference configs, README).
 
+## 2026-05-21 — WiFi → RobotNet (UniFi Express 7)
+- Replaced the ad-hoc WiFi (STARLINK-MUC / iPhone hotspot) with a dedicated **RobotNet**
+  SSID on a **UniFi Express 7** router for the whole rig (Spark + G1 management/internet).
+- The wired `192.168.123.x` control link (Spark `enP7s7` ↔ G1 `eth0`) is unchanged — Zenoh
+  bridge + teleop continue over Ethernet, independent of WiFi.
+- G1 Orin WiFi connected to RobotNet via `nmcli` over the wired SSH (so SSH never drops):
+  `eth0`/`unitree1` untouched (route-metric bumped to backup, no bounce), new WiFi profile
+  `ipv4.never-default no` + `route-metric 100`. Single-line psk (multi-line `nmcli modify`
+  corrupts the key). Result: wlan0 = 192.168.1.229 (default route via WiFi), robot subnet
+  still on eth0. Spark↔robot wired ping 0.25ms unaffected.
+- RobotNet is **WPA2/WPA3 mixed mode**; the modern Spark uses `sae` (WPA3), but the older
+  Jetson connects fine via `wpa-psk` (WPA2 path) — more compatible with JetPack 5's stack.
+  PSK was read off the Spark's already-working RobotNet profile
+  (`nmcli -s -g 802-11-wireless-security.psk con show RobotNet`).
+- Pruned stale WiFi profiles on the Orin — removed `STARLINK-MUC`, `OnePlus12`,
+  `TP-LINK_0B20_5G`; only `RobotNet` remains. Their PSKs are saved locally on the Spark
+  at `~/robot-wifi-credentials.txt` (`chmod 600`, **not committed** — DIARY is a public fork).
+- Did the Orin SSH + nmcli edits through a persistent **tmux** session (`tmux-mcp`),
+  raw-mode interactive SSH, so the work survives disconnects.
+
 ## Open TODOs
 - [ ] **Verify LowCmd CRC across the Zenoh round-trip.** `g1zenoh` mode passes
   `--disable-crc-check` on the assumption the bridge re-serialization may alter bytes.
