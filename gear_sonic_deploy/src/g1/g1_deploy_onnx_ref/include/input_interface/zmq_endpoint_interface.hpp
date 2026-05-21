@@ -88,7 +88,7 @@
 class ZMQEndpointInterface : public InputInterface {
 public:
     /// Compile-time toggle for debug log output.
-    static constexpr bool DEBUG_LOGGING = true;
+    static constexpr bool DEBUG_LOGGING = false;  // per-message decode logs; set true to debug
     
     // ------------------------------------------------------------------
     // Per-frame action flags (reset at the start of every update() call)
@@ -1468,14 +1468,16 @@ private:
             }
             
             // Print frame indices for protocol v3 (SMPL actions)
-            if (protocol_version == 3 && !frame_indices.empty()) {
-                if (frame_indices.size() == 1) {
-                    std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (single) - frame_index: " 
-                              << frame_indices[0] << std::endl;
-                } else {
-                    std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (chunk) - frames: " 
-                              << frame_indices[0] << " to " << frame_indices.back() 
-                              << ", chunk_size: " << frame_indices.size() << std::endl;
+            if constexpr (DEBUG_LOGGING) {
+                if (protocol_version == 3 && !frame_indices.empty()) {
+                    if (frame_indices.size() == 1) {
+                        std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (single) - frame_index: "
+                                  << frame_indices[0] << std::endl;
+                    } else {
+                        std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (chunk) - frames: "
+                                  << frame_indices[0] << " to " << frame_indices.back()
+                                  << ", chunk_size: " << frame_indices.size() << std::endl;
+                    }
                 }
             }
         }
@@ -1810,10 +1812,12 @@ private:
         std::lock_guard<std::mutex> lock(data_mutex_);
         
         // Print message received info
-        std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic 
-                  << "', protocol_version: " << hdr.version 
-                  << ", num_fields: " << hdr.fields.size() 
-                  << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        if constexpr (DEBUG_LOGGING) {
+            std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic
+                      << "', protocol_version: " << hdr.version
+                      << ", num_fields: " << hdr.fields.size()
+                      << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        }
         
         // Buffer the received data for processing in handle_input (main thread)
         buffered_header_ = hdr;

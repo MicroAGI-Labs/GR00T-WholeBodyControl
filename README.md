@@ -260,6 +260,19 @@ Each use case has its own lightweight environment. The install scripts use `uv`
 and create isolated venvs automatically — you don't need to manage them manually.
 Training is the only one that requires Isaac Lab (installed separately).
 
+**Note: Systems with system-installed TensorRT (DGX Spark, Grace servers, etc.)**
+
+The install scripts use a managed Python 3.10 which cannot see TensorRT installed via `apt` (`python3-libnvinfer`). On these systems use the system Python + `--system-site-packages`:
+
+```bash
+# For inference / VLA deployment
+uv venv .venv_inference --python /usr/bin/python3.12 --system-site-packages --prompt gear_sonic_inference
+source .venv_inference/bin/activate
+uv pip install -e "gear_sonic/[inference]"
+```
+
+This makes the system TensorRT 10.x bindings available inside the project environment.
+
 ## Documentation
 
 📚 **[Full Documentation](https://nvlabs.github.io/GR00T-WholeBodyControl/)**

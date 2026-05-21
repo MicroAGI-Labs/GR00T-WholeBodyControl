@@ -83,16 +83,31 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
 
   set(CUDA_LINK_DIRS ${CUDA_ARM_LIB_PATH})
 
-  # DLA support: only for non-Thor Jetson devices
-  if(IS_THOR)
+  # DLA support: only for real Jetson devices that have DLA hardware.
+  # The DGX Spark (Grace + Blackwell) is aarch64 but has no DLA → must not link cudla.
+  set(IS_JETSON FALSE)
+  if(EXISTS "/etc/nv_tegra_release")
+    set(IS_JETSON TRUE)
+  elseif(EXISTS "/proc/device-tree/compatible")
+    file(READ "/proc/device-tree/compatible" COMPAT)
+    if(COMPAT MATCHES "nvidia,tegra")
+      set(IS_JETSON TRUE)
+    endif()
+  endif()
+
+  if(IS_THOR OR NOT IS_JETSON)
     set(CUDLA_LIBRARY "")
-    message(STATUS "🚀 ARM64 (Thor) detected - building without DLA support")
+    if(NOT IS_JETSON)
+      message(STATUS "🚀 Generic aarch64 (DGX Spark / non-Jetson) detected - building WITHOUT DLA support")
+      message(STATUS "   libcudla does not exist on this platform (expected).")
+    else()
+      message(STATUS "🚀 ARM64 (Thor) detected - building without DLA support")
+    endif()
     message(STATUS "   Using CUDA library path: ${CUDA_ARM_LIB_PATH}")
-    message(STATUS "   Thor doesn't have DLA engines")
   else()
-    # Match bare-metal Jetson builds: link cudla from the CUDA toolkit (targets/aarch64-linux/lib)
+    # Real Jetson (non-Thor) with DLA
     set(CUDLA_LIBRARY "cudla")
-    message(STATUS "✅ ARM64 detected - enabling DLA (cudla) support")
+    message(STATUS "✅ ARM64 Jetson detected - enabling DLA (cudla) support")
     message(STATUS "   Using CUDA library path: ${CUDA_ARM_LIB_PATH}")
     message(STATUS "   Using CUDLA library: -l${CUDLA_LIBRARY}")
   endif()

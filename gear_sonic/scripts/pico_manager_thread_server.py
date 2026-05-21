@@ -3,14 +3,11 @@
 """
 
 # Recommended Command Line Arguments:
-    # With VR3 PT visualization (by --vis_vr3pt) and optional SMPL body visualization (by --vis_smpl)
-    # If you want to enable waist tracking in the VR3 PT visualization, please add --waist_tracking
-    python pico_manager_thread_server.py --manager \
-        --vis_vr3pt --vis_smpl \
-        --waist_tracking
+    # With Rerun visualization (recommended)
+    python pico_manager_thread_server.py --manager --vis_rerun
 
-    # VR3 PT visualization only (without SMPL body) — lower latency
-    python pico_manager_thread_server.py --manager --vis_vr3pt
+    # Old PyVista path (still available)
+    python pico_manager_thread_server.py --manager --vis_vr3pt --vis_smpl --waist_tracking
 
 # DEBUG VR3 PT VISUALIZATION:
     # A standalone test mode that captures one live frame and visualizes it.
@@ -84,16 +81,31 @@ except ImportError:
     print("Warning: G1GripperInverseKinematicsSolver not available.")
     G1GripperInverseKinematicsSolver = None
 
-try:
-    from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
-except ImportError:
-    print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
-    VR3PtPoseVisualizer = None
+# Lazy imports — only load what we actually need
+VR3PtPoseVisualizer = None
+Rerun3PtVisualizer = None
+RERUN_AVAILABLE = False
+
+if "--vis_vr3pt" in " ".join(__import__("sys").argv):
+    try:
+        from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import VR3PtPoseVisualizer
+    except ImportError:
+        print("Warning: VR3PtPoseVisualizer not available (pyvista may not be installed).")
+
+print(f"[DEBUG] Checking argv for --vis_rerun: {'--vis_rerun' in ' '.join(__import__('sys').argv)}")
+if "--vis_rerun" in " ".join(__import__("sys").argv):
+    print("[DEBUG] Attempting to import Rerun3PtVisualizer...")
+    try:
+        from gear_sonic.utils.teleop.vis.rerun_3pt_visualizer import Rerun3PtVisualizer
+        RERUN_AVAILABLE = True
+        print("[DEBUG] Rerun3PtVisualizer import succeeded")
+    except ImportError as e:
+        print(f"[DEBUG] Rerun import failed: {e}")
+        print("Warning: Rerun not available. Install with: uv pip install rerun-sdk")
 
 try:
     from gear_sonic.utils.teleop.vis.vr3pt_pose_visualizer import get_g1_key_frame_poses
 except ImportError:
-    print("Warning: get_g1_key_frame_poses not available (pyvista may not be installed).")
     get_g1_key_frame_poses = None
 
 
@@ -786,6 +798,19 @@ class PicoReader:
             try:
                 body_poses = xrt.get_body_joints_pose()
 
+                # --- TEMP DEBUG (always fires): prove raw PICO body data is arriving + moving
+                now_dbg = time.time()
+                if now_dbg - getattr(self, "_last_raw_debug_t", 0) > 0.5:
+                    try:
+                        # Indices from example_body_tracking.py: 20=L-Wrist, 21=R-Wrist, 12=Neck
+                        l_wrist = body_poses[20][:3]
+                        r_wrist = body_poses[21][:3]
+                        neck    = body_poses[12][:3]
+                        print(f"[RAW POSE DEBUG] L-wrist={np.round(l_wrist, 3)} | R-wrist={np.round(r_wrist, 3)} | Neck={np.round(neck, 3)}")
+                    except Exception:
+                        pass
+                    self._last_raw_debug_t = now_dbg
+
                 sample = {
                     "body_poses_np": np.array(body_poses),
                     "timestamp_realtime": t_realtime,
@@ -834,6 +859,7 @@ def _pose_stream_common(
     # Create 3-point pose processor with visualization settings
     three_point = ThreePointPose(
         enable_vis_vr3pt=enable_vis_vr3pt,
+        enable_vis_rerun=enable_vis_rerun,
         with_g1_robot=with_g1_robot,
         enable_waist_tracking=enable_waist_tracking,
         enable_smpl_vis=enable_smpl_vis,
@@ -887,6 +913,7 @@ class ThreePointPose:
     def __init__(
         self,
         enable_vis_vr3pt: bool = False,
+        enable_vis_rerun: bool = False,
         with_g1_robot: bool = True,
         enable_waist_tracking: bool = False,
         enable_smpl_vis: bool = False,
@@ -942,6 +969,23 @@ class ThreePointPose:
             smpl_str = " + SMPL body" if enable_smpl_vis else ""
             print(f"[{log_prefix}] VR 3pt pose visualization enabled{g1_str}{waist_str}{smpl_str}")
 
+        # Rerun visualizer (much better interaction + timeline)
+        self.rerun_visualizer = None
+        print(f"[{log_prefix}] DEBUG: enable_vis_rerun={enable_vis_rerun}, RERUN_AVAILABLE={RERUN_AVAILABLE}")
+        if enable_vis_rerun:
+            if not RERUN_AVAILABLE:
+                print(f"[{log_prefix}] DEBUG: Raising ImportError because RERUN_AVAILABLE is False")
+                raise ImportError(
+                    "Rerun is not installed but --vis_rerun was requested. "
+                    "Install with: uv pip install rerun-sdk"
+                )
+            print(f"[{log_prefix}] DEBUG: About to create Rerun3PtVisualizer...")
+            self.rerun_visualizer = Rerun3PtVisualizer(
+                title=f"GEAR-SONIC 3Pt Teleop (PICO) — {log_prefix}",
+                spawn=True,
+            )
+            print(f"[{log_prefix}] Rerun 3pt visualization enabled (recommended for debugging)")
+
         # Calibration state — triggered explicitly by calibrate_now() or reset_with_measured_q()
         self._calibration_pending = False
         self._calibration_neck_quat_inv: np.ndarray | None = None  # inv(initial neck quat)
@@ -990,11 +1034,26 @@ class ThreePointPose:
         # Apply calibration to get the final pose
         vr_3pt_pose = self._apply_calibration(vr_3pt_pose_raw)
 
+        # --- TEMP DEBUG (remove later): prove that movement data is reaching the visualizer ---
+        if not hasattr(self, "_last_pose_debug_t"):
+            self._last_pose_debug_t = 0.0
+        now = time.time()
+        if now - getattr(self, "_last_pose_debug_t", 0) > 0.5:  # print every 0.5s
+            lw = vr_3pt_pose[0, :3]
+            rw = vr_3pt_pose[1, :3]
+            nk = vr_3pt_pose[2, :3]
+            print(f"[POSE DEBUG] L-wrist xyz={lw.round(3)} | R-wrist xyz={rw.round(3)} | Neck xyz={nk.round(3)}")
+            self._last_pose_debug_t = now
+
         if self.vr3pt_visualizer is not None:
             self.vr3pt_visualizer.update_from_vr_pose(vr_3pt_pose, waist_scale=1.0)
             if smpl_joints_local is not None:
                 self.vr3pt_visualizer.update_smpl_joints(smpl_joints_local)
             self.vr3pt_visualizer.render()
+
+        # Rerun visualization (much better for live debugging)
+        if self.rerun_visualizer is not None:
+            self.rerun_visualizer.update(vr_3pt_pose)
 
         return vr_3pt_pose
 
@@ -1811,6 +1870,7 @@ def run_pico_manager(
     zmq_feedback_host: str = "localhost",
     zmq_feedback_port: int = 5557,
     enable_vis_vr3pt: bool = False,
+    enable_vis_rerun: bool = False,
     with_g1_robot: bool = True,
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
@@ -1821,6 +1881,7 @@ def run_pico_manager(
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
     """
+    print(f"[DEBUG] run_pico_manager received: enable_vis_rerun={enable_vis_rerun}, RERUN_AVAILABLE={RERUN_AVAILABLE}")
     if xrt is None:
         raise ImportError(
             "XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run the manager."
@@ -1852,6 +1913,7 @@ def run_pico_manager(
 
     three_point = ThreePointPose(
         enable_vis_vr3pt=enable_vis_vr3pt,
+        enable_vis_rerun=enable_vis_rerun,
         with_g1_robot=with_g1_robot,
         enable_waist_tracking=enable_waist_tracking,
         enable_smpl_vis=enable_smpl_vis,
@@ -2038,6 +2100,15 @@ def run_pico_manager(
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
 
+            # Mode-independent: always update Rerun visualizer with latest pose
+            # (skip when a streamer already called process_smpl_pose this iteration)
+            if three_point.rerun_visualizer is not None and new_mode not in (
+                StreamMode.POSE, StreamMode.PLANNER_VR_3PT
+            ):
+                sample = reader.get_latest()
+                if sample is not None:
+                    three_point.process_smpl_pose(sample["body_poses_np"])
+
             # Mode-independent: send manager_state for data exporter
             toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
             toggle_da_tmp = bool(b_pressed) and left_grip_mgr > 0.5
@@ -2133,7 +2204,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--vis_vr3pt",
         action="store_true",
-        help="Enable inline VR 3-point pose visualization in pose streaming mode",
+        help="Enable inline VR 3-point pose visualization in pose streaming mode (PyVista)",
+    )
+    parser.add_argument(
+        "--vis_rerun",
+        action="store_true",
+        help="Enable Rerun-based 3-point pose visualization (recommended for debugging)",
     )
     parser.add_argument(
         "--vr3pt_hz",
@@ -2157,6 +2233,7 @@ if __name__ == "__main__":
         help="Enable SMPL body joint visualization (24 joint spheres) in the VR3pt viewer",
     )
     args = parser.parse_args()
+    print(f"[DEBUG] args.vis_rerun = {getattr(args, 'vis_rerun', False)}")
 
     # Standalone VR3Pt test modes (exit after finishing)
     if args.vr3pt_test:
@@ -2182,6 +2259,7 @@ if __name__ == "__main__":
     with_g1_robot = not args.no_g1
 
     if args.manager:
+        print(f"[DEBUG] About to call run_pico_manager with enable_vis_rerun={args.vis_rerun}")
         run_pico_manager(
             port=args.port,
             buffer_size=args.buffer_size,
@@ -2193,6 +2271,7 @@ if __name__ == "__main__":
             zmq_feedback_host=args.zmq_feedback_host,
             zmq_feedback_port=args.zmq_feedback_port,
             enable_vis_vr3pt=args.vis_vr3pt,
+            enable_vis_rerun=args.vis_rerun,
             with_g1_robot=with_g1_robot,
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,

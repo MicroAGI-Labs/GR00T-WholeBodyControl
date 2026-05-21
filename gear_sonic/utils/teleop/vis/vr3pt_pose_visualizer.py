@@ -1725,6 +1725,7 @@ class VR3PtPoseVisualizer:
         if self.plotter is not None:
             t0 = time.perf_counter()
             self.plotter.update()
+            self.plotter.render()  # force a full redraw (helps on some aarch64 + VTK setups)
             self._vis_times_render.append(time.perf_counter() - t0)
             self._maybe_report_timing()
 

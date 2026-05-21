@@ -61,6 +61,7 @@
 #include <functional>
 #include <unordered_map>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <chrono>
 #include <algorithm>
@@ -2128,6 +2129,10 @@ class G1Deploy {
   public:
     OperatorState operator_state;
 
+    // When false we still read LowState from the real G1 and run the full policy,
+    // but we never send motor commands to the robot (safe "log only" mode).
+    bool actuate_robot_ = true;
+
     G1Deploy(
       std::string networkInterface,
       std::string model_file_path,
@@ -2672,7 +2677,21 @@ class G1Deploy {
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-        lowcmd_publisher_->Write(dds_low_command);
+
+        if (actuate_robot_) {
+          lowcmd_publisher_->Write(dds_low_command);
+        } else {
+          // Log-only mode: print what we *would* have sent (very useful for validation)
+          static int log_counter = 0;
+          if ((log_counter++ % 50) == 0 && mc) {   // print every ~0.1s
+            std::cout << "[LOG-ONLY] Would send LowCmd (first 6 joints): ";
+            for (int j = 0; j < 6 && j < G1_NUM_MOTOR; ++j) {
+              std::cout << "q[" << j << "]=" << std::fixed << std::setprecision(3)
+                        << mc->q_target.at(j) << " ";
+            }
+            std::cout << "..." << std::endl;
+          }
+        }
       }
 
       // Publish Dex3 hand commands at the same publish cadence
@@ -4105,7 +4124,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "|ros2";
 #endif
     std::cout << ">: input interface type (default: keyboard)" << std::endl;
-    std::cout << "  --output-type <zmq|all";
+    std::cout << "  --output-type <zmq|all|log|none";
 #if HAS_ROS2
     std::cout << "|ros2";
 #endif
@@ -4255,12 +4274,13 @@ int main(int argc, char const* argv[]) {
     } else if (std::string(argv[i]) == "--output-type") {
       if (i + 1 < argc) {
         outputType = argv[i + 1];
-        bool valid_output = (outputType == "zmq" || outputType == "all");
+        bool valid_output = (outputType == "zmq" || outputType == "all" ||
+                             outputType == "log" || outputType == "none");
 #if HAS_ROS2
         valid_output = valid_output || (outputType == "ros2");
 #endif
         if (!valid_output) {
-          std::cerr << "Error: --output-type must be 'zmq', 'all'";
+          std::cerr << "Error: --output-type must be 'zmq', 'all', 'log', or 'none'";
 #if HAS_ROS2
           std::cerr << ", or 'ros2'";
 #endif
@@ -4270,7 +4290,7 @@ int main(int argc, char const* argv[]) {
         std::cout << "[INFO] Using output type: " << outputType << std::endl;
         i++; // Skip the next argument since it's the output type
       } else {
-        std::cerr << "Error: --output-type requires a type argument (zmq, all";
+        std::cerr << "Error: --output-type requires a type argument (zmq, all, log, none";
 #if HAS_ROS2
         std::cerr << ", or ros2";
 #endif
@@ -4441,6 +4461,11 @@ int main(int argc, char const* argv[]) {
     initial_max_close_ratio
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
+
+  if (outputType == "log" || outputType == "none") {
+    custom.actuate_robot_ = false;
+    std::cout << "[INFO] *** LOG-ONLY MODE ENABLED ***  No motor commands will be sent to the G1." << std::endl;
+  }
   
   // Main application loop - check both operator_state.stop and ROS2 status if using ROS2
 #if HAS_ROS2
