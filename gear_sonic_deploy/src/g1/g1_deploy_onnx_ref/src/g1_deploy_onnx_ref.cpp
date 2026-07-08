@@ -2785,8 +2785,11 @@ class G1Deploy {
         return false;
       }
 
+      // In MuJoCo/Isaac sim (--disable-crc-check) the LowState stream pauses during
+      // env.reset(), which would trip this staleness guard and abort control. There
+      // is no real robot to protect, so skip the staleness check in that mode.
       auto now = std::chrono::steady_clock::now();
-      if (now - low_state_data.timestamp > LOW_STATE_ABSENT_THRESHOLD) {
+      if (now - low_state_data.timestamp > LOW_STATE_ABSENT_THRESHOLD && !disable_crc_check_) {
         std::cout << "[ERROR] Lost LowState data connection from robot!" << std::endl;
         return false;
       }

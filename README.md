@@ -296,6 +296,14 @@ This makes the system TensorRT 10.x bindings available inside the project enviro
 ### Best Practices
 - [Teleoperation](https://nvlabs.github.io/GR00T-WholeBodyControl/user_guide/teleoperation.html)
 
+### Local deployment (DGX Spark ↔ G1)
+For the operational end-to-end runbook used to deploy a fine-tuned SONIC
+checkpoint on real hardware from this checkout — host setup, Zenoh DDS bridge
+(over IGMP-snooped robot switch), camera server, PolicyServer + VLA launcher,
+drive sequence (`k → i → p`), checkpoint iteration, and the troubleshooting
+catalog assembled during bring-up — see
+[`SONIC_DEPLOY_RUNBOOK.md` in the Isaac-GR00T repo](../Isaac-GR00T/SONIC_DEPLOY_RUNBOOK.md).
+
 
 
 

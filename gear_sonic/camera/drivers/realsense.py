@@ -69,13 +69,10 @@ class RealSenseSensor(Sensor, SensorServer):
                 rs.format.rgb8,
                 config.fps,
             )
-            self.config.enable_stream(
-                rs.stream.depth,
-                config.depth_image_dim[0],
-                config.depth_image_dim[1],
-                rs.format.z16,
-                config.fps,
-            )
+            # Depth stream intentionally NOT enabled: the data exporter records only
+            # the color ego_view, and on this rig the depth stream can stall after a
+            # USB re-enumeration (color streams fine), making wait_for_frames time
+            # out. Color-only is robust and sufficient.
             self.pipeline.start(self.config)
         except Exception as e:
             raise RuntimeError(f"Failed to start RealSense pipeline: {e}")
@@ -98,32 +95,27 @@ class RealSenseSensor(Sensor, SensorServer):
             return None
 
         color_frame = frames.get_color_frame()
-        depth_frame = frames.get_depth_frame()
 
-        if not color_frame or not depth_frame:
-            print("WARNING! No color or depth frame")
+        if not color_frame:
+            print("WARNING! No color frame")
             return None
 
         try:
             color_image = np.asanyarray(color_frame.get_data())
-            depth_image = np.asanyarray(depth_frame.get_data())
         except Exception as e:
-            print(f"ERROR! Failed to convert frames to numpy arrays: {e}")
+            print(f"ERROR! Failed to convert frame to numpy array: {e}")
             return None
 
-        if color_image.size == 0 or depth_image.size == 0:
-            print("WARNING! Empty color or depth image")
+        if color_image.size == 0:
+            print("WARNING! Empty color image")
             return None
 
         current_time = time.time()
-        timestamps = {
-            self.mount_position: current_time,
-            f"{self.mount_position}_depth": current_time,
-        }
-        images = {
-            self.mount_position: color_image,
-            f"{self.mount_position}_depth": depth_image,
-        }
+        # Publish color only. The ImageMessageSchema serializer JPEG-encodes every
+        # image, which fails on the uint16 depth frame (JPEG is 8-bit). The data
+        # exporter records only the color ego_view, so we drop the depth stream here.
+        timestamps = {self.mount_position: current_time}
+        images = {self.mount_position: color_image}
         return {"timestamps": timestamps, "images": images}
 
     def serialize(self, data: dict[str, Any]) -> dict[str, Any]:

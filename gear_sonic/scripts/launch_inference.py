@@ -113,6 +113,10 @@ class InferenceLaunchConfig:
     deploy_output_type: str = ""
     """Output type for deploy.sh. Leave empty for default."""
 
+    deploy_mode: str = ""
+    """Override deploy.sh mode positional arg (e.g., 'g1zenoh' for the Spark-Orin
+    DDS-over-Zenoh path). Leave empty to derive from --sim ('sim' or 'real')."""
+
     # VLA inference options
     policy_host: str = "localhost"
     """Isaac-GR00T PolicyServer host."""
@@ -303,7 +307,7 @@ def main(config: InferenceLaunchConfig):
         )
 
     # --- Pane 0 (top-left): C++ Deploy ---
-    deploy_mode = "sim" if config.sim else "real"
+    deploy_mode = config.deploy_mode if config.deploy_mode else ("sim" if config.sim else "real")
     deploy_cmd = (
         f"cd {repo_root / 'gear_sonic_deploy'} && "
         f"./deploy.sh "

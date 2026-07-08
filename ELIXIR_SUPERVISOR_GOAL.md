@@ -311,7 +311,64 @@ red battery chip on the PICO node with reason "L tracker 8%".
 - All of it rides the existing **`"rig:status"` PubSub contract** as extra fields, so the
   LiveView shape doesn't change.
 
-## 13. Definition of done (Phase 1)
+## 13. Safe restart & actuation interlocks
+
+The hazard is **discontinuity at re-engage**, not the restart itself: a controller that
+resumes commanding a target far from the robot's *current* pose makes the PD loop slam to it
+("the robot instantly snaps to your pose; a large mismatch causes aggressive motion"). Every
+rule below ensures actuation never resumes from a jump.
+
+**Responsibility split**
+- **RigPilot** (orchestrator — never in the realtime path): restart *ordering*, health
+  *gates*, *graceful* stop signaling, and refusing to auto-engage actuation.
+- **deploy** (must support; RigPilot verifies): init-from-measured-pose + soft-start ramp on
+  engage; drop to damping when its inputs gap.
+- **robot firmware** (backstop): `rt/lowcmd` timeout → damping.
+
+**Tiers**
+- *Non-actuating* (roboticsservice, pico_manager, zenoh bridges, telemetry): emit no
+  `rt/lowcmd`, so safe to restart — but the deploy must detect the resulting `lowstate`/pose
+  gap and disengage to damping, never command on stale state.
+- *Actuating* (deploy — the only `rt/lowcmd` source): restart **only while disengaged**; it
+  must come back **disengaged**; the first engaged command must be continuous
+  (`CALIB` / init-from-measured).
+
+**Ordered restart sequence** (any restart touching the control path)
+1. **Disengage first** — signal the deploy to stop/OFF (it ramps to damping); confirm
+   `lowcmd` ceased. *Not* a SIGKILL.
+2. **Stop** downstream→upstream (deploy → spark_bridge → orin_bridge …).
+3. **Start** upstream→downstream, **gated** — each stage waits for its dependency to be
+   healthy (e.g. deploy won't start until `lowstate_hz > 0`).
+4. **Come up disengaged** — never auto-engage.
+5. **Human re-arm** — operator re-engages; engage runs `CALIB` (init from measured) → zero
+   initial error → no jump.
+
+Between steps 1 and 5 the robot is in damping, so steps 2–4 cannot produce a sudden command.
+
+**Stop strategy** (`ManagedProc.stop_strategy`)
+- `deploy` → `:graceful` — send disengage, wait a timeout for `lowcmd` to cease, *then*
+  SIGTERM via muontrap. Never SIGKILL an actively-commanding deploy.
+- bridges / services → `:term`.
+
+**Interlocks**
+- Never auto-engage actuation — orchestrated restarts leave the deploy **disarmed**;
+  re-engage is human-only.
+- Deploy Start stays behind the arm/confirm gate; post-restart it shows "ready — disengaged".
+- Optional **pre-engage alignment check**: warn/block if the streamed target ≫ measured pose.
+- **Rehearse** a restart with `--output-type log` (dry-run, zero actuation) before going live.
+- **E-STOP** is an independent, always-available fast path (cut `rt/lowcmd` → damping) that
+  bypasses the orchestration.
+
+**Honest precondition:** safe only if the deploy supports (a) graceful stop-to-damping and
+(b) init-from-measured + soft-start. If not, RigPilot treats a deploy stop as
+"firmware-timeout damping" and **must not** offer a hot restart — it surfaces the limitation
+rather than pretend.
+
+**UI:** two actions — *Restart infra* (one-click; warns it forces deploy disengage if in-path)
+vs *Restart control chain* (the gated sequence shown as a live step-checklist); plus an
+**engaged / disengaged / armed** indicator on the deploy node throughout.
+
+## 14. Definition of done (Phase 1)
 
 Open a browser on the rig, and within 2 s see — without running a single shell command —
 whether each process is up/wedged/down, whether the PICO body feed is truly LIVE, the

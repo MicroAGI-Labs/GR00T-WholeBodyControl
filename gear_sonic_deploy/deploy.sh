@@ -582,7 +582,7 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     # inbound multicast (IGMP snooping).
     # ------------------------------------------------------------------
     if [[ -n "$USE_ZENOH_BRIDGE" ]]; then
-        ZENOH_JETSON_ENDPOINT="${ZENOH_JETSON_ENDPOINT:-tcp/192.168.123.164:7447}"
+        ZENOH_JETSON_ENDPOINT="${ZENOH_JETSON_ENDPOINT:-tcp/192.168.1.229:7447}"
         echo "[INFO] Starting Zenoh DDS bridge on Spark (peer -> $ZENOH_JETSON_ENDPOINT)..."
 
         # Write config FILES before docker run. If these paths don't exist,
@@ -598,7 +598,7 @@ XML
   plugins: {
     dds: {
       domain: 0,
-      allow: ["rt/lowstate", "rt/lowcmd", "rt/secondary_imu"]
+      allow: ["rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/api/motion_switcher/request", "rt/api/motion_switcher/response"]
     }
   }
 }
@@ -611,6 +611,7 @@ JSON5
           -v "$HOME/cyclonedds_spark.xml:/cyclonedds_spark.xml:ro" \
           -v "$HOME/zenoh-spark-config.json5:/zenoh-spark-config.json5:ro" \
           -e CYCLONEDDS_URI=/cyclonedds_spark.xml \
+          -e UHLC_MAX_DELTA_MS="${UHLC_MAX_DELTA_MS:-500}" \
           eclipse/zenoh-bridge-dds:latest \
           --config /zenoh-spark-config.json5
 

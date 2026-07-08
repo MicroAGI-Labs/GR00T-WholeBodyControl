@@ -21,6 +21,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
+from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
 from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
@@ -182,8 +183,20 @@ class DefaultEnv:
                 )
 
         # Enable the elastic band
+        self.elastic_band = None
+        self._band_keyboard_sub = None
+        self._band_released = False
         if self.config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
             self.elastic_band = ElasticBand()
+            # Subscribe to the existing keyboard publisher so the band auto-
+            # disables on first 'p' press (= operator unpaused VLA inference).
+            # This makes the band a startup-only stabilizer that releases as
+            # soon as the policy takes over balance — closer to real-hardware
+            # behavior than a permanent tether at z=1.
+            try:
+                self._band_keyboard_sub = ZMQKeyboardSubscriber()
+            except Exception as e:
+                print(f"[ElasticBand] keyboard subscriber init failed: {e}")
             if "g1" in self.config["ROBOT_TYPE"]:
                 if self.config["enable_waist"]:
                     self.band_attached_link = self.mj_model.body("pelvis").id
@@ -392,6 +405,14 @@ class DefaultEnv:
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
+            if (
+                not self._band_released
+                and self._band_keyboard_sub is not None
+                and self._band_keyboard_sub.read_msg() == "p"
+            ):
+                self.elastic_band.enable = False
+                self._band_released = True
+                print("[ElasticBand] Released — policy is now in control.")
             if self.elastic_band.enable and self.use_floating_root_link:
                 pose = np.concatenate(
                     [
