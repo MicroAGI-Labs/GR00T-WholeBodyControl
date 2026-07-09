@@ -46,6 +46,7 @@
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
 #include <cmath>
+#include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <mutex>
@@ -249,6 +250,9 @@ class G1Deploy {
     // =========================================================================
     // Flag to disable CRC checking for MuJoCo simulation
     bool disable_crc_check_ = false;
+    double pred_horizon_s_ = 0.0;  ///< Forward state-prediction horizon (s) to cancel round-trip control-loop delay; 0 = off (real robot / unchanged).
+    double gain_kp_scale_ = 1.0;   ///< Multiplier on commanded kp (lower = softer/lower-bandwidth = more delay-tolerant); 1.0 = unchanged.
+    double gain_kd_scale_ = 1.0;   ///< Multiplier on commanded kd; 1.0 = unchanged.
     
     bool reinitialize_heading_ = true;
     bool report_temperature_ = false;
@@ -2183,8 +2187,14 @@ class G1Deploy {
         model_path(model_file_path),
         planner_path(planner_file_path) {
       
-      // Initialize ChannelFactory
-      ChannelFactory::Instance()->Init(0, networkInterface);
+      // Initialize ChannelFactory. DDS domain is configurable via the DDS_DOMAIN env
+      // var (default 0) so multiple deploys can run concurrently on the same host,
+      // each isolated on its own domain (e.g. MuJoCo on domain 0, Isaac on domain 1).
+      const char* _dds_domain_env = std::getenv("DDS_DOMAIN");
+      int _dds_domain = _dds_domain_env ? std::atoi(_dds_domain_env) : 0;
+      std::cout << "[deploy] DDS domain = " << _dds_domain
+                << " (interface '" << networkInterface << "')" << std::endl;
+      ChannelFactory::Instance()->Init(_dds_domain, networkInterface);
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       dex3_hands_.initialize("");
@@ -2578,16 +2588,39 @@ class G1Deploy {
         std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
       }
 
+      // Wall-clock rate scale for sim2sim timing alignment. When the target sim can't
+      // run at real time (e.g. single-env Isaac PhysX caps at RTF~0.86), the deploy's
+      // fixed wall-clock threads over-sample the slow sim in sim-time and destabilize the
+      // balance policy. Dividing every thread PERIOD by CONTROL_WALL_SCALE (=sim RTF) slows
+      // the whole deploy to the sim's wall rate WITHOUT touching the policy's control_dt_
+      // (=0.02) math, so control/planner/writer all land at their trained rates in
+      // sim-time. Default 1.0 == unchanged (real robot / MuJoCo unaffected).
+      double wall_scale = 1.0;
+      { const char* e = std::getenv("CONTROL_WALL_SCALE");
+        if (e) { double v = std::atof(e); if (v > 0.05 && v <= 2.0) wall_scale = v; } }
+      std::cout << "[deploy] CONTROL_WALL_SCALE=" << wall_scale
+                << " (thread periods /= scale; 1.0 = real-time / unchanged)" << std::endl;
+
+      // Forward state-prediction horizon (s): on receipt, extrapolate LowState/IMU
+      // forward by this many seconds (q += dq*T, quaternion integrated by gyro) to
+      // cancel the ~40ms round-trip control-loop delay (network + async gaps) that
+      // eats the stiff SONIC policy's phase margin at RTF~1.0. Set to the measured
+      // effective loop delay. 0 = off (real robot / MuJoCo unchanged).
+      { const char* e = std::getenv("PRED_HORIZON_S");
+        if (e) { double v = std::atof(e); if (v >= 0.0 && v <= 0.2) pred_horizon_s_ = v; } }
+      std::cout << "[deploy] PRED_HORIZON_S=" << pred_horizon_s_
+                << " (forward state prediction to cancel loop delay; 0 = off)" << std::endl;
+
       // create threads
-      input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
-      command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
+      input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6 / wall_scale, &G1Deploy::Input, this);
+      command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6 / wall_scale,
                                                     &G1Deploy::LowCommandWriter, this);
       control_thread_ptr_ =
-          CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_dt_ * 1e6, &G1Deploy::Control, this);
-      
+          CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_dt_ * 1e6 / wall_scale, &G1Deploy::Control, this);
+
       if (planner_) {
         planner_thread_ptr_ =
-          CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6, &G1Deploy::Planner, this);
+          CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6 / wall_scale, &G1Deploy::Planner, this);
       }
           
       SetThreadPriority();
@@ -2606,6 +2639,67 @@ class G1Deploy {
       CPU_ZERO(&cpuset);
       CPU_SET(0, &cpuset);
       pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    }
+
+    /// Live-refresh commanded-gain scales from GAIN_SCALE_FILE (default /tmp/gain_scale),
+    /// format "<kp_scale> <kd_scale>" ~every 0.5s so the effective control bandwidth can
+    /// be swept without restarting the deploy. Missing/invalid leaves current values.
+    void MaybeRefreshGainScale() {
+      static int c = 0;
+      if (++c < 250) return;   // ~every 0.5s at 500Hz
+      c = 0;
+      const char* f = std::getenv("GAIN_SCALE_FILE");
+      std::ifstream in(f ? f : "/tmp/gain_scale");
+      double kp, kd;
+      if (in >> kp >> kd && kp > 0.05 && kp <= 2.0 && kd > 0.05 && kd <= 4.0) {
+        gain_kp_scale_ = kp; gain_kd_scale_ = kd;
+      }
+    }
+
+    /// Live-refresh pred_horizon_s_ from PRED_HORIZON_FILE (default /tmp/pred_horizon)
+    /// ~every 0.5s so the prediction horizon can be swept without restarting the
+    /// deploy. Missing/invalid file leaves the current (env-seeded) value untouched.
+    void MaybeRefreshPredHorizon() {
+      static int c = 0;
+      if (++c < 50) return;
+      c = 0;
+      const char* f = std::getenv("PRED_HORIZON_FILE");
+      std::ifstream in(f ? f : "/tmp/pred_horizon");
+      double v;
+      if (in >> v && v >= 0.0 && v <= 0.2) pred_horizon_s_ = v;
+    }
+
+    /// First-order forward integration of an IMU orientation quaternion by its
+    /// own body-frame gyro over T seconds (q += 0.5*q(x)(0,omega)*T, renormalized).
+    /// Quaternion order is [w,x,y,z]; gyro is body-frame rad/s.
+    void PredictImuForward(IMUState_& imu, double T) {
+      auto& q = imu.quaternion();
+      const auto& g = imu.gyroscope();
+      double qw = q[0], qx = q[1], qy = q[2], qz = q[3];
+      double wx = g[0], wy = g[1], wz = g[2];
+      double dw = 0.5 * (-qx * wx - qy * wy - qz * wz);
+      double dx = 0.5 * ( qw * wx + qy * wz - qz * wy);
+      double dy = 0.5 * ( qw * wy - qx * wz + qz * wx);
+      double dz = 0.5 * ( qw * wz + qx * wy - qy * wx);
+      qw += dw * T; qx += dx * T; qy += dy * T; qz += dz * T;
+      double n = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+      if (n > 1e-9) { qw /= n; qx /= n; qy /= n; qz /= n; }
+      q[0] = static_cast<float>(qw); q[1] = static_cast<float>(qx);
+      q[2] = static_cast<float>(qy); q[3] = static_cast<float>(qz);
+    }
+
+    /// Extrapolate a LowState forward by T seconds to cancel the round-trip
+    /// control-loop delay (network + async gaps): joint positions advance by
+    /// q += dq*T, and the pelvis IMU orientation is integrated by its gyro.
+    /// This restores the phase margin the stiff SONIC policy loses to loop delay.
+    /// Feature-flagged: T=0 is a no-op (real robot / MuJoCo unchanged).
+    void PredictLowStateForward(LowState_& ls, double T) {
+      if (T <= 0.0) return;
+      auto& ms = ls.motor_state();
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        ms[i].q() = static_cast<float>(ms[i].q() + ms[i].dq() * T);
+      }
+      PredictImuForward(ls.imu_state(), T);
     }
 
     /// DDS callback: receives a 500 Hz LowState message from the robot SDK.
@@ -2638,6 +2732,12 @@ class G1Deploy {
         error_monitor_.update(motorstates);
       }
 
+      // Cancel round-trip loop delay by extrapolating the freshly-received state
+      // forward (no-op when PRED_HORIZON_S=0). Applied after CRC so downstream
+      // consumers (all read low_state_buffer_ directly) see the predicted state.
+      MaybeRefreshPredHorizon();
+      PredictLowStateForward(low_state, pred_horizon_s_);
+
       low_state_buffer_.SetData(low_state);
 
       // update mode machine
@@ -2650,6 +2750,7 @@ class G1Deploy {
     /// DDS callback: receives secondary (torso) IMU data.
     void imuTorsoHandler(const void* message) {
       IMUState_ imu_torso = *(const IMUState_*)message;
+      if (pred_horizon_s_ > 0.0) PredictImuForward(imu_torso, pred_horizon_s_);
       imu_torso_buffer_.SetData(imu_torso);
     }
 
@@ -2665,6 +2766,7 @@ class G1Deploy {
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
       dds_low_command.mode_machine() = mode_machine_;
 
+      MaybeRefreshGainScale();
       const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
       if (mc) {
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
@@ -2672,8 +2774,8 @@ class G1Deploy {
           dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
           dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);
           dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);
-          dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i);
-          dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
+          dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i) * gain_kp_scale_;
+          dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i) * gain_kd_scale_;
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);

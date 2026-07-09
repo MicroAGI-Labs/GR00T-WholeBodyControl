@@ -461,18 +461,40 @@ Authoritative RTF (measured via `env.sim.current_time` vs wall-clock), single en
 10. **Wire parity is verifiable:** the camera message's `images` dict must have keys
     `ego_view` / `left_wrist` / `right_wrist` (480×640×3 uint8). The VLA client reads
     `images["ego_view"]` directly — a `head` key gives `KeyError: 'ego_view'` (see §2).
-11. **Never restart the camera pub alone while the sim is running.** `MultiImageReader`
-    attaches to the sim's camera **shared-memory** segments; when the pub process exits,
-    Python's `resource_tracker` *unlinks* those segments ("N leaked shared_memory objects
-    to clean up at shutdown"), so the sim's writer and any new pub then read **0 frames /
-    `cams=NONE`**. Recovery = restart the **sim + pub together** (just run `start_all.sh`).
-    This is why the camera key fix (§2) required a full stack restart, not a pub-only bounce.
-12. **The viewport livestream was gated on `--no_render`** in `sim_main.py` — but that flag
-    also freezes rendering (`render_interval → 1e6`), so you could never have both. It's been
-    **decoupled**: `LIVESTREAM` now follows `--livestream_type` (>0 ⇒ on), independent of
-    `--no_render`. Launch with `--livestream_type 2 --public_ip $(hostname -i)`. The old
-    belief that the viewport streamed on `55555-7` was wrong — those are the camera
-    image-server; the interactive viewport is `8011`/`49100` (§4a-bis).
+11. **Shared memory is fragile — the sim owns it; don't touch `/dev/shm` and don't bounce
+    the pub alone.** Both the camera feed *and* the DDS state path run through Python
+    `multiprocessing.shared_memory` segments (named `/dev/shm/psm_*`). Two ways to break it,
+    both seen in practice:
+    - **Restarting the camera pub alone** while the sim runs: `MultiImageReader`'s
+      `resource_tracker` *unlinks* the segments on exit ("N leaked shared_memory objects to
+      clean up at shutdown"), so the new pub reads **0 frames / `cams=NONE`**.
+    - **`rm -f /dev/shm/psm_*`**: this also nukes the **DDS input shm**, so
+      `g1_robot_dds.dds_publisher()` reads `input_shm` as `None` and **silently skips the
+      publish** — `rt/lowstate` drops to **0 msgs with no error in the log**, the sim keeps
+      stepping, and `ls /dev/shm | grep -c psm` shows `0`. Camera may still work (its pub
+      holds an open fd), which makes this very confusing. **Never `rm /dev/shm/psm_*`.**
+
+    Recovery for either: restart the **whole sim stack together** — `pkill -9 -f sim_main.py;
+    pkill -9 -f gear_sonic_camera_pub; pkill -9 -f zenoh-bridge-dds; pkill -9 -f
+    secondary_imu_adapter; sleep 3; bash ~/live-sim/start_all.sh` (no `rm`; let the fresh sim
+    recreate its own segments). Verify with `ls /dev/shm | grep -c psm` (should be >0) and a
+    `rt/lowstate` subscriber (should be ~100 Hz) before bringing up the deploy.
+12. **The viewport livestream is now ON by default** in `sim_main.py` (was gated on
+    `--no_render`, which also freezes rendering via `render_interval → 1e6`, so you could
+    never have both). It's decoupled and default-on: `LIVESTREAM=livestream_type` (default 2)
+    unless you pass **`--no_livestream`**. `--public_ip` defaults to **`auto`** (this host's
+    primary IP via a UDP-socket probe), so the advertised ICE candidate is the pod IP with no
+    flag needed. The old belief that the viewport streamed on `55555-7` was wrong — those are
+    the camera image-server; the interactive viewport is `8011`/`49100` (§4a-bis).
+13. **The sim's base-orientation quaternion was wrong-order (cost the whole "flailing"
+    debug).** `dds/g1_robot_dds.py` published `imu_state.quaternion` as `[x,y,z,w]`
+    (scalar-last), but the real Unitree `LowState.imu_state.quaternion` — and everything
+    downstream (`compute_projected_gravity`, the training data) — is `[w,x,y,z]`
+    (scalar-first). Effect: the policy's `projected_gravity` read `[0.02, −0.99, 0.13]` (robot
+    "tipped 97°") vs. training's `[−0.03, 0.02, −1.0]` (upright), driving constant recovery
+    motion. Fix (sim-side, preserves parity): `imu_state.quaternion[:] = imu_array[[3,4,5,6]]`
+    (was `[[4,5,6,3]]`). Sanity-check any sim IMU/orientation field by confirming
+    `compute_projected_gravity(base_quat) ≈ [0,0,-1]` when the robot is upright.
 
 ---
 

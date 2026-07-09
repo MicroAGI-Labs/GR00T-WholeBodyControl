@@ -239,11 +239,11 @@ def prepare_observation_from_sensors(
         right_hand_actuated_joint_values=state_msg["right_hand_q"],
     )
 
+    # The unitree_g1_sonic modality config consumes only 'ego_view'; wrist cameras
+    # are not in the training data and are dropped by the policy transform, so we do
+    # not forward them. (Re-add left_wrist / wrist_view here for a checkpoint whose
+    # video modality includes them.)
     video = {"ego_view": cam_img[np.newaxis, np.newaxis]}
-    if "left_wrist" in camera_msg["images"]:
-        video["left_wrist"] = camera_msg["images"]["left_wrist"][np.newaxis, np.newaxis]
-    if "right_wrist" in camera_msg["images"]:
-        video["wrist_view"] = camera_msg["images"]["right_wrist"][np.newaxis, np.newaxis]
 
     observation = {
         "video": video,

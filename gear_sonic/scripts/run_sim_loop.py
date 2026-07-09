@@ -23,7 +23,12 @@ class SimWrapper:
         self.robot_model = robot_model
         self.config = config
 
-        init_channel(config=self.config)
+        # NOTE: DDS channel init is done inside BaseSimulator.__init__ (base_sim.py).
+        # Calling it here too double-inits the same cyclonedds domain in one process,
+        # which raises "create domain error" and leaves the ChannelFactory in a broken
+        # state (cross-domain lowcmd leak -> bridge lock race). Let base_sim be the
+        # single init site.
+        # init_channel(config=self.config)
 
         # Create simulator using factory
         self.sim = SimulatorFactory.create_simulator(

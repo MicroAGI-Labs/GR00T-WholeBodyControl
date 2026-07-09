@@ -174,7 +174,42 @@
 - Result: the PICO PC-Service IP (Spark `192.168.1.178`) and `ZENOH_JETSON_ENDPOINT`
   (Orin `192.168.1.229:7447`) are now stable across reboots. Resolves the IP-drift issue.
 
+## 2026-07-09 — SONIC balance in RTX6000 Isaac sim is latency-capped (RTF 0.333)
+- Goal: run the RTX6000 Isaac sim **faster** while SONIC (on the Spark) keeps the G1
+  upright, controller-on-Spark + sim-on-RTX6000 + swappable real/sim interface intact.
+  Full write-up in [`RTX_SIM_LATENCY.md`](RTX_SIM_LATENCY.md).
+- **Root cause = fixed network latency, not sim dynamics.** The RTX6000 is a remote k8s
+  pod reachable **only via Cloudflare WARP** (`spark@10.5.7.178`, port 22 only, UDP
+  blocked) → all DDS is forced through one `ssh -L 7447` tunnel (TCP-over-TCP). Warm RTT
+  floor **~38 ms** (cold `connect()` ≈ warm, so it's the path, not overhead). Live DDS
+  `rt/lowstate` jitter at RTF 1.0: p50 9 ms / p99 23 ms / worst 69 ms (zenoh coalesces
+  stale — much milder than raw TCP-over-TCP). The deploy's printed "LowState age"
+  (2–5 ms) is stamped **locally on arrival** (`utils.hpp`), so it's blind to the ~19 ms
+  transit.
+- **RTF is the only variable** — sim math per step is byte-identical regardless of pacing,
+  so the sole difference between "balances" and "falls" is loop delay in *sim-time*
+  (≈ 38 ms × RTF + async). Measured cliff: RTF 0.20 ✅, **0.333 ✅ (30 s+ stable, tilt →
+  sub-1°)**, 0.40 ❌ hard, 0.50/1.0 ❌. ⇒ SONIC's delay margin ≈ **18–20 ms sim-time**.
+- **38 ms is NOT a physics limit.** Standing G1 ≈ inverted pendulum, ωᵤ ≈ 4 rad/s → delay
+  budget ~250 ms (ωᵤ·T ≲ 1); at 38 ms ωᵤ·T ≈ 0.15. The limiter is SONIC being a stiff,
+  high-bandwidth policy effectively trained at zero latency — phase margin dies at ω_c·T.
+- **Levers tested (all feature-flagged in the deploy, default-off → real robot unchanged):**
+  - Forward state prediction (`PRED_HORIZON_S` + `/tmp/pred_horizon`; `q += dq·T`, quat
+    integrated by gyro): **ineffective / mildly harmful** — first-order can't catch the
+    slow-growing delay instability.
+  - Commanded-gain soften/damp (`/tmp/gain_scale`): **marginal** — lowers peak tilt but
+    doesn't prevent the fall; too soft can't hold the stance.
+  - Neither moves the ceiling → it's delay-margin-bound.
+- **Delivered: sim now runs 1.67× faster (RTF 0.333) with a stable unaided stand** vs the
+  prior RTF 0.2 point. Persisted in `run_deploy_direct.sh`
+  (`CONTROL_WALL_SCALE=0.333`, must equal sim RTF = 1/`sim_slowmo`; pod `/tmp/sim_slowmo=3`).
+  Real-robot defaults (`CONTROL_WALL_SCALE=1.0`, prediction/gain off) reproduce the
+  original behavior exactly.
+
 ## Open TODOs
+- [ ] **Push RTX6000 sim RTF past 0.333** — the main lever is a lower-latency path to the
+  pod (co-locate the Spark / direct link): `stable RTF ≈ margin / RTT`, so cutting the
+  ~38 ms WARP RTT scales the ceiling linearly. See `RTX_SIM_LATENCY.md` §7.
 - [ ] **Make cold-start hands-off:** (a) run `roboticsservice` as a persistent systemd
   service so pico_manager doesn't bounce it (avoids the PICO needing a manual reconnect),
   (b) document/automate the robot motor-enable (clear `0x40000` after power-cycle).
@@ -200,3 +235,10 @@
 - Match the deploy `--input-type` to the PICO stream: `zmq_manager` for real teleop, and the
   PICO must be in **POSE** mode (topic `pose`) for full-body tracking.
 - On a shared desktop, terminal output volume is a real-time hazard — redirect deploy logs.
+- **Closed-loop balance over a remote link is latency-capped, and the cap is the
+  *controller's* delay margin, not physics.** A stiff, high-bandwidth policy (SONIC) tolerates
+  only ~18–20 ms of loop delay; over a fixed ~38 ms round-trip that pins the stable sim RTF
+  near 0.33. Measure warm RTT (not the deploy's locally-stamped "age") to know the real
+  budget, and match `CONTROL_WALL_SCALE` to the sim RTF. Prediction/gain-softening don't
+  rescue a slow-growing delay instability — widen the margin (retrain) or cut the delay
+  (network) instead.

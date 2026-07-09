@@ -405,6 +405,13 @@ class DefaultEnv:
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
+            import os as _os_band
+            _rel = float(_os_band.environ.get("MUJOCO_BAND_RELEASE_S", "0"))
+            if not self._band_released and _rel > 0.0 and self.mj_data.time > _rel:
+                self.elastic_band.enable = False
+                self._band_released = True
+                print(f"[ElasticBand] AUTO-RELEASED at t={self.mj_data.time:.1f}s "
+                      f"(MUJOCO_BAND_RELEASE_S) — SONIC now balances UNAIDED", flush=True)
             if (
                 not self._band_released
                 and self._band_keyboard_sub is not None
