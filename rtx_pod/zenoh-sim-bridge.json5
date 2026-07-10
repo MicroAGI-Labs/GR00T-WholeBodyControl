@@ -1,0 +1,15 @@
+{
+  mode: "peer",
+  listen: { endpoints: ["tcp/0.0.0.0:7447"] },
+  scouting: { multicast: { enabled: false } },
+  plugins: {
+    dds: {
+      domain: 1,
+      allow: ["rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/reset_pose/cmd", "rt/api/motion_switcher/request", "rt/api/motion_switcher/response"],
+      forward_discovery: true
+    }
+  },
+  open: {
+    return_conditions: { "connect_scouted": false }
+  }
+}
