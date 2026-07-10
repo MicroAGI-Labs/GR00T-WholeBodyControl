@@ -9,8 +9,19 @@ a stable 30 s+ unaided stand there. Going faster needs either a lower-latency ne
 path (infra) or a delay-robust controller (retrain SONIC). First-order state prediction
 and gain-softening were implemented and tested — neither moves the ceiling.
 
-Related: [`RTX_SIM_GUIDE.md`](RTX_SIM_GUIDE.md) (bring-up), memory
-`sonic-rtf-delay-tolerance-levers`, `isaac-rtf-timing-gap-root-cause`.
+Related: [`RTX_SIM_GUIDE.md`](RTX_SIM_GUIDE.md) (bring-up),
+[`SIM_RESILIENCE_PLAN.md`](SIM_RESILIENCE_PLAN.md) (auto-recovery + the working balance recipe),
+memory `sonic-rtf-delay-tolerance-levers`, `sim-resilience-implementation`,
+`sonic-imu-bug-and-concurrent-harness`.
+
+> **Update 2026-07-10.** Balance reproduced, and two refinements to the numbers below:
+> (1) With the current `autossh` tunnel the RTT is higher, so a clean stand needed RTF
+> **0.10–0.125** (`sim_slowmo` 8–10), not 0.333 — same law (`stable RTF ≈ margin / RTT`),
+> just a bigger RTT. (2) A clean release requires the right **warmup geometry**: RIGID hold
+> (`SIM_BASE_SOFT=0`) + `SIM_WARMUP_JOINTS=1` holding the policy's default stance (knee 0.669)
+> at init z **0.793** (feet-on-ground), released with **cat-3**, from a **fresh** deploy. z=0.8
+> jams the knees to ~1.9 and topples on release; SOFT hold flails. See `SIM_RESILIENCE_PLAN.md`
+> §8 and memory `sim-resilience-implementation`.
 
 ---
 
@@ -122,8 +133,8 @@ control bandwidth (wider delay margin).
 
 ### 4c. What was ruled out earlier
 Contact model, armature, joint friction, PhysX solver iterations, foot geometry, mass,
-control rate — none explain the RTF dependence (see `isaac-rtf-timing-gap-root-cause`).
-The dependence is purely loop delay.
+control rate — none explain the RTF dependence, and there is **no** PhysX/MuJoCo dynamics
+gap (that earlier framing was wrong). The dependence is purely loop delay.
 
 ---
 

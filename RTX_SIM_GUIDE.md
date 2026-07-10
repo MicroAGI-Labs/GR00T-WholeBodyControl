@@ -76,7 +76,7 @@ so the installed environment survives pod restarts and follows to a new pod.
 ### 1a. System packages (pod is a minimized image)
 
 ```bash
-ssh spark@10.5.1.123
+ssh spark@10.5.7.178
 sudo apt-get update
 sudo apt-get install -y git curl tmux iproute2 \
     libxt6 libvulkan1 vulkan-tools libglu1-mesa libegl1 libgles2 libopengl0 libglx0 libgl1
@@ -281,16 +281,26 @@ tail -3 ~/live-sim/campub.log
 ### 4a. Tunnels (Spark reaches the pod only on :22; forward DDS + camera)
 
 The Spark's WARP profile only lets it reach the pod on `:22`, so tunnel DDS + camera
-over SSH (one connection, both forwards):
+over SSH (one connection, both forwards). **Use the supervised `autossh` tunnel** so a WARP
+hiccup or pod flap self-heals instead of silently killing `rt/lowstate` (a bare `ssh -N`
+does not come back — see [`SIM_RESILIENCE_PLAN.md`](SIM_RESILIENCE_PLAN.md)):
 
 ```bash
-ssh -N -o ServerAliveInterval=30 -o ExitOnForwardFailure=yes \
-    -L 7447:localhost:7447 -L 5555:localhost:5555 spark@<SERVICE_IP>
+./sim_tunnel.sh            # autossh -M0, forwards :7447 + :5555, auto-reconnects
+# endpoint = the `rtx-pod` Host alias in ~/.ssh/config (edit its HostName once per pod restart)
 # verify: nc -z 127.0.0.1 7447 && nc -z 127.0.0.1 5555
 ```
 
-`localhost` in the `-L` target is the pod's own loopback, where the zenoh bridge (`:7447`)
-and camera pub (`:5555`) both listen on `0.0.0.0`.
+`localhost` in the forward target is the pod's own loopback, where the zenoh bridge (`:7447`)
+and camera pub (`:5555`) both listen on `0.0.0.0`. (Plain fallback:
+`ssh -N -o ExitOnForwardFailure=yes -L 7447:localhost:7447 -L 5555:localhost:5555 rtx-pod` —
+but it won't auto-reconnect.)
+
+> **Resilience & auto-recovery:** the deploy now damps on LowState loss and auto-resumes when
+> it returns (`AUTO_RECOVER`, 1 s trigger); the pod shm consumers self-heal a sidecar bounce;
+> and `start_flat.sh` is single-instance (flock + assert). Full design + the SONIC balance
+> recipe (RIGID warmup + `SIM_WARMUP_JOINTS=1` + init z 0.793, RTF 0.10–0.125, cat-3 release):
+> `SIM_RESILIENCE_PLAN.md`.
 
 ### 4a-bis. Watch it: WebRTC 3rd-person viewport (from a WARP laptop, NO tunnel)
 

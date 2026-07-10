@@ -206,6 +206,59 @@
   Real-robot defaults (`CONTROL_WALL_SCALE=1.0`, prediction/gain off) reproduce the
   original behavior exactly.
 
+## 2026-07-10 — Connection resilience + SONIC balancing reproduced (no dynamics gap)
+- Goal: implement [`SIM_RESILIENCE_PLAN.md`](SIM_RESILIENCE_PLAN.md) so the Spark↔RTX6000-sim
+  loop **auto-recovers** from network flaps / process bounces, and confirm SONIC balances the
+  G1 in Isaac under forced disruption. Full plan + status in that doc; details in memory
+  `sim-resilience-implementation`.
+- **Resilience implemented & demonstrated (zero operator input):**
+  - **A — autossh tunnel** (`sim_tunnel.sh` + a `rtx-pod` `~/.ssh/config` alias = single source
+    of truth for the pod endpoint). Replaces the bare `ssh -N -L`; kill the child ssh → it
+    re-establishes `:7447`/`:5555` in ~1 s.
+  - **B — deploy auto-recovery** (`g1_deploy_onnx_ref.cpp`, env-flagged `AUTO_RECOVER=on`): new
+    `RECOVER_DAMPING` state + `FeedHealthy()` (arrival-age **and** `tick`-advance). On LowState
+    loss → damping (threads stay alive, no terminal stop); on return fresh+advancing → soft
+    re-arm via the INIT ramp → auto-resume CONTROL, mode preserved. Damping trigger
+    `AUTO_RECOVER_ABSENT_MS` set to **1 s** (rides out jitter; was 200 ms). Same binary, strictly
+    better on the real robot.
+  - **C — self-healing shm** (pod `dds/sharedmemorymanager.py`, `tools/shared_memory_utils.py`):
+    `resource_tracker.unregister` at every attach-by-name site (a consumer must never unlink a
+    segment it didn't create — CPython unlinks tracked segs on exit) + reopen-on-error + ms
+    timestamps. Proven with a create/attach/exit test; bouncing the camera pub alone now
+    re-reads `cams=[ego_view,left_wrist,right_wrist]` instead of `cams=NONE`.
+  - **D — pod watchdog** (`sim_watchdog.sh`): restarts the sim if `rt/lowstate` dies. Detection
+    verified; the auto-restart path needs flock/backoff refinement before being relied on.
+  - **G — single-instance guard** (added after a duplicate-publisher scare that turned out to be
+    a miscount): `stack_singleton.py` (kill/count/assert by process `comm`, collapses
+    parent+child, never self-matches) + `flock` + post-launch assertion in `start_flat.sh`.
+  - **Forced-disruption tests all auto-recovered:** tunnel flap, camera-pub bounce, and a full
+    sim restart → the deploy damped then resumed on its own each time.
+- **SONIC balancing in Isaac — reproduced (~30 s unaided stand, sway 2–12° with active
+  recovery).** It is a **latency** effect, **not** a PhysX/MuJoCo dynamics gap — the earlier
+  "dynamics gap / doesn't transfer" writeups were wrong; deleted the two hallucinated memories
+  and corrected the rest. Working recipe (order matters):
+  1. **Warmup geometry**: RIGID hold (`SIM_BASE_SOFT=0`) + `SIM_WARMUP_JOINTS=1` (forces the
+     default stance — knee **0.669**, a shallow stand) + init z **0.793** (feet-on-ground for
+     that stance; z=0.8/0.85 jammed the knees to ~1.9 and toppled on release). SOFT hold flails.
+  2. **Fresh deploy** started after the sim is up (don't drag it through sim-restart
+     auto-recoveries), planner + standing (`]`, ENTER, `1`), warm up held, then **cat-3 release**.
+  3. **Slower than the old 0.333**: the current autossh tunnel needs RTF **0.10–0.125**
+     (`/tmp/sim_slowmo`=8–10, matched `CONTROL_WALL_SCALE`) — higher tunnel RTT now, so more
+     delay margin. Feed was smooth (0 gaps >100 ms) and auto-recovery never misfired during the
+     stand. The ~30 s ceiling is marginal stability; indefinite needs a lower actual RTT.
+- **Real bugs found & fixed along the way:**
+  - The flat task had silently regressed to a **fixed-base** robot preset
+    (`g1_29dof_dex3_base_fix` → reverted to `g1_29dof_dex3_wholebody`) — a welded base can't balance.
+  - **The `pkill -f` self-kill footgun** (cost hours): `pkill -9 -f "g1_deploy_onnx_ref"` matches
+    the *shell running it* (the pattern is in that shell's own cmdline) and SIGKILLs it, so the
+    command dies before doing anything — this was behind most "sessions won't launch". Kill via
+    `ps -eo pid,args | awk '/[t]arget…/{print $1}' | xargs -r kill -9` (the `[t]` self-exclusion
+    trick); on the pod use `stack_singleton.py`.
+  - Deploy launch under the harness: the `sonic_deploy` ble.sh pane mangles/eats send-keys of
+    long commands. Reliable path: run the deploy as a tmux pane's **direct command** (no login
+    shell → no ble.sh), stdout→logfile, stdin=PTY (the keyboard handler uses termios raw mode,
+    so it needs a PTY, not a FIFO). The binary needs no conda env.
+
 ## Open TODOs
 - [ ] **Push RTX6000 sim RTF past 0.333** — the main lever is a lower-latency path to the
   pod (co-locate the Spark / direct link): `stable RTF ≈ margin / RTT`, so cutting the
@@ -218,6 +271,12 @@
   Teleop works with it disabled — confirm whether the robot accepts the round-tripped
   `rt/lowcmd` CRC and whether the incoming check can be safely re-enabled (safety
   hardening). Tracked in `gear_sonic_deploy/zenoh/README.md`.
+- [ ] **Indefinite (vs ~30 s) Isaac balance** — the stand is marginally stable at the current
+  tunnel latency (needs RTF 0.10–0.125). The real fix is a lower actual RTT to the pod
+  (co-locate / faster link); `stable RTF ≈ margin / RTT`. See `RTX_SIM_LATENCY.md` §7.
+- [ ] **Refine the pod watchdog auto-restart** (`sim_watchdog.sh`): detection works, but the
+  restart contends on the WS-G `flock` when it retries — add single-in-flight + backoff so a
+  dead sim reliably comes back (the deploy already auto-recovers once lowstate returns).
 
 ## Key Lessons So Far
 - External high-power compute (Spark) + frozen robot (G1) is the right pragmatic split.
@@ -240,5 +299,20 @@
   only ~18–20 ms of loop delay; over a fixed ~38 ms round-trip that pins the stable sim RTF
   near 0.33. Measure warm RTT (not the deploy's locally-stamped "age") to know the real
   budget, and match `CONTROL_WALL_SCALE` to the sim RTF. Prediction/gain-softening don't
-  rescue a slow-growing delay instability — widen the margin (retrain) or cut the delay
-  (network) instead.
+  rescue a slow-growing delay instability — cut the delay (network) instead.
+- **There is no SONIC/Isaac "dynamics gap".** SONIC balances the G1 in Isaac fine when the sim
+  runs slow enough for the round-trip latency; the earlier "MuJoCo balances, PhysX doesn't /
+  doesn't transfer" conclusion was a wrong intermediate hypothesis (it had ruled out
+  contact/armature/friction/solver/mass — all irrelevant because latency dominated). Deleted
+  those hallucinated writeups. What *does* matter for a clean stand is the **warmup geometry**:
+  hold the robot RIGIDLY in the policy's default stance (`SIM_BASE_SOFT=0` + `SIM_WARMUP_JOINTS=1`)
+  at the feet-on-ground base height (init z 0.793), release with cat-3, from a *fresh* deploy.
+- **Design for fail-then-auto-recover, not fail-safe-and-stop.** A remote-driven controller
+  should treat a feed gap as a transient: drop to damping, keep the realtime threads alive, and
+  auto-re-arm (soft-ramp from measured pose) when the feed returns — no operator input, no
+  process restart. Pair it with a self-healing transport (autossh) and self-healing shm
+  (opt out of `resource_tracker` so a consumer never unlinks the producer's segment on exit).
+- **`pkill -f <pattern>` self-matches and SIGKILLs its own shell** when the pattern appears in
+  that shell's command line — it silently aborts the whole command (before e.g. `tmux
+  new-session`). Kill via `ps | awk '/[p]attern/'` (bracket self-exclusion) or a `comm`-based
+  helper; same class of bug as `pgrep -f` inflating process counts by matching itself.

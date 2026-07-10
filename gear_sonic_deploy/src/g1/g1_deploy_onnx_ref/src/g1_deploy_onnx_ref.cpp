@@ -167,7 +167,7 @@ using namespace unitree_hg::msg::dds_;
 class G1Deploy {
   private:
     /// State machine for the control loop lifecycle.
-    enum class ProgramState { INIT, WAIT_FOR_CONTROL, CONTROL };
+    enum class ProgramState { INIT, WAIT_FOR_CONTROL, CONTROL, RECOVER_DAMPING };
     
     // =========================================================================
     // Core timing, mode, and counters
@@ -303,6 +303,22 @@ class G1Deploy {
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
+
+    // ---- Auto-recovery (SIM_RESILIENCE_PLAN.md Workstream B) ----------------
+    // When the LowState feed drops (network flap / sidecar bounce / shm glitch)
+    // the control loop enters RECOVER_DAMPING (emit damping, keep threads alive)
+    // instead of terminally stopping; when the feed returns fresh AND advancing
+    // for auto_recover_stable_, it soft-ramps from the measured pose (reusing the
+    // INIT ramp) and auto-resumes CONTROL with the pre-loss mode -- no operator
+    // input. Enabled by default (strict improvement on the real robot too);
+    // AUTO_RECOVER=0 restores the old terminal-stop behaviour.
+    bool auto_recover_enabled_ = true;
+    std::chrono::milliseconds auto_recover_absent_{1000};  ///< feed age/frozen -> damp (~1s; ride out flaps/jitter)
+    std::chrono::milliseconds auto_recover_stable_{300};   ///< healthy this long -> re-arm
+    bool auto_resume_pending_ = false;                    ///< INIT should auto-start CONTROL
+    uint32_t last_health_tick_ = 0;                       ///< frozen-feed detection
+    std::chrono::steady_clock::time_point last_tick_change_{};
+    std::chrono::steady_clock::time_point feed_healthy_since_{};
     
     // =========================================================================
     // Logging / recording streams
@@ -2611,6 +2627,21 @@ class G1Deploy {
       std::cout << "[deploy] PRED_HORIZON_S=" << pred_horizon_s_
                 << " (forward state prediction to cancel loop delay; 0 = off)" << std::endl;
 
+      // Auto-recovery (SIM_RESILIENCE_PLAN.md Workstream B): on LowState feed loss,
+      // drop to damping and auto-resume when it returns instead of terminal-stopping.
+      // Default on (strict improvement on the real robot too). AUTO_RECOVER=0 restores
+      // the old terminal-stop path. Thresholds tunable via env (ms).
+      { const char* e = std::getenv("AUTO_RECOVER");
+        if (e) auto_recover_enabled_ = (std::string(e) != "0"); }
+      { const char* e = std::getenv("AUTO_RECOVER_ABSENT_MS");
+        if (e) { int v = std::atoi(e); if (v >= 40 && v <= 5000) auto_recover_absent_ = std::chrono::milliseconds(v); } }
+      { const char* e = std::getenv("AUTO_RECOVER_STABLE_MS");
+        if (e) { int v = std::atoi(e); if (v >= 50 && v <= 10000) auto_recover_stable_ = std::chrono::milliseconds(v); } }
+      std::cout << "[deploy] AUTO_RECOVER=" << (auto_recover_enabled_ ? "on" : "off")
+                << " absent=" << auto_recover_absent_.count() << "ms"
+                << " stable=" << auto_recover_stable_.count() << "ms"
+                << " (feed-loss -> damping -> auto re-arm; 0 = terminal stop)" << std::endl;
+
       // create threads
       input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6 / wall_scale, &G1Deploy::Input, this);
       command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6 / wall_scale,
@@ -2896,6 +2927,24 @@ class G1Deploy {
         return false;
       }
 
+      return true;
+    }
+
+    /// Auto-recovery liveness check (SIM_RESILIENCE_PLAN.md Workstream B).
+    /// True iff LowState is both ARRIVING (age < auto_recover_absent_) and
+    /// ADVANCING (tick changed within that window). Unlike CheckSafety this is
+    /// active in sim mode too, and the tick test catches a frozen-but-present
+    /// feed (e.g. Zenoh re-delivering a stale sample after a reconnect) that a
+    /// pure arrival-age test would miss. Side-effect: updates the tick tracker.
+    bool FeedHealthy() {
+      auto d = low_state_buffer_.GetDataWithTime();
+      if (!d.data) return false;
+      auto now = std::chrono::steady_clock::now();
+      if (now - d.timestamp > auto_recover_absent_) return false;   // arrivals stopped
+      uint32_t tk = d.data->tick();
+      if (last_tick_change_.time_since_epoch().count() == 0) last_tick_change_ = now;
+      if (tk != last_health_tick_) { last_health_tick_ = tk; last_tick_change_ = now; }
+      if (now - last_tick_change_ > auto_recover_absent_) return false;  // frozen feed
       return true;
     }
 
@@ -3923,6 +3972,14 @@ class G1Deploy {
 
       switch (program_state_) {
         case ProgramState::INIT:
+          // Auto-recovery re-arm: if the feed drops again mid-ramp, fall back to
+          // damping rather than ramping on a stale/absent state.
+          if (auto_resume_pending_ && auto_recover_enabled_ && !FeedHealthy()) {
+            std::cout << "[Recover] Feed dropped during re-arm ramp — back to damping." << std::endl;
+            feed_healthy_since_ = std::chrono::steady_clock::time_point{};
+            program_state_ = ProgramState::RECOVER_DAMPING;
+            break;
+          }
           if (!InitControl()) {
             std::cout << "LowState is not available, waiting for robot to be ready" << std::endl;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -3942,6 +3999,14 @@ class G1Deploy {
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
           for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
+          // Auto-recovery: the re-arm ramp finished, so resume CONTROL without an
+          // operator "start". Mode state (planner/encoder/current_motion_) was never
+          // torn down, so control resumes exactly where it left off.
+          if (auto_resume_pending_) {
+            auto_resume_pending_ = false;
+            operator_state.start = true;
+            std::cout << "[Recover] Re-arm ramp complete — auto-resuming CONTROL." << std::endl;
+          }
           if (operator_state.start) {
             // Warn if starting control in token mode without tokens, but allow it
             if (initial_encoder_mode_ == -1 && !first_token_received_) {
@@ -3957,8 +4022,37 @@ class G1Deploy {
           }
           break;
 
+        case ProgramState::RECOVER_DAMPING: {
+          // Feed lost: hold the robot in damping (all threads stay alive) and watch
+          // for the feed to return fresh AND advancing for auto_recover_stable_,
+          // then soft-ramp back via INIT and auto-resume CONTROL (mode preserved) —
+          // no operator input. SIM_RESILIENCE_PLAN.md Workstream B.
+          CreateDampingCommand();
+          auto now = std::chrono::steady_clock::now();
+          if (FeedHealthy()) {
+            if (feed_healthy_since_.time_since_epoch().count() == 0) feed_healthy_since_ = now;
+            if (now - feed_healthy_since_ >= auto_recover_stable_) {
+              std::cout << "[Recover] LowState feed restored and stable — soft re-arm." << std::endl;
+              time_ = 0.0;                    // reset the INIT ramp timer
+              auto_resume_pending_ = true;    // INIT -> WAIT_FOR_CONTROL -> auto CONTROL
+              program_state_ = ProgramState::INIT;
+            }
+          } else {
+            feed_healthy_since_ = std::chrono::steady_clock::time_point{};  // reset debounce
+          }
+          break;
+        }
+
         case ProgramState::CONTROL: {
-          if (!CheckSafety()) {
+          if (auto_recover_enabled_) {
+            // Non-terminal loss handling: drop to damping and auto-resume later.
+            if (!FeedHealthy()) {
+              std::cout << "[Recover] LowState feed lost — entering damping; will auto-resume when it returns." << std::endl;
+              feed_healthy_since_ = std::chrono::steady_clock::time_point{};
+              program_state_ = ProgramState::RECOVER_DAMPING;
+              break;
+            }
+          } else if (!CheckSafety()) {
             std::cout << "[ERROR] Safety check failed, stopping control." << std::endl;
             operator_state.stop = true;
             break;
