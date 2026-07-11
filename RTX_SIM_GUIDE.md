@@ -302,6 +302,29 @@ but it won't auto-reconnect.)
 > recipe (RIGID warmup + `SIM_WARMUP_JOINTS=1` + init z 0.793, RTF 0.10–0.125, cat-3 release):
 > `SIM_RESILIENCE_PLAN.md`.
 
+### 4a-flat. Flat-world SONIC balance (verified RTF 0.10)
+
+Use `start_flat.sh` for the free-base, flat-world task. It intentionally uses GPU physics
+(`--device cuda`); the CPU-physics recommendation in §6 applies to the single-env
+pick/place task, not this balance recipe.
+
+```bash
+# RTX pod: start from a clean flat stack and hold the upright stance while SONIC warms up.
+echo 10 > /tmp/sim_slowmo
+SIM_SLOWMO=10 SIM_BASE_HOLD_S=9999 SIM_BASE_SOFT=0 SIM_WARMUP_JOINTS=1 \
+  bash ~/live-sim/start_flat.sh
+
+# Spark: launch a fresh sim deploy with matching wall-time scaling.
+ZENOH_JETSON_ENDPOINT=tcp/127.0.0.1:7447 UHLC_MAX_DELTA_MS=2000 \
+  CONTROL_WALL_SCALE=0.1 DEPLOY_YES=1 \
+  ./deploy.sh --input-type zmq_manager --output-type all g1zenoh
+```
+
+Start the controller, send cat-4 to teleport/re-arm the upright hold, allow the planner to
+initialize, then send cat-3 to release. In `sim_main.py`, cat-3 and cat-4 **must not** be
+gated by `not args_cli.enable_wholebody_dds`; otherwise this workflow is silently ignored by
+the flat task.
+
 ### 4a-bis. Watch it: WebRTC 3rd-person viewport (from a WARP laptop, NO tunnel)
 
 The Omniverse viewport livestream (enabled by `--livestream_type 2 --public_ip <POD_IP>`
@@ -471,11 +494,12 @@ Authoritative RTF (measured via `env.sim.current_time` vs wall-clock), single en
 10. **Wire parity is verifiable:** the camera message's `images` dict must have keys
     `ego_view` / `left_wrist` / `right_wrist` (480×640×3 uint8). The VLA client reads
     `images["ego_view"]` directly — a `head` key gives `KeyError: 'ego_view'` (see §2).
-11. **Shared memory is fragile — the sim owns it; don't touch `/dev/shm` and don't bounce
-    the pub alone.** Both the camera feed *and* the DDS state path run through Python
+11. **Shared memory is fragile — the sim owns it; don't touch `/dev/shm`.** Both the camera
+    feed *and* the DDS state path run through Python
     `multiprocessing.shared_memory` segments (named `/dev/shm/psm_*`). Two ways to break it,
     both seen in practice:
-    - **Restarting the camera pub alone** while the sim runs: `MultiImageReader`'s
+    - **On deployments without the resilience patch, restarting the camera pub alone** while
+      the sim runs: `MultiImageReader`'s
       `resource_tracker` *unlinks* the segments on exit ("N leaked shared_memory objects to
       clean up at shutdown"), so the new pub reads **0 frames / `cams=NONE`**.
     - **`rm -f /dev/shm/psm_*`**: this also nukes the **DDS input shm**, so
@@ -484,7 +508,9 @@ Authoritative RTF (measured via `env.sim.current_time` vs wall-clock), single en
       stepping, and `ls /dev/shm | grep -c psm` shows `0`. Camera may still work (its pub
       holds an open fd), which makes this very confusing. **Never `rm /dev/shm/psm_*`.**
 
-    Recovery for either: restart the **whole sim stack together** — `pkill -9 -f sim_main.py;
+    With the implemented self-healing reader patch, a sidecar bounce re-attaches safely; this
+    must be verified by observing resumed cameras and `rt/lowstate`. Recovery for either
+    failure on an unpatched deployment: restart the **whole sim stack together** — `pkill -9 -f sim_main.py;
     pkill -9 -f gear_sonic_camera_pub; pkill -9 -f zenoh-bridge-dds; pkill -9 -f
     secondary_imu_adapter; sleep 3; bash ~/live-sim/start_all.sh` (no `rm`; let the fresh sim
     recreate its own segments). Verify with `ls /dev/shm | grep -c psm` (should be >0) and a

@@ -232,12 +232,13 @@ Forced-disruption tests all auto-recovered with **zero operator input**: tunnel 
 (autossh healed → deploy damped → resumed), camera-pub bounce (shm re-attached, `cams=[…]`
 not `NONE`), and full sim restart (deploy damped → auto-resumed).
 
-**Balancing achieved:** SONIC balances the G1 unaided in Isaac ~30 s (sway 2–12°, active
-recovery) — a latency effect, no dynamics gap. Working recipe: RIGID hold +
-`SIM_WARMUP_JOINTS=1` + init z 0.793 (clean default stance), **fresh** deploy,
-`sim_slowmo`=8–10 (RTF 0.10–0.125) with matched `CONTROL_WALL_SCALE`, cat-3 release. The
-~30 s ceiling is marginal stability; indefinite balance needs lower actual RTT. See memory
-`sim-resilience-implementation` and `RTX_SIM_LATENCY.md`.
+**Balancing achieved:** SONIC balances the G1 unaided in Isaac for **60 s** at RTF 0.10
+(final tilt ≈2.5°, no fall). Working recipe: RIGID hold + `SIM_WARMUP_JOINTS=1` + init z
+0.793 (clean default stance), **fresh** deploy, `sim_slowmo=10` with matched
+`CONTROL_WALL_SCALE=0.1`, then cat-4 re-arm and cat-3 release. The whole-body flat task
+must accept cat-3/cat-4 even with `--enable_wholebody_dds`; do not gate those handlers to
+the non-whole-body path. See memory `sim-resilience-implementation` and
+`RTX_SIM_LATENCY.md`.
 
 Deferred (§3): control plane, Docker removal, bridge simplification. The D watchdog's
 auto-restart path should get flock/backoff refinement before being relied on.

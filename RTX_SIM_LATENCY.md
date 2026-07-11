@@ -19,7 +19,8 @@ memory `sonic-rtf-delay-tolerance-levers`, `sim-resilience-implementation`,
 > **0.10–0.125** (`sim_slowmo` 8–10), not 0.333 — same law (`stable RTF ≈ margin / RTT`),
 > just a bigger RTT. (2) A clean release requires the right **warmup geometry**: RIGID hold
 > (`SIM_BASE_SOFT=0`) + `SIM_WARMUP_JOINTS=1` holding the policy's default stance (knee 0.669)
-> at init z **0.793** (feet-on-ground), released with **cat-3**, from a **fresh** deploy. z=0.8
+> at init z **0.793** (feet-on-ground), from a **fresh** deploy. First send cat-4 to re-arm
+> the upright hold, then release with cat-3. z=0.8
 > jams the knees to ~1.9 and topples on release; SOFT hold flails. See `SIM_RESILIENCE_PLAN.md`
 > §8 and memory `sim-resilience-implementation`.
 
@@ -140,14 +141,13 @@ gap (that earlier framing was wrong). The dependence is purely loop delay.
 
 ## 5. Result and operating point
 
-**RTF 0.333 is the stable ceiling** and is now the default sim operating point:
-- Deploy: `CONTROL_WALL_SCALE=0.333` (must equal sim RTF).
-- Pod sim: `/tmp/sim_slowmo=3` (RTF = 1 / slowmo).
-- Confirmed: 30 s+ unaided stand, tilt settles to sub-1° mid-run, bounded ~5° limit
-  cycle, |ω| low, no divergence.
+**RTF 0.10 is the verified operating point with the current autossh tunnel:**
+- Deploy: `CONTROL_WALL_SCALE=0.1` (must equal sim RTF).
+- Pod sim: `/tmp/sim_slowmo=10` (RTF = 1 / slowmo).
+- Confirmed: 60 s unaided stand; final tilt ≈2.5° with no fall.
 
-This is **1.67× faster** than the previous RTF 0.2 operating point, while keeping the
-G1 upright under SONIC control on the Spark.
+This keeps the G1 upright under SONIC control on the Spark despite the current tunnel
+latency.
 
 ### Real-robot path is preserved
 All new deploy code is off by default:
@@ -163,17 +163,18 @@ Launch the *same* binary for hardware with no knobs set → identical behavior t
 
 ```bash
 # --- pod (RTX6000) ---
-echo 3 > /tmp/sim_slowmo                     # RTF 0.333 (sim re-reads live)
+echo 10 > /tmp/sim_slowmo                    # RTF 0.10 (sim re-reads live)
 
 # --- Spark ---
 echo "1.0 1.0" > /tmp/gain_scale             # gain scaling off
 echo "0.0"     > /tmp/pred_horizon           # prediction off
-CONTROL_WALL_SCALE=0.333 ./run_deploy_direct.sh   # in tmux `sonic_deploy`
+CONTROL_WALL_SCALE=0.1 ./run_deploy_direct.sh     # in tmux `sonic_deploy`
 #   then in the deploy: ']' start, ENTER enable planner, '1' standing set
 
 # release the sim base-hold so SONIC balances unaided (pod, DDS domain 1):
-#   ~/live-sim/venv/bin/python ~/live-sim/fire_reset.py 0 3   # cat3 = release
-#   (cat4 = re-pin upright to retry;  LD_LIBRARY_PATH=~/live-sim/cyclonedds/install/lib, env -u CYCLONEDDS_URI)
+#   ~/live-sim/venv/bin/python ~/live-sim/fire_reset.py 0 4   # cat4 = re-arm upright hold
+#   ~/live-sim/venv/bin/python ~/live-sim/fire_reset.py 0 3   # cat3 = release after planner warmup
+#   (LD_LIBRARY_PATH=~/live-sim/cyclonedds/install/lib, env -u CYCLONEDDS_URI)
 
 # observe tilt (Spark, domain 0):
 .venv_sim/bin/python io_capture.py 0 check 20
