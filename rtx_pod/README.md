@@ -26,6 +26,7 @@ version-controlled and reviewable.
 | `gear_sonic_camera_pub.py` | Publishes sim cameras on ZMQ `:5555` in the Orin wire format (keys `ego_view`/`left_wrist`/`right_wrist`). |
 | `zenoh-sim-bridge.json5` | Pod zenoh-bridge-dds config (domain 1, listen `:7447`). |
 | `fire_reset.py` | Publish `rt/reset_pose/cmd` (domain 1): cat-2 teleport-upright+release, cat-3 release-in-place, cat-4 re-arm hold. |
+| `g1_dds_diag.py` | Balance-stack DDS diagnostics CLI over `rt/lowstate`/`rt/lowcmd`. Subcommands: `watch` (live tilt/knee/\|gyro\| stand check), `capture` (29-joint measured+commanded + IMU → CSV), `probe` (lowstate inter-arrival gaps, diagnoses 'Lost LowState'), `warm` (hold the zenoh↔DDS route warm). `--domain 0` = Spark/deploy side, `1` = pod sim. |
 
 ## Our edits to the vendored `unitree_sim_isaaclab/` → same relative path on the pod
 
