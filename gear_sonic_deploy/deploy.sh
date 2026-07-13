@@ -598,7 +598,7 @@ XML
   plugins: {
     dds: {
       domain: 0,
-      allow: ["rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/api/motion_switcher/request", "rt/api/motion_switcher/response"],
+      allow: ["rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/eval", "rt/api/motion_switcher/request", "rt/api/motion_switcher/response"],
       forward_discovery: true
     }
   },

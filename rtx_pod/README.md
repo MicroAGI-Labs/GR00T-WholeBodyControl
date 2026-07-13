@@ -26,7 +26,8 @@ version-controlled and reviewable.
 | `gear_sonic_camera_pub.py` | Publishes sim cameras on ZMQ `:5555` in the Orin wire format (keys `ego_view`/`left_wrist`/`right_wrist`). |
 | `zenoh-sim-bridge.json5` | Pod zenoh-bridge-dds config (domain 1, listen `:7447`). |
 | `fire_reset.py` | Publish `rt/reset_pose/cmd` (domain 1): cat-2 teleport-upright+release, cat-3 release-in-place, cat-4 re-arm hold. |
-| `g1_dds_diag.py` | Balance-stack DDS diagnostics CLI over `rt/lowstate`/`rt/lowcmd`. Subcommands: `watch` (live tilt/knee/\|gyro\| stand check), `capture` (29-joint measured+commanded + IMU → CSV), `probe` (lowstate inter-arrival gaps, diagnoses 'Lost LowState'), `warm` (hold the zenoh↔DDS route warm). `--domain 0` = Spark/deploy side, `1` = pod sim. |
+| `g1_dds_diag.py` | Balance-stack DDS diagnostics CLI over `rt/lowstate`/`rt/lowcmd`/`rt/eval`. Subcommands: `watch` (live tilt/knee/\|gyro\| stand check), `eval` (print the in-sim balance eval stream — termination + result score), `capture` (29-joint measured+commanded + IMU → CSV), `probe` (lowstate inter-arrival gaps, diagnoses 'Lost LowState'), `warm` (hold the zenoh↔DDS route warm). `--domain 0` = Spark/deploy side, `1` = pod sim. |
+| `unitree_sim_isaaclab/tools/stand_eval.py` | **Deterministic in-sim balance eval** → publishes `rt/eval` (std_msgs/String JSON). `termination` 0→1 (1 = a full 60 s sim-time stand = success, or a fall) and `result` −100…100 (100 = perfect upright at start; penalties for distance-from-start [≥2 m ⇒ −99], squat, and out-of-band joints; −100 = fall). Runs inside the sim loop (needs world pose + sim-time, absent from `rt/lowstate`); armed on hold-release, disarmed on cat-4 re-arm. Env-tunable (`EVAL_WINDOW_S`, `EVAL_DIST_MAX_M`, `EVAL_FALL_TILT_DEG`, …); disable with `EVAL=0`. |
 
 ## Our edits to the vendored `unitree_sim_isaaclab/` → same relative path on the pod
 
@@ -37,6 +38,12 @@ version-controlled and reviewable.
 | `tasks/g1_tasks/flat_g1_29dof_dex3/flat_g1_29dof_dex3_env_cfg.py` | Floating-base preset (`g1_29dof_dex3_wholebody`, reverted from a `base_fix` regression); init z `0.793` (feet-on-ground for the SONIC default stance). |
 | `tasks/common_observations/g1_29dof_state.py` | Main `rt/lowstate.imu_state` = PELVIS IMU (`use_torso_imu=False`), matching MuJoCo/training. |
 | `dds/g1_robot_dds.py` | IMU quaternion order `[w,x,y,z]` to match the real Unitree LowState. |
+| `sim_main.py` | (a) Hooks for `tools/stand_eval.py`: instantiate `StandEval` before the loop (`EVAL=1`), `arm()` on hold-release (cat-2/cat-3), `disarm()` on re-arm (cat-4), `update()` each control step. (b) File-triggered external-force disturbance for eval testing: `echo "fx fy fz [dur_s]" > $SIM_PUSH_FILE` (default `/tmp/sim_push`) applies a one-shot global wrench on the pelvis (e.g. `0 0 -900 0.6` = a downward shove to force a fall); fires once per distinct content, only while the base-hold is released. |
+
+> **`rt/eval` must be in BOTH zenoh allow-lists** to reach the Spark: the pod
+> `zenoh-sim-bridge.json5` (domain 1) **and** the Spark-side `zenoh-spark-config.json5`
+> (domain 0, bind-mounted into the `zenoh-spark-bridge` container). Restart both bridges
+> after editing, or just re-run `start_flat.sh` + `docker restart zenoh-spark-bridge`.
 
 See `../SIM_RESILIENCE_PLAN.md`, `../RTX_SIM_GUIDE.md`, and memory
 `sim-resilience-implementation` for how these fit together and the balance recipe.

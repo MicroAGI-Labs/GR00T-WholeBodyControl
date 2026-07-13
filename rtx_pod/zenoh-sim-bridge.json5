@@ -5,7 +5,7 @@
   plugins: {
     dds: {
       domain: 1,
-      allow: ["rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/reset_pose/cmd", "rt/api/motion_switcher/request", "rt/api/motion_switcher/response"],
+      allow: ["rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/reset_pose/cmd", "rt/eval", "rt/api/motion_switcher/request", "rt/api/motion_switcher/response"],
       forward_discovery: true
     }
   },

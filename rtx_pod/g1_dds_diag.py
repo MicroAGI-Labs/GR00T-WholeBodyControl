@@ -9,6 +9,7 @@ debugging the Isaac-sim balance work into a single reusable tool.
 Subcommands
 -----------
   watch     live base tilt / knee / |gyro| — the quick "is it standing?" check
+  eval      print the in-sim deterministic balance eval (rt/eval: termination + score)
   capture   record measured+commanded 29-joint state + IMU to a CSV
   probe     rt/lowstate inter-arrival gaps — diagnose the deploy's 'Lost LowState'
   warm      hold the zenoh<->DDS route warm (persistent subscriber)
@@ -40,6 +41,7 @@ except ModuleNotFoundError:
     sys.path.insert(0, os.path.expanduser("~/unitree_sdk2_python"))
     from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
 from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_, LowCmd_
+from unitree_sdk2py.idl.std_msgs.msg.dds_ import String_
 
 N = 29  # G1 29-DoF
 
@@ -90,6 +92,35 @@ def cmd_watch(args):
             knee = (st["knee"][0] + st["knee"][1]) / 2
             print(f"  t={time.time()-t0:5.1f}s  tilt={tilt_deg(st['quat']):5.1f}deg  "
                   f"knee={knee:5.3f}  |gyro|={gyro_norm(st['gyro']):4.2f}", flush=True)
+        time.sleep(args.interval)
+
+
+# ---------------------------------------------------------------------------- eval
+def cmd_eval(args):
+    """Print the in-sim balance eval stream (rt/eval): termination + result score."""
+    import json
+    _init(args.domain)
+    st = {"last": None}
+    ChannelSubscriber("rt/eval", String_).Init(lambda m: st.__setitem__("last", m.data), 10)
+    print(f"[eval] domain={args.domain}  waiting for rt/eval...", flush=True)
+    t0 = time.time()
+    seen = None
+    while args.dur <= 0 or time.time() - t0 < args.dur:
+        raw = st["last"]
+        if raw and raw != seen:
+            seen = raw
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                print(f"  (unparseable) {raw}", flush=True)
+                time.sleep(args.interval)
+                continue
+            flag = "FALL" if d.get("fallen") else ("SUCCESS" if d.get("termination", 0) >= 1
+                                                   else ("stand" if d.get("standing") else "hold"))
+            print(f"  t={d.get('t', 0):6.2f}s  term={d.get('termination', 0):5.3f}  "
+                  f"result={d.get('result', 0):+7.2f}  [{flag:7s}] "
+                  f"dist={d.get('dist', 0):5.2f}m z={d.get('height', 0):5.3f} "
+                  f"tilt={d.get('tilt', 0):5.1f}deg  {d.get('reason', '')}", flush=True)
         time.sleep(args.interval)
 
 
@@ -198,6 +229,11 @@ def main():
     w.add_argument("dur", nargs="?", type=float, default=0.0, help="seconds (0=forever)")
     w.add_argument("--interval", type=float, default=0.5)
     w.set_defaults(func=cmd_watch)
+
+    ev = sub.add_parser("eval", help="print the in-sim balance eval stream (rt/eval)")
+    ev.add_argument("dur", nargs="?", type=float, default=0.0, help="seconds (0=forever)")
+    ev.add_argument("--interval", type=float, default=0.2)
+    ev.set_defaults(func=cmd_eval)
 
     c = sub.add_parser("capture", help="record 29-joint measured+commanded + IMU to CSV")
     c.add_argument("dur", nargs="?", type=float, default=16.0)
