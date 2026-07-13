@@ -17,6 +17,7 @@ version-controlled and reviewable.
 | File | Role |
 |---|---|
 | `start_flat.sh` | One-command bring-up of the floating-base balance stack (`Isaac-Flat-G129-Dex3`, `dds_lowcmd29`). Single-instance: `flock` guard + robust clean-slate + post-launch `stack_singleton assert`. |
+| `bridge_supervisor.sh` | Keeps the pod `zenoh-bridge-dds` process alive. The bridge may start before or after the Spark bridge/tunnel; Zenoh reconnects peers and this supervisor only respawns a dead local binary. |
 | `start_all.sh` | Bring-up of the fixed-base manipulation stack (`PickPlace-Cylinder-…-Joint`). |
 | `start_sim.sh` | Low-level sim launcher (pkill + venv + `LD_LIBRARY_PATH` + pidfile + log). |
 | `stack_singleton.py` | Robust single-instance control — `kill` / `count` / `assert` by process `comm` (collapses parent+child, never self-matches like `pgrep -f`). |

@@ -31,6 +31,25 @@ SIM_ARGS="--device cuda --headless --enable_cameras --task Isaac-Flat-G129-Dex3 
 
 alive() { local p; p="$(cat "$1" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
 
+# Stop only the PID we started.  Do not use `pkill -f` here: the bridge's name
+# appears in this shell's command line, so that pattern can kill the bring-up
+# shell itself and strand the stack with no Zenoh listener.
+stop_pidfile() {
+  local pidfile="$1" pid
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$pid" ] && kill "$pid" 2>/dev/null || true
+  rm -f "$pidfile"
+}
+
+start_zenoh_bridge() {
+  env -u CYCLONEDDS_URI \
+      LD_LIBRARY_PATH=/usr/local/nvidia/lib64 \
+      UHLC_MAX_DELTA_MS=2000 \
+      setsid "$LS/zenoh-bridge-dds" --config "$LS/zenoh-sim-bridge.json5" \
+      > "$LS/zenoh_bridge.log" 2>&1 < /dev/null &
+  echo $! > "$LS/zenoh.pid"
+}
+
 # ---- Kill the camera pub BEFORE (re)launching the sim (shm-race guard) -------
 echo "==> [0/4] clearing any stale camera pub (shm-race guard)"
 tmux kill-session -t campub 2>/dev/null || true
@@ -54,13 +73,16 @@ done
 [ "$ready" = 1 ] || { echo "    ERROR: sim did not reach stepping within timeout."; tail -25 "$LS/sim_run.log"; exit 1; }
 
 echo "==> [2/4] Zenoh DDS bridge"
-pkill -9 -f "zenoh-bridge-dds" 2>/dev/null; sleep 1
-env -u CYCLONEDDS_URI \
-    LD_LIBRARY_PATH=/usr/local/nvidia/lib64 \
-    UHLC_MAX_DELTA_MS=2000 \
-    nohup "$LS/zenoh-bridge-dds" --config "$LS/zenoh-sim-bridge.json5" \
-    > "$LS/zenoh_bridge.log" 2>&1 &
-echo $! > "$LS/zenoh.pid"
+stop_pidfile "$LS/zenoh.pid"; sleep 1
+start_zenoh_bridge
+
+# The peer may start before or after the Spark tunnel/bridge.  Zenoh reconnects
+# on its own, and this lightweight supervisor also respawns the local bridge if
+# the binary itself exits; neither restart order requires a manual bridge restart.
+if ! alive "$LS/bridge_supervisor.pid"; then
+  setsid bash "$LS/bridge_supervisor.sh" > "$LS/bridge_supervisor.log" 2>&1 < /dev/null &
+  echo $! > "$LS/bridge_supervisor.pid"
+fi
 
 echo "==> [3/4] Secondary IMU adapter"
 pkill -9 -f "secondary_imu_adapter.py" 2>/dev/null; sleep 1

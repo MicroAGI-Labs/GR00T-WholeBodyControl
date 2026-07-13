@@ -222,11 +222,17 @@ CONTROL  ──(lowstate absent > T_absent)──►  RECOVER_DAMPING
 
 ## 8. Status
 
-**Implemented & verified 2026-07-10.** All workstreams done: A (autossh, `sim_tunnel.sh` +
+**Implemented & verified 2026-07-10; hardened 2026-07-11.** All workstreams done: A (autossh, `sim_tunnel.sh` +
 `rtx-pod` ssh alias), B (deploy auto-recovery — `RECOVER_DAMPING` state, **1 s** trigger,
 auto re-arm), C (self-healing shm — `resource_tracker` opt-out + reopen, proven), D (pod
 watchdog `sim_watchdog.sh` — detection verified), plus **G** (single-instance guard
 `stack_singleton.py` + `flock` in `start_flat.sh`, added after a duplicate-publisher scare).
+
+The pod bridge is also supervised by `bridge_supervisor.sh`. `start_flat.sh` uses
+PID-file-based bridge shutdown rather than `pkill -f` (which can self-match the
+bring-up shell), so a pod bridge restart, Spark bridge restart, or tunnel restart
+may occur in any order: Zenoh reconnects the peer and the supervisor respawns a
+dead pod bridge.
 
 Forced-disruption tests all auto-recovered with **zero operator input**: tunnel flap
 (autossh healed → deploy damped → resumed), camera-pub bounce (shm re-attached, `cams=[…]`
