@@ -202,6 +202,38 @@ class H2Converter(IsaacLabMuJoCoConverter):
     FOOT_BODY_NAMES = ["left_ankle_roll_link", "right_ankle_roll_link"]
 
 
+class Tiangong2DexConverter(IsaacLabMuJoCoConverter):
+    """TienKung 2dex joint/body order converter between IsaacLab and MuJoCo.
+
+    Mirrors H2Converter. TienKung body names differ from Unitree: side is a
+    suffix, torso_link -> waist_pitch_link, and the wrist chain ends at
+    wrist_roll_{l,r}_link. VR_3POINTS uses the 2nd-to-last wrist link
+    (wrist_pitch_{l,r}_link), matching H2Converter's use of wrist_pitch.
+    """
+
+    def __init__(self):
+        from gear_sonic.envs.manager_env.robots.tiangong2dex import (
+            TIANGONG2DEX_ISAACLAB_JOINTS,
+            TIANGONG2DEX_ISAACLAB_TO_MUJOCO_BODY,
+            TIANGONG2DEX_ISAACLAB_TO_MUJOCO_DOF,
+            TIANGONG2DEX_MUJOCO_TO_ISAACLAB_BODY,
+            TIANGONG2DEX_MUJOCO_TO_ISAACLAB_DOF,
+        )
+
+        self.JOINT_NAMES = TIANGONG2DEX_ISAACLAB_JOINTS
+        self.DOF_MAPPINGS = {
+            ("isaaclab", "mujoco"): TIANGONG2DEX_ISAACLAB_TO_MUJOCO_DOF,
+            ("mujoco", "isaaclab"): TIANGONG2DEX_MUJOCO_TO_ISAACLAB_DOF,
+        }
+        self.BODY_MAPPINGS = {
+            ("isaaclab", "mujoco"): TIANGONG2DEX_ISAACLAB_TO_MUJOCO_BODY,
+            ("mujoco", "isaaclab"): TIANGONG2DEX_MUJOCO_TO_ISAACLAB_BODY,
+        }
+
+    VR_3POINTS_BODY_NAMES = ["waist_pitch_link", "wrist_pitch_l_link", "wrist_pitch_r_link"]
+    FOOT_BODY_NAMES = ["ankle_roll_l_link", "ankle_roll_r_link"]
+
+
 def load_qpos_from_csv(csv_path: str) -> torch.Tensor:
     """Load qpos [T, D] from CSV."""
     import pandas as pd
