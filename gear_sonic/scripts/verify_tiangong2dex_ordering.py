@@ -34,26 +34,37 @@ sim = SimulationContext(sim_utils.SimulationCfg(dt=0.005, device="cuda:0"))
 robot = Articulation(TIANGONG2DEX_CFG.replace(prim_path="/World/Robot"))
 sim.reset()
 
+result_lines = []
+
+
+def emit(msg):
+    result_lines.append(msg)
+    print(msg, flush=True)
+
+
 observed_bodies = list(robot.body_names)
 observed_joints = list(robot.joint_names)
 expected_bodies = list(TIANGONG2DEX_ISAACLAB_JOINTS)
 
-print(f"observed bodies ({len(observed_bodies)}): {observed_bodies}")
-print(f"observed joints ({len(observed_joints)}): {observed_joints}")
+emit(f"observed bodies ({len(observed_bodies)}): {observed_bodies}")
+emit(f"observed joints ({len(observed_joints)}): {observed_joints}")
 
 ok = True
 if observed_bodies != expected_bodies:
     ok = False
-    print("BODY MISMATCH vs TIANGONG2DEX_ISAACLAB_JOINTS:")
+    emit("BODY MISMATCH vs TIANGONG2DEX_ISAACLAB_JOINTS:")
     for i, (o, e) in enumerate(zip(observed_bodies, expected_bodies)):
         if o != e:
-            print(f"  [{i}] observed={o} expected={e}")
+            emit(f"  [{i}] observed={o} expected={e}")
     if len(observed_bodies) != len(expected_bodies):
-        print(f"  length {len(observed_bodies)} vs {len(expected_bodies)}")
+        emit(f"  length {len(observed_bodies)} vs {len(expected_bodies)}")
 if len(observed_joints) != 31:
     ok = False
-    print(f"JOINT COUNT MISMATCH: {len(observed_joints)} != 31")
+    emit(f"JOINT COUNT MISMATCH: {len(observed_joints)} != 31")
 
-print("ORDERING VERIFIED" if ok else "ORDERING WRONG — regenerate mappings")
+emit("ORDERING VERIFIED" if ok else "ORDERING WRONG — regenerate mappings")
+
+with open("/tmp/tiangong2dex_ordering_result.txt", "w") as f:
+    f.write("\n".join(result_lines) + "\n")
 simulation_app.close()
 sys.exit(0 if ok else 1)
