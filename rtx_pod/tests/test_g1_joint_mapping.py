@@ -11,6 +11,8 @@ sys.path.insert(0, str(POD_SOURCE))
 from dds.g1_joint_mapping import (  # noqa: E402
     UNITREE_FROM_ISAAC_INDICES,
     UNITREE_G1_29_DEFAULT_POSITIONS,
+    UNITREE_G1_29_EFFORT_LIMITS,
+    UNITREE_G1_EFFORT_LIMIT_BY_NAME,
     UNITREE_G1_29_JOINT_NAMES,
     isaac_to_unitree,
     unitree_indices_in,
@@ -45,6 +47,14 @@ class TestG1JointMapping(unittest.TestCase):
         pose = dict(zip(UNITREE_G1_29_JOINT_NAMES, UNITREE_G1_29_DEFAULT_POSITIONS))
         self.assertEqual(pose["left_knee_joint"], 0.669)
         self.assertEqual(pose["right_ankle_pitch_joint"], -0.363)
+
+    def test_sonic_effort_contract_covers_every_hardware_joint(self) -> None:
+        self.assertEqual(len(UNITREE_G1_29_EFFORT_LIMITS), 29)
+        self.assertEqual(set(UNITREE_G1_EFFORT_LIMIT_BY_NAME), set(UNITREE_G1_29_JOINT_NAMES))
+        self.assertEqual(UNITREE_G1_EFFORT_LIMIT_BY_NAME["left_hip_pitch_joint"], 139.0)
+        self.assertEqual(UNITREE_G1_EFFORT_LIMIT_BY_NAME["right_hip_pitch_joint"], 139.0)
+        self.assertEqual(UNITREE_G1_EFFORT_LIMIT_BY_NAME["left_hip_yaw_joint"], 88.0)
+        self.assertEqual(UNITREE_G1_EFFORT_LIMIT_BY_NAME["left_ankle_pitch_joint"], 25.0)
 
     def test_control_maps_every_lowcmd_motor_to_named_isaac_joint(self) -> None:
         existing = [-5000.0 - index for index in range(len(self.isaac_names))]

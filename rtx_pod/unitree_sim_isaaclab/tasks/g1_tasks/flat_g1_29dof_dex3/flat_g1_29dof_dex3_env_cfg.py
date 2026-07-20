@@ -27,8 +27,7 @@ from tasks.g1_tasks.move_cylinder_g1_29dof_dex3_wholebody import mdp
 from tasks.common_config import G1RobotPresets, CameraPresets  # isort: skip
 from tasks.common_event.event_manager import SimpleEvent, SimpleEventManager
 from dds.g1_joint_mapping import (
-    UNITREE_G1_29_DEFAULT_POSITIONS,
-    UNITREE_G1_29_JOINT_NAMES,
+    UNITREE_G1_EFFORT_LIMIT_BY_NAME,
 )
 
 
@@ -133,11 +132,49 @@ class FlatG1Dex3EnvCfg(ManagerBasedRLEnvCfg):
     curriculum = None
 
     def __post_init__(self):
-        # Reset and warmup share SONIC's policy default pose.  Independent
-        # "upright" guesses put the policy out of distribution before release.
-        self.scene.robot.init_state.joint_pos = dict(
-            zip(UNITREE_G1_29_JOINT_NAMES, UNITREE_G1_29_DEFAULT_POSITIONS)
-        )
+        # Match the actuator contract used to scale SONIC's policy actions. The
+        # upstream Isaac G1 preset still caps hip pitch at the old 88 Nm motor,
+        # while this SONIC checkpoint uses the newer 139 Nm 7520_22. That caused
+        # persistent hip saturation, a deep crouch, and an alternating recovery
+        # shuffle even under an IDLE reference.
+        _legs = self.scene.robot.actuators["legs"]
+        _feet = self.scene.robot.actuators["feet"]
+        _legs.effort_limit_sim[".*_hip_pitch_joint"] = UNITREE_G1_EFFORT_LIMIT_BY_NAME[
+            "left_hip_pitch_joint"
+        ]
+        _legs.effort_limit_sim[".*waist_roll_joint"] = UNITREE_G1_EFFORT_LIMIT_BY_NAME[
+            "waist_roll_joint"
+        ]
+        _legs.effort_limit_sim[".*waist_pitch_joint"] = UNITREE_G1_EFFORT_LIMIT_BY_NAME[
+            "waist_pitch_joint"
+        ]
+        _feet.effort_limit_sim[".*_ankle_pitch_joint"] = UNITREE_G1_EFFORT_LIMIT_BY_NAME[
+            "left_ankle_pitch_joint"
+        ]
+        _feet.effort_limit_sim[".*_ankle_roll_joint"] = UNITREE_G1_EFFORT_LIMIT_BY_NAME[
+            "left_ankle_roll_joint"
+        ]
+
+        # Reset and rigid-hold warmup share the measured free-standing
+        # equilibrium from the verified 60 s balance run.  Do not substitute
+        # SONIC's default-angle offsets here: those are an action-coordinate
+        # convention, and pinning the pelvis at z=0.793 with that crouched pose
+        # forces the knees from 0.669 to about 0.95 rad before release.
+        self.scene.robot.init_state.pos = (0.0, 0.0, 0.80)
+        self.scene.robot.init_state.joint_pos = {
+            "left_hip_pitch_joint": -0.05,
+            "left_knee_joint": 0.47,
+            "left_ankle_pitch_joint": 0.0,
+            "right_hip_pitch_joint": -0.05,
+            "right_knee_joint": 0.47,
+            "right_ankle_pitch_joint": 0.0,
+            "left_shoulder_roll_joint": 0.3,
+            "left_shoulder_yaw_joint": -0.65,
+            "left_elbow_joint": 0.76,
+            "right_shoulder_roll_joint": -0.3,
+            "right_shoulder_yaw_joint": 0.65,
+            "right_elbow_joint": 0.76,
+        }
         # 100 Hz physics, 50 Hz control (control period 0.02 s == deploy Control thread).
         # NOTE: single-env CPU PhysX at 200 Hz (decim=4) only reaches RTF~0.69 -> the
         # deploy's wall-clock 50 Hz loop over-samples a slow-motion sim and the balance

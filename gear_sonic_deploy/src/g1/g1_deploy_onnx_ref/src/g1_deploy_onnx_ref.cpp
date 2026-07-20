@@ -137,6 +137,7 @@
 
 // Error monitor
 #include "../include/error_monitor.hpp"
+#include "../include/walk_to_idle_transition.hpp"
 
 #include "audio_thread/audio_thread.hpp"
 
@@ -225,26 +226,16 @@ class G1Deploy {
     std::unique_ptr<LocalMotionPlannerBase> planner_;
     std::shared_ptr<MotionSequence> planner_motion_;
     
-    // Movement momentum system
-    MovementState last_movement_state_ = MovementState(static_cast<int>(LocomotionMode::IDLE), {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, -1.0f, -1.0f);
+    // Planner command state. Requested WALK -> IDLE changes pass through a
+    // model-native deceleration before the final IDLE request.
+    MovementState last_planner_state_ = MovementState(static_cast<int>(LocomotionMode::IDLE), {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, -1.0f, -1.0f);
+    WalkToIdleTransition walk_to_idle_transition_;
     float replan_interval_running_ = 0.1;
     float replan_interval_crawling_ = 0.2;
     float replan_interval_boxing_ = 1.0;
     float replan_interval_ = 1.0;
     float replan_interval_counter_ = 0.0f;
 
-    // Idle-mode error-based readaptation with double-threshold state machine.
-    // States: IDLE (do nothing), ADAPTING (toward robot state), RECOVERING (toward planner target).
-    // Each state has a trigger threshold (enter) and stop threshold (exit).
-    enum class IdleReadaptState { IDLE, ADAPTING, RECOVERING };
-    std::array<double, 29> idle_readapt_original_targets_{};
-    bool idle_readapt_stored_ = false;
-    IdleReadaptState idle_readapt_state_ = IdleReadaptState::IDLE;
-    static constexpr double kAdaptTrigger  = 0.10;   // rad: start adapting
-    static constexpr double kAdaptStop     = 0.05;   // rad: stop adapting → IDLE
-    static constexpr double kRecoverTrigger = 0.045;  // rad: start recovering
-
-    
     // =========================================================================
     // Low-level robot I/O buffers, channels, and threads
     // =========================================================================
@@ -3461,7 +3452,6 @@ class G1Deploy {
             current_frame_ = 0;
             // Assign shared_ptr directly - planner_motion_ is already a shared_ptr
             current_motion_ = planner_motion_;
-            idle_readapt_stored_ = false;
             if(is_the_first_time) {
               reinitialize_heading_ = true;
             }
@@ -3473,68 +3463,6 @@ class G1Deploy {
           int new_frame = current_frame_ + 1;
             if (new_frame >= current_motion_->timesteps) {
               new_frame = current_motion_->timesteps - 1; // Clamp to last frame
-              // Error-based readaptation in idle mode with double-threshold state machine.
-              // IDLE: do nothing. ADAPTING: blend toward robot state. RECOVERING: blend toward planner target.
-              auto movement_state_data = movement_state_buffer_.GetDataWithTime().data;
-              if(movement_state_data && movement_state_data->locomotion_mode == static_cast<int>(LocomotionMode::IDLE)) {
-                auto low_state = low_state_buffer_.GetDataWithTime().data;
-                if (low_state) {
-                  auto motor_state = low_state->motor_state();
-
-                  // Store original planner targets on first entry
-                  if (!idle_readapt_stored_) {
-                    for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
-                      idle_readapt_original_targets_[idx] = planner_motion_->JointPositions(new_frame)[idx];
-                    }
-                    idle_readapt_stored_ = true;
-                    idle_readapt_state_ = IdleReadaptState::IDLE;
-                  }
-
-                  // Compute average error across all lower-body joints
-                  double total_error = 0.0;
-                  for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
-                    total_error += std::abs(planner_motion_->JointPositions(new_frame)[idx]
-                                            - motor_state[mujoco_to_isaaclab[idx]].q());
-                  }
-                  double avg_error = total_error / static_cast<double>(lower_body_joint_isaaclab_order_in_isaaclab_index.size());
-
-                  // State transitions
-                  switch (idle_readapt_state_) {
-                    case IdleReadaptState::IDLE:
-                      if (avg_error > kAdaptTrigger) {
-                        idle_readapt_state_ = IdleReadaptState::ADAPTING;
-                      } else if (avg_error < kRecoverTrigger) {
-                        idle_readapt_state_ = IdleReadaptState::RECOVERING;
-                      }
-                      break;
-                    case IdleReadaptState::ADAPTING:
-                      if (avg_error < kAdaptStop) {
-                        idle_readapt_state_ = IdleReadaptState::IDLE;
-                      }
-                      break;
-                    case IdleReadaptState::RECOVERING:
-                      if (avg_error > kAdaptTrigger) {
-                        idle_readapt_state_ = IdleReadaptState::ADAPTING;
-                      }
-                      break;
-                  }
-
-                  // Apply blend based on current state
-                  if (idle_readapt_state_ == IdleReadaptState::ADAPTING) {
-                    for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
-                      double actual = motor_state[mujoco_to_isaaclab[idx]].q();
-                      planner_motion_->JointPositions(new_frame)[idx] =
-                          0.98 * planner_motion_->JointPositions(new_frame)[idx] + 0.02 * actual;
-                    }
-                  } else if (idle_readapt_state_ == IdleReadaptState::RECOVERING) {
-                    for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
-                      planner_motion_->JointPositions(new_frame)[idx] =
-                          0.98 * planner_motion_->JointPositions(new_frame)[idx] + 0.02 * idle_readapt_original_targets_[idx];
-                    }
-                  }
-                  // IDLE state: do nothing
-                }
-              }
             }
           current_frame_ = new_frame;
         }
@@ -3797,36 +3725,57 @@ class G1Deploy {
             bool movement_mode_changed = false;
             bool movement_speed_changed = false;
             bool movement_direction_changed = false;
-            bool under_static_motion_mode = is_static_motion_mode(static_cast<LocomotionMode>(last_movement_state_.locomotion_mode));
 
             // Read current movement mode from thread-safe buffer
             auto movement_state_data = movement_state_buffer_.GetDataWithTime();
+            MovementState requested_state = movement_state_data.data
+                ? *movement_state_data.data
+                : MovementState(static_cast<int>(LocomotionMode::IDLE),
+                                {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, -1.0, -1.0);
 
-            if (movement_state_data.data) {
-              // bool of checking if facing direction is changed
-              facing_direction_changed = movement_state_data.data->facing_direction[0] != last_movement_state_.facing_direction[0] || 
-                                          movement_state_data.data->facing_direction[1] != last_movement_state_.facing_direction[1] || 
-                                          movement_state_data.data->facing_direction[2] != last_movement_state_.facing_direction[2];
-              // bool of checking if height is changed
-              height_changed = movement_state_data.data->height != last_movement_state_.height;
-              // bool of checking if movement mode is changed
-              movement_mode_changed = movement_state_data.data->locomotion_mode != last_movement_state_.locomotion_mode;
-              // bool of checking if movement speed is changed
-              movement_speed_changed = movement_state_data.data->movement_speed != last_movement_state_.movement_speed;
-              // bool of checking if movement direction is changed
-              movement_direction_changed = movement_state_data.data->movement_direction[0] != last_movement_state_.movement_direction[0] || 
-                                          movement_state_data.data->movement_direction[1] != last_movement_state_.movement_direction[1] || 
-                                          movement_state_data.data->movement_direction[2] != last_movement_state_.movement_direction[2];
-              // bool of checking if the last movement value is under the static motion mode
-              under_static_motion_mode = is_static_motion_mode(static_cast<LocomotionMode>(movement_state_data.data->locomotion_mode));
+            auto to_transition_command = [](const MovementState& state) {
+              return WalkToIdleCommand{
+                  state.locomotion_mode,
+                  state.movement_direction,
+                  state.facing_direction,
+                  state.movement_speed,
+                  state.height};
+            };
+            const bool stop_was_active = walk_to_idle_transition_.active();
+            const auto effective_command = walk_to_idle_transition_.Update(
+                to_transition_command(requested_state),
+                to_transition_command(last_planner_state_), planner_dt_);
+            const bool stop_is_active = walk_to_idle_transition_.active();
+            if (!stop_was_active && stop_is_active) {
+              std::cout << "[walk-to-idle] braking: WALK 0.8 -> SLOW_WALK 0.1 -> IDLE"
+                        << std::endl;
+            } else if (stop_was_active && !stop_is_active &&
+                       requested_state.locomotion_mode == static_cast<int>(LocomotionMode::IDLE)) {
+              std::cout << "[walk-to-idle] braking complete; requesting IDLE" << std::endl;
             }
-            bool is_running = movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RUN);
-            bool is_boxing = movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::LEFT_PUNCH) ||
-                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RIGHT_PUNCH) ||
-                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RANDOM_PUNCH) ||
-                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::LEFT_HOOK) ||
-                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RIGHT_HOOK);
-            bool is_crawling = movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::CRAWLING);
+
+            MovementState planner_state(
+                effective_command.locomotion_mode,
+                effective_command.movement_direction,
+                effective_command.facing_direction,
+                effective_command.movement_speed,
+                effective_command.height);
+
+            facing_direction_changed = planner_state.facing_direction != last_planner_state_.facing_direction;
+            height_changed = planner_state.height != last_planner_state_.height;
+            movement_mode_changed = planner_state.locomotion_mode != last_planner_state_.locomotion_mode;
+            movement_speed_changed = planner_state.movement_speed != last_planner_state_.movement_speed;
+            movement_direction_changed = planner_state.movement_direction != last_planner_state_.movement_direction;
+            const bool under_static_motion_mode =
+                is_static_motion_mode(static_cast<LocomotionMode>(planner_state.locomotion_mode));
+
+            bool is_running = planner_state.locomotion_mode == static_cast<int>(LocomotionMode::RUN);
+            bool is_boxing = planner_state.locomotion_mode == static_cast<int>(LocomotionMode::LEFT_PUNCH) ||
+                             planner_state.locomotion_mode == static_cast<int>(LocomotionMode::RIGHT_PUNCH) ||
+                             planner_state.locomotion_mode == static_cast<int>(LocomotionMode::RANDOM_PUNCH) ||
+                             planner_state.locomotion_mode == static_cast<int>(LocomotionMode::LEFT_HOOK) ||
+                             planner_state.locomotion_mode == static_cast<int>(LocomotionMode::RIGHT_HOOK);
+            bool is_crawling = planner_state.locomotion_mode == static_cast<int>(LocomotionMode::CRAWLING);
             // increment replan interval counter
             replan_interval_counter_ += planner_dt_;
             // check if need to replan
@@ -3862,16 +3811,9 @@ class G1Deploy {
             
             if (movement_mode_changed || facing_direction_changed || height_changed) {
               need_replan = true;
-            } else if (!under_static_motion_mode && (movement_speed_changed || movement_direction_changed || (time_to_replan && movement_state_data.data->movement_speed != 0))) {
-              need_replan = true;
-            } else if (under_static_motion_mode &&
-                       movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::IDLE) &&
-                       time_to_replan) {
-              // Do not freeze the final frame of the one-shot IDLE trajectory.
-              // After WALK -> IDLE the robot is still settling; periodically
-              // regenerate the model-native idle trajectory from the rolling
-              // planner context so the existing cross-fade/readaptation path
-              // can track that measured settling motion.
+            } else if (!under_static_motion_mode &&
+                       (movement_speed_changed || movement_direction_changed ||
+                        (time_to_replan && planner_state.movement_speed != 0))) {
               need_replan = true;
             }
 
@@ -3888,24 +3830,15 @@ class G1Deploy {
             float movement_speed = -1.0f;
             float target_height = -1.0f;
             
-            if (movement_state_data.data) {
-              current_mode = movement_state_data.data->locomotion_mode;
-              movement_direction[0] = movement_state_data.data->movement_direction[0];
-              movement_direction[1] = movement_state_data.data->movement_direction[1]; 
-              movement_direction[2] = movement_state_data.data->movement_direction[2];
-              facing_direction[0] = movement_state_data.data->facing_direction[0];
-              facing_direction[1] = movement_state_data.data->facing_direction[1];
-              facing_direction[2] = movement_state_data.data->facing_direction[2];
-              movement_speed = movement_state_data.data->movement_speed;
-              target_height = movement_state_data.data->height;
-
-              // Update last movement state for next iteration comparison (update here to avoid missing the update)
-              last_movement_state_.locomotion_mode = movement_state_data.data->locomotion_mode;
-              last_movement_state_.movement_direction = movement_state_data.data->movement_direction;
-              last_movement_state_.facing_direction = movement_state_data.data->facing_direction;
-              last_movement_state_.movement_speed = movement_state_data.data->movement_speed;
-              last_movement_state_.height = movement_state_data.data->height;
-            }
+            current_mode = planner_state.locomotion_mode;
+            movement_direction[0] = planner_state.movement_direction[0];
+            movement_direction[1] = planner_state.movement_direction[1];
+            movement_direction[2] = planner_state.movement_direction[2];
+            facing_direction[0] = planner_state.facing_direction[0];
+            facing_direction[1] = planner_state.facing_direction[1];
+            facing_direction[2] = planner_state.facing_direction[2];
+            movement_speed = planner_state.movement_speed;
+            target_height = planner_state.height;
             
             try {
               // Update planning with current movement parameters
@@ -3922,6 +3855,7 @@ class G1Deploy {
               )) {
                 throw std::runtime_error("Error when updating planner");
               }
+              last_planner_state_ = planner_state;
               
             } catch (const std::exception& e) {
               std::cout << "✗ Error during planning update: " << e.what() << std::endl;

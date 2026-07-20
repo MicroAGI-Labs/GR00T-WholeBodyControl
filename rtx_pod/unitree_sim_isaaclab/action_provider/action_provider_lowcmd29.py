@@ -17,7 +17,6 @@ import time
 import torch
 from dds.dds_master import dds_manager
 from tasks.common_observations.g1_29dof_state import get_robot_boy_joint_names
-from dds.g1_joint_mapping import UNITREE_G1_29_DEFAULT_POSITIONS
 
 
 class DDSLowCmd29ActionProvider(ActionProvider):
@@ -86,13 +85,11 @@ class DDSLowCmd29ActionProvider(ActionProvider):
         default_q = self.env.scene["robot"].data.default_joint_pos[0].clone()
         self._full_action_buf = default_q.to(device=device, dtype=torch.float32)
         self._default_full = default_q.to(device=device, dtype=torch.float32).clone()
-        # One pose authority: use SONIC's hardware-order policy default for
-        # warmup, scattered into the articulation by the canonical name map.
+        # The environment default is the measured free-standing equilibrium.
+        # Keep reset and rigid-hold warmup on that same pose.  SONIC's internal
+        # default-angle offsets are a policy coordinate convention, not a
+        # physically self-consistent pinned pose in Isaac.
         self._warmup_full = self._default_full.clone()
-        warmup_q = torch.tensor(
-            UNITREE_G1_29_DEFAULT_POSITIONS, dtype=torch.float32, device=device
-        )
-        self._warmup_full.index_copy_(0, self._body_target_idx_t, warmup_q)
         self._positions_buf = torch.empty(29, device=device, dtype=torch.float32)
 
         # Action-latency model (SIM_ACT_LATENCY = N control steps, 50Hz -> 20ms each).

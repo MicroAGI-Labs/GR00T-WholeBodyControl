@@ -60,6 +60,24 @@ UNITREE_G1_29_DEFAULT_POSITIONS = (
 )
 
 
+# Per-joint effort contract used by the SONIC deploy. These values mirror
+# policy_parameters.hpp and must also be the Isaac actuator limits: the policy's
+# action scale is computed from them. In particular, current SONIC uses the
+# 7520_22 hip-pitch motor (139 Nm); the upstream Isaac preset still carries the
+# older 7520_14 value (88 Nm), which clips more than half of standing updates.
+UNITREE_G1_29_EFFORT_LIMITS = (
+    139.0, 139.0, 88.0, 139.0, 25.0, 25.0,
+    139.0, 139.0, 88.0, 139.0, 25.0, 25.0,
+    88.0, 25.0, 25.0,
+    25.0, 25.0, 25.0, 25.0, 25.0, 5.0, 5.0,
+    25.0, 25.0, 25.0, 25.0, 25.0, 5.0, 5.0,
+)
+
+UNITREE_G1_EFFORT_LIMIT_BY_NAME = dict(
+    zip(UNITREE_G1_29_JOINT_NAMES, UNITREE_G1_29_EFFORT_LIMITS)
+)
+
+
 # Unitree index -> Isaac articulation index for the G1 articulation used by the
 # flat task.  This is the permutation previously embedded in
 # get_robot_boy_joint_states().
