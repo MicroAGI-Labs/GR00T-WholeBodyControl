@@ -39,8 +39,11 @@ class G1RobotDDS(DDSObject):
         self.setup_shared_memory(
             input_shm_name="isaac_robot_state",  # read the state of the G1 robot from Isaac Lab
             output_shm_name="dds_robot_cmd",  # output the command to Isaac Lab
-            input_size=3072,
-            output_size=3072  # output the command to Isaac Lab
+            # JSON for the full 29-joint state/command can exceed 3 KiB
+            # (observed 3,105 B for state).  Leave headroom for all five
+            # command vectors and avoid silently retaining stale samples.
+            input_size=8192,
+            output_size=8192  # output the command to Isaac Lab
         )
         
         print(f"[{self.node_name}] G1 robot DDS node initialized")
@@ -89,7 +92,13 @@ class G1RobotDDS(DDSObject):
                 q_array = np.asarray(positions, dtype=np.float32)
                 dq_array = np.asarray(velocities, dtype=np.float32)
                 tau_array = np.asarray(torques, dtype=np.float32)
-                for i in range(len(q_array)):
+                # Isaac can expose extra articulation entries (for example
+                # dexterous-hand joints), while Unitree LowState has a fixed
+                # motor_state sequence.  Only copy the shared body-motor
+                # prefix; indexing the full Isaac array made lowstate
+                # publishing fail whenever the controller was active.
+                count = min(num_motors, len(q_array), len(dq_array), len(tau_array))
+                for i in range(count):
                     motor = motor_state[i]
                     motor.q = q_array[i]
                     motor.dq = dq_array[i]

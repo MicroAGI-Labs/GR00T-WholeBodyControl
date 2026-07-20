@@ -484,16 +484,14 @@ class ZMQManager : public InputInterface {
             planner_state.enabled = true;
             std::cout << "[ZMQManager] Planner enabled" << std::endl;
 
-            // Wait for planner to be initialized with timeout (5 seconds)
+            // Wait for planner initialization, not for planner_motion to be
+            // installed as current_motion.  The latter only happens once the
+            // control loop is allowed to run, so waiting on it here deadlocks
+            // the ZMQ startup path before the queued planner command can be
+            // applied.
             auto wait_start = std::chrono::steady_clock::now();
             constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
-            while (planner_state.enabled) {
-              {
-                std::lock_guard<std::mutex> lock(current_motion_mutex);
-                if (current_motion->name == "planner_motion") {
-                  break;
-                }
-              }
+            while (planner_state.enabled && !planner_state.initialized) {
               std::this_thread::sleep_for(std::chrono::milliseconds(100));
               auto elapsed = std::chrono::steady_clock::now() - wait_start;
               if (elapsed > PLANNER_INIT_TIMEOUT) {
@@ -538,17 +536,13 @@ class ZMQManager : public InputInterface {
           std::cout << "[ZMQManager] Planner enabled" << std::endl;
         }
         
-        // Wait for initialization
+        // Wait for the planner's initialization flag.  Do not wait for
+        // current_motion == planner_motion: that transition is performed by
+        // the control loop after this handler returns and processes the
+        // queued planner command.
         auto wait_start = std::chrono::steady_clock::now();
         constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
-        while (planner_state.enabled) {
-          {
-            std::lock_guard<std::mutex> lock(current_motion_mutex);
-            if (current_motion->name == "planner_motion") {
-              std::cout << "[ZMQManager] motion name is planner_motion" << std::endl;
-              break;
-            }
-          }
+        while (planner_state.enabled && !planner_state.initialized) {
           std::this_thread::sleep_for(std::chrono::milliseconds(100));
           auto elapsed = std::chrono::steady_clock::now() - wait_start;
           if (elapsed > PLANNER_INIT_TIMEOUT) {

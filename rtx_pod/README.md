@@ -38,6 +38,7 @@ version-controlled and reviewable.
 | `tasks/g1_tasks/flat_g1_29dof_dex3/flat_g1_29dof_dex3_env_cfg.py` | Floating-base preset (`g1_29dof_dex3_wholebody`, reverted from a `base_fix` regression); init z `0.793` (feet-on-ground for the SONIC default stance). |
 | `tasks/common_observations/g1_29dof_state.py` | Main `rt/lowstate.imu_state` = PELVIS IMU (`use_torso_imu=False`), matching MuJoCo/training. |
 | `dds/g1_robot_dds.py` | IMU quaternion order `[w,x,y,z]` to match the real Unitree LowState. |
+| `dds/g1_joint_mapping.py` | Single 29-joint Unitree ordering contract plus name-based Isaac↔Unitree gather/scatter helpers. |
 | `sim_main.py` | (a) Hooks for `tools/stand_eval.py`: instantiate `StandEval` before the loop (`EVAL=1`), `arm()` on hold-release (cat-2/cat-3), `disarm()` on re-arm (cat-4), `update()` each control step. (b) File-triggered external-force disturbance for eval testing: `echo "fx fy fz [dur_s]" > $SIM_PUSH_FILE` (default `/tmp/sim_push`) applies a one-shot global wrench on the pelvis (e.g. `0 0 -900 0.6` = a downward shove to force a fall); fires once per distinct content, only while the base-hold is released. |
 
 > **`rt/eval` must be in BOTH zenoh allow-lists** to reach the Spark: the pod
@@ -47,3 +48,9 @@ version-controlled and reviewable.
 
 See `../SIM_RESILIENCE_PLAN.md`, `../RTX_SIM_GUIDE.md`, and memory
 `sim-resilience-implementation` for how these fit together and the balance recipe.
+
+Run the dependency-free joint mapping tests from the repository root:
+
+```bash
+python -m unittest discover -s rtx_pod/tests -p 'test_*.py' -v
+```

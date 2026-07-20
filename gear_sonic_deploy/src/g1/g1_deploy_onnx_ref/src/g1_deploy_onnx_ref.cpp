@@ -3864,6 +3864,15 @@ class G1Deploy {
               need_replan = true;
             } else if (!under_static_motion_mode && (movement_speed_changed || movement_direction_changed || (time_to_replan && movement_state_data.data->movement_speed != 0))) {
               need_replan = true;
+            } else if (under_static_motion_mode &&
+                       movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::IDLE) &&
+                       time_to_replan) {
+              // Do not freeze the final frame of the one-shot IDLE trajectory.
+              // After WALK -> IDLE the robot is still settling; periodically
+              // regenerate the model-native idle trajectory from the rolling
+              // planner context so the existing cross-fade/readaptation path
+              // can track that measured settling motion.
+              need_replan = true;
             }
 
             if (!need_replan) {
@@ -4689,4 +4698,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-

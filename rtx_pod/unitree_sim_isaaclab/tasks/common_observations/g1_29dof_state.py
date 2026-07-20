@@ -18,46 +18,10 @@ if TYPE_CHECKING:
 
 import torch
 
-def get_robot_boy_joint_names() -> list[str]:
-    return [
-        # leg joints (12)
-        # left leg (6)
-        "left_hip_pitch_joint",
-        "left_hip_roll_joint",
-        "left_hip_yaw_joint",
-        "left_knee_joint",
-        "left_ankle_pitch_joint",
-        "left_ankle_roll_joint",
-        # right leg (6)
-        "right_hip_pitch_joint",
-        "right_hip_roll_joint",
-        "right_hip_yaw_joint",
-        "right_knee_joint",
-        "right_ankle_pitch_joint",
-        "right_ankle_roll_joint",
-        # waist joints (3)
-        "waist_yaw_joint",
-        "waist_roll_joint",
-        "waist_pitch_joint",
+from dds.g1_joint_mapping import UNITREE_G1_29_JOINT_NAMES, unitree_indices_in
 
-        # arm joints (14)
-        # left arm (7)
-        "left_shoulder_pitch_joint",
-        "left_shoulder_roll_joint",
-        "left_shoulder_yaw_joint",
-        "left_elbow_joint",
-        "left_wrist_roll_joint",
-        "left_wrist_pitch_joint",
-        "left_wrist_yaw_joint",
-        # right arm (7)
-        "right_shoulder_pitch_joint",
-        "right_shoulder_roll_joint",
-        "right_shoulder_yaw_joint",
-        "right_elbow_joint",
-        "right_wrist_roll_joint",
-        "right_wrist_pitch_joint",
-        "right_wrist_yaw_joint",
-    ]
+def get_robot_boy_joint_names() -> list[str]:
+    return list(UNITREE_G1_29_JOINT_NAMES)
 
 def get_robot_arm_joint_names() -> list[str]:
     return [
@@ -165,8 +129,11 @@ def get_robot_boy_joint_states(
     # 预计算并缓存索引张量（列索引）
     global _obs_cache
     if _obs_cache["device"] != device or _obs_cache["boy_idx_t"] is None:
-        boy_joint_indices = [0, 3, 6, 9, 13, 17, 1, 4, 7, 10, 14, 18, 2, 5, 8, 11, 15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28]
-        _obs_cache["boy_idx_t"] = torch.tensor(boy_joint_indices, dtype=torch.long, device=device)
+        body_indices = unitree_indices_in(env.scene["robot"].data.joint_names)
+        _obs_cache["boy_idx_t"] = torch.tensor(
+            body_indices, dtype=torch.long, device=device
+        )
+        print(f"[g1_state] Unitree joint indices in articulation: {body_indices}", flush=True)
         _obs_cache["device"] = device
         _obs_cache["batch"] = None  # force re-init batch-shaped buffers
 

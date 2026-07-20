@@ -2,6 +2,10 @@
   mode: "peer",
   listen: { endpoints: ["tcp/0.0.0.0:7447"] },
   scouting: { multicast: { enabled: false } },
+  // This bridge crosses hosts through an SSH TCP tunnel.  Disable Zenoh shared
+  // memory so forwarded DDS discovery can carry serialized Unitree LowState
+  // samples even when the generated DDS type is not memcpy-safe.
+  transport: { shared_memory: { enabled: false } },
   plugins: {
     dds: {
       domain: 1,

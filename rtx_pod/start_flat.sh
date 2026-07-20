@@ -21,9 +21,19 @@ LOCK="$LS/.stack_bringup.lock"
 if [ "${_STACK_LOCKED:-}" != "1" ] && command -v flock >/dev/null 2>&1; then
   # re-exec via absolute `bash <script>` (NOT "$0", which may be a bare relative
   # name that isn't on PATH after exec -> silent failure/no sim).
-  exec env _STACK_LOCKED=1 flock -w 60 "$LOCK" bash "$LS/start_flat.sh" "$@"
+  # --close prevents long-lived sim/bridge children from inheriting the lock
+  # descriptor and blocking every later restart after this script exits.
+  exec env _STACK_LOCKED=1 flock --close -w 60 "$LOCK" bash "$LS/start_flat.sh" "$@"
 fi
 echo "==> [pre] robust clean slate (kill any prior stack instances)"
+# Stop the bridge supervisor before killing the bridge.  Otherwise it races the
+# clean-slate phase by immediately respawning Zenoh, leaving a stale bridge PID
+# and making a full-stack restart depend on process ordering.
+if [ -r "$LS/bridge_supervisor.pid" ]; then
+  supervisor_pid="$(cat "$LS/bridge_supervisor.pid" 2>/dev/null || true)"
+  [ -n "$supervisor_pid" ] && kill "$supervisor_pid" 2>/dev/null || true
+  rm -f "$LS/bridge_supervisor.pid"
+fi
 python3 "$LS/stack_singleton.py" kill || true
 
 POD_IP="$(hostname -i | awk '{print $1}')"

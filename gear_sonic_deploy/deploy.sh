@@ -595,6 +595,9 @@ XML
   mode: "peer",
   connect: { endpoints: ["$ZENOH_JETSON_ENDPOINT"] },
   scouting: { multicast: { enabled: false } },
+  // The sim bridge is remote (SSH TCP), not a same-host SHM peer.  Keeping
+  // SHM off preserves serialized forwarding for non-memcpy-safe DDS types.
+  transport: { shared_memory: { enabled: false } },
   plugins: {
     dds: {
       domain: 0,

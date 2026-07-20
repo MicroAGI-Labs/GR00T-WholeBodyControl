@@ -26,6 +26,10 @@ from isaaclab.utils import configclass
 from tasks.g1_tasks.move_cylinder_g1_29dof_dex3_wholebody import mdp
 from tasks.common_config import G1RobotPresets, CameraPresets  # isort: skip
 from tasks.common_event.event_manager import SimpleEvent, SimpleEventManager
+from dds.g1_joint_mapping import (
+    UNITREE_G1_29_DEFAULT_POSITIONS,
+    UNITREE_G1_29_JOINT_NAMES,
+)
 
 
 ##
@@ -129,26 +133,11 @@ class FlatG1Dex3EnvCfg(ManagerBasedRLEnvCfg):
     curriculum = None
 
     def __post_init__(self):
-        # Reset the robot into the SONIC controller's ACTUAL standing pose. Stream logging
-        # (rt/lowcmd vs rt/lowstate in the held state) showed the controller commands
-        # knee~0.30 / ankle~-0.20 while the robot was held at knee 0.669 / ankle -0.363 ->
-        # a ~0.37 rad leg mismatch that made it lurch and topple on release. The proven
-        # stance is the config DEFAULT_DOF_ANGLES (hip -0.1, knee 0.3, ankle -0.2) with the
-        # arms at loco_upper_body_dof_pos (shoulder_roll +-0.3, elbow 1.0) that the policy
-        # tracks. z lowered accordingly (test controller-free that the pin holds ~0 deg).
-        # This is the ACTUAL pose the SONIC controller balances at, captured from the
-        # working MuJoCo run (g1_debug body_q_measured, where measured==target == the
-        # controller's equilibrium): hip~-0.05, knee~0.47, ANKLE~0 (not -0.2!), arms at
-        # shoulder_roll +-0.3 / shoulder_yaw -+0.65 / elbow 0.76. Every earlier guess had
-        # the wrong knee AND a far-too-plantarflexed ankle, so on release the controller
-        # yanked the legs to this pose and toppled. z set for feet-on-ground at this stance.
-        self.scene.robot.init_state.pos = (0.0, 0.0, 0.80)
-        self.scene.robot.init_state.joint_pos = {
-            "left_hip_pitch_joint": -0.05, "left_knee_joint": 0.47, "left_ankle_pitch_joint": 0.0,
-            "right_hip_pitch_joint": -0.05, "right_knee_joint": 0.47, "right_ankle_pitch_joint": 0.0,
-            "left_shoulder_roll_joint": 0.3, "left_shoulder_yaw_joint": -0.65, "left_elbow_joint": 0.76,
-            "right_shoulder_roll_joint": -0.3, "right_shoulder_yaw_joint": 0.65, "right_elbow_joint": 0.76,
-        }
+        # Reset and warmup share SONIC's policy default pose.  Independent
+        # "upright" guesses put the policy out of distribution before release.
+        self.scene.robot.init_state.joint_pos = dict(
+            zip(UNITREE_G1_29_JOINT_NAMES, UNITREE_G1_29_DEFAULT_POSITIONS)
+        )
         # 100 Hz physics, 50 Hz control (control period 0.02 s == deploy Control thread).
         # NOTE: single-env CPU PhysX at 200 Hz (decim=4) only reaches RTF~0.69 -> the
         # deploy's wall-clock 50 Hz loop over-samples a slow-motion sim and the balance
