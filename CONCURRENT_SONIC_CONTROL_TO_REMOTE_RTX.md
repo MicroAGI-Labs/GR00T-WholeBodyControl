@@ -56,8 +56,10 @@ are the first supported concurrent configuration.
 
 ### Deferred
 
-- Eight or more simulated robots.
-- Twelve- or sixteen-controller capacity claims.
+- Supporting more than seven balancing robots at RTF 0.10 or more than four at
+  RTF 0.15.
+- Twelve- or sixteen-controller balance claims; the 24-process check measured
+  startup capacity only.
 - A separate DDS domain, bridge, or SSH port per robot.
 - DDS sidecars and a versioned cross-process shared-memory protocol.
 - Failure isolation for shared Isaac, bridge, or tunnel processes.
@@ -90,6 +92,13 @@ Measurements and live inspection on 2026-07-21:
 | Two-env Spark-side state, robot 0 | 102.0 Hz, 60.6 ms maximum gap, no >100 ms stalls |
 | Two-env Spark-side state, robot 1 | 101.9 Hz, 56.6 ms maximum gap, no >100 ms stalls |
 | Two-env 60 s free IDLE result | both success; 0.00 m displacement; 2.0° / 1.9° final tilt |
+| Four SONIC at RTF 0.15 | about 0.28 CPU cores total, 2.13 GiB RSS, 96 threads |
+| Four-env Spark-side state at RTF 0.15 | 100.0–100.1 Hz, 68–76 ms maximum gap |
+| Four-env 60 s free IDLE result | all success; 0.09 m displacement; 1.9–2.0° final tilt |
+| First unreliable count at RTF 0.15 | five; one clean-repeat fall at 14.06 s |
+| Seven SONIC at RTF 0.10 | about 0.43 CPU cores total, 3.72 GiB RSS, 168 threads |
+| Seven-env 60 s free IDLE result | all success; 0.09 m displacement; 1.8–2.2° final tilt |
+| First failing count at RTF 0.10 | eight; two falls by 10.50 s |
 
 The two-robot path was brought up on 2026-07-21. The live RTX stack has one
 two-environment Isaac process, one in-process multi-robot DDS manager, one
@@ -101,8 +110,16 @@ seconds with zero reported displacement and no fall. Robot 0 finished at
 0.683 m pelvis height and 2.0° tilt with result +95.34; robot 1 finished at
 0.684 m and 1.9° with result +95.59.
 
-The two-environment run establishes capacity for two at RTF 0.1. Four remains
-an unmeasured follow-on.
+The follow-up count sweep establishes four as the verified limit at RTF 0.15.
+All four completed 60.02 simulated seconds; five was the first unreliable
+count. Six was intermittent, seven and eight failed repeatedly, and a pinned
+24-controller startup test overloaded transport timing even though every
+process initialized. See the measured table in `RTX_SIM_GUIDE.md` rather than
+inferring capacity from process startup alone.
+
+Repeating the upper boundary at RTF 0.10 raised the verified limit to seven.
+All seven completed 60.02 simulated seconds with clean station-keeping; eight
+failed at 10.50 seconds despite healthy near-100 Hz state feeds.
 
 Before multiple controllers:
 
@@ -333,11 +350,13 @@ Exit: reset, re-arm, release, and evaluation work independently for two robots.
 
 ### Phase 4 — Use the existing remote transport (data path complete)
 
-- [x] Generate one explicit allow-list for all configured namespaced topics.
+- [x] Use one bounded regex allow rule for all numeric robot namespaces.
 - [x] Keep one RTX bridge on DDS domain 1 and port `7447`.
 - [x] Keep one Spark bridge on DDS domain 0.
 - [x] Keep the existing supervised single-port tunnel.
 - [x] Add `--topic-prefix` to diagnostics.
+- [x] Raise CycloneDDS's participant-index ceiling for namespaced SONIC launches.
+- [x] Add one-participant count-wide lifecycle/feed/evaluation diagnostics.
 - [ ] Report state/command rates, age, sequence, and reconnect count per robot.
 
 Tests:
@@ -356,21 +375,24 @@ free-standing transport interruption remains to be tested.
 Exit: two remote pairs communicate without cross-talk and recover from shared
 transport interruption.
 
-### Phase 5 — Demonstrate two, then scale to four (in progress)
+### Phase 5 — Demonstrate two, then scale to four (balance acceptance complete)
 
 - [x] Start two pinned robots and two SONIC controllers.
 - [x] Release both and hold IDLE for 60 simulated seconds.
 - [ ] Keep robot 0 IDLE while robot 1 WALKS, then returns to IDLE.
 - [ ] Re-arm/release robot 1 while robot 0 keeps balancing.
 - [ ] Restart controller 1 and verify only robot 1 recovers.
-- [ ] Record RTF, step timing, CPU/RSS, GPU use, message age, and balance.
+- [x] Record RTF, CPU/RSS, state timing, and balance at four and at the 24-process capacity point.
 - [ ] Add small checked-in launch/status/stop scripts after manual success.
-- [ ] Repeat the entire suite with `SIM_ROBOT_COUNT=4`.
+- [x] Repeat the 60-second IDLE acceptance run with `SIM_ROBOT_COUNT=4` at RTF 0.15.
+- [x] Bracket the balance limit: four passes; five is unreliable; six through eight fail or are intermittent.
+- [x] Repeat at RTF 0.10: seven passes 60.02 s; eight fails at 10.50 s.
+- [x] Verify all 24 pinned controllers initialize, then stop because timing is not operational.
 
-Acceptance result: both robots reached 60.02 simulated seconds concurrently
-with zero displacement and no fall.
+Acceptance result: four robots reached 60.02 simulated seconds concurrently at
+RTF 0.15 with 0.09 m displacement, 1.9–2.0° tilt, and no fall.
 
-Exit: four robots pass without cross-talk and maintain RTF at or above 0.095.
+Exit: four robots pass without cross-talk and maintain RTF 0.150.
 
 ---
 
@@ -408,13 +430,16 @@ At robot counts 1, 2, and 4, record:
 Stop increasing concurrency if:
 
 - any cross-talk or non-selective reset occurs;
-- RTF falls below 0.095 for the 0.1 target;
+- RTF falls below 0.095 for the 0.1 target or 0.145 for the 0.15 target;
 - controllers miss deadlines or repeatedly enter feed-loss recovery;
 - message age exceeds its safe threshold;
 - GPU or host memory exceeds 80%;
 - the known-good single-robot test stops reproducing.
 
-Do not benchmark 8, 12, or 16 controllers until four real pairs pass.
+Do not promote counts above four at RTF 0.15 or above seven at RTF 0.10 as
+supported without a new full 60-second balance pass. The current 24-process
+result proves initialization only and is explicitly not a control-capacity
+result.
 
 ---
 
@@ -429,7 +454,7 @@ Do not benchmark 8, 12, or 16 controllers until four real pairs pass.
 7. [x] Finish the 60-simulated-second concurrent IDLE run.
 8. [ ] Run opposite-command, mixed-mode, selective-reset, and restart tests.
 9. [ ] Add minimal launch/status/stop scripts and retest `N=1`.
-10. [ ] Increase to four only after the two-robot acceptance suite passes.
+10. [x] Increase to four and complete the 60-second RTF 0.15 IDLE acceptance run.
 
 ---
 
@@ -484,20 +509,23 @@ path works. Validated shell launchers are sufficient for the MVP.
 
 ## 11. Current status and next action
 
-The concurrent body-control path is live at RTF 0.1:
+The concurrent body-control path is live with seven pairs at RTF 0.10:
 
-- RTX: one Isaac process with two environments, one bridge, one camera
+- RTX: one Isaac process with seven environments, one bridge, one camera
   publisher, and no separate IMU adapter;
-- Spark: two SONIC processes, one bridge, and one autossh tunnel;
-- robot 0 and robot 1 each receive about 102 Hz namespaced state and publish an
-  isolated LowCmd;
-- the Spark bridge was restarted after both SONIC processes had started; both
-  recovered without a controller restart;
-- namespaced re-arm and release requests were acknowledged independently by the
-  simulator;
-- both robots completed the concurrent 60.02-simulated-second IDLE evaluation
-  with zero displacement, no fall, and final tilt of 2.0° and 1.9°.
+- Spark: seven SONIC processes, one bridge, and one autossh tunnel;
+- all seven state feeds measured 99.7–99.8 Hz in the post-run probe;
+- Isaac held RTF 0.100 and the seven controllers used 3.72 GiB aggregate RSS;
+- all seven completed 60.02 simulated seconds with 0.09 m displacement, no
+  fall, and final tilt of 1.8–2.2°;
+- eight is the first failing count at RTF 0.10, with two falls by 10.50 s;
+- four remains the verified RTF 0.15 limit, with five the first unreliable count;
+- 24 controllers can initialize, but their 24–26 Hz state delivery and RTF loss
+  make that count unsuitable for control.
 
-Next, run the mixed IDLE/WALK, selective reset, one-controller restart, and
-shared-transport recovery checks. Do not add sidecars, more bridges, or a
-manifest framework before these tests expose a concrete need.
+The bridge and controllers recover when the tunnel returns, but the discarded
+five-robot run demonstrated that actively balancing robots still fall during a
+multi-second WAN outage. Next, run the mixed IDLE/WALK, selective reset, and
+one-controller restart checks at the intended operating count. Do not add
+sidecars, more bridges, or a manifest framework before those tests expose a
+concrete need.

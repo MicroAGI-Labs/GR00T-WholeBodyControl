@@ -87,8 +87,8 @@ parser.add_argument(
 # add AppLauncher parameters
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
-if args_cli.num_envs < 1 or args_cli.num_envs > 16:
-    parser.error("--num_envs must be between 1 and 16")
+if args_cli.num_envs < 1 or args_cli.num_envs > 24:
+    parser.error("--num_envs must be between 1 and 24")
 # Omniverse WebRTC viewport livestream is ON by default; pass --no_livestream to disable.
 # (Kept independent of --no_render: that flag freezes the viewport via render_interval->1e6,
 # so the two must be decoupled to stream the live 3rd-person view while rendering normally.)

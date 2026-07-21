@@ -2217,9 +2217,15 @@ class G1Deploy {
       // each isolated on its own domain (e.g. MuJoCo on domain 0, Isaac on domain 1).
       const char* _dds_domain_env = std::getenv("DDS_DOMAIN");
       int _dds_domain = _dds_domain_env ? std::atoi(_dds_domain_env) : 0;
-      std::cout << "[deploy] DDS domain = " << _dds_domain
-                << " (interface '" << networkInterface << "')" << std::endl;
-      ChannelFactory::Instance()->Init(_dds_domain, networkInterface);
+      const char* _dds_config_env = std::getenv("DDS_CONFIG_FILE");
+      if (_dds_config_env && *_dds_config_env) {
+        std::cout << "[deploy] DDS config file = " << _dds_config_env << std::endl;
+        ChannelFactory::Instance()->Init(std::string(_dds_config_env));
+      } else {
+        std::cout << "[deploy] DDS domain = " << _dds_domain
+                  << " (interface '" << networkInterface << "')" << std::endl;
+        ChannelFactory::Instance()->Init(_dds_domain, networkInterface);
+      }
 
       const char* _instance_env = std::getenv("SONIC_INSTANCE_ID");
       const char* _topic_prefix_env = std::getenv("SONIC_TOPIC_PREFIX");

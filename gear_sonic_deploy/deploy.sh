@@ -622,10 +622,7 @@ XML
       allow: [
         "rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/eval",
         "rt/api/motion_switcher/request", "rt/api/motion_switcher/response",
-        "rt/sim/g1/0/lowstate", "rt/sim/g1/0/lowcmd", "rt/sim/g1/0/secondary_imu",
-        "rt/sim/g1/0/reset_pose/cmd", "rt/sim/g1/0/eval",
-        "rt/sim/g1/1/lowstate", "rt/sim/g1/1/lowcmd", "rt/sim/g1/1/secondary_imu",
-        "rt/sim/g1/1/reset_pose/cmd", "rt/sim/g1/1/eval"
+        "^rt/sim/g1/[0-9]+/(lowstate|lowcmd|secondary_imu|reset_pose/cmd|eval)$"
       ],
       // Unitree topics need data routing, not remote endpoint replication.
       // Local route mode avoids discovery feedback and survives either bridge

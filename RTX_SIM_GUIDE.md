@@ -28,8 +28,13 @@ The core design principle:
 ```
 
 The pick/place stack can run near real time, but remote SONIC balance is
-latency-limited and is validated at **RTF 0.1** with the current SSH route. See
-[`RTX_SIM_LATENCY.md`](RTX_SIM_LATENCY.md) and **§7 Gotchas**.
+latency-limited. **RTF 0.1 is the recommended clean operating point** with the
+current SSH route and is verified for **seven concurrent robots**. **RTF 0.15 is
+verified for four concurrent robots** and is the recommended higher-throughput
+point when that reduced latency margin is acceptable. A two-robot sweep
+completed 60.02 simulated seconds without a fall at RTF 0.20, but with
+substantial translation in one repeat; both robots fell near 29 seconds at RTF
+0.225. See [`RTX_SIM_LATENCY.md`](RTX_SIM_LATENCY.md) and **§7 Gotchas**.
 
 ---
 
@@ -349,7 +354,7 @@ default route; set `DDS_INTERFACE=<name>` to override it. On the pod,
 `g1_dds_diag.py capture` also records the latest absolute root position/quaternion from
 `rt/eval`, alongside measured and commanded joints.
 
-### 4a-concurrent. Two G1s controlled by two Spark SONIC processes
+### 4a-concurrent. Multiple G1s controlled by Spark SONIC processes
 
 The concurrent MVP keeps one Isaac process, one bridge per host, and one SSH
 tunnel. Isolation comes from namespaced topics, not extra DDS domains or
@@ -380,6 +385,13 @@ can be restarted independently and controllers may start before or after it:
 docker restart zenoh-spark-bridge
 docker logs --tail 30 zenoh-spark-bridge
 ```
+
+The bridge allow rule is a regex covering IDs `0..N-1`; it does not need to be
+regenerated as the count changes. Namespaced launches through
+`run_deploy_clean.sh` also select `gear_sonic_deploy/dds_sim_spark.json`
+automatically. That file raises CycloneDDS's auto participant-index ceiling;
+without it, eight controllers plus the local bridge exhaust the default `0..9`
+range. The physical-robot launch path remains unchanged.
 
 Launch the controllers in clean tmux sessions. The explicit zero pitch bias and
 zero leg blend make the IDLE reference match the observed warmup posture used
@@ -441,6 +453,101 @@ and no fall; final tilt was 2.0° and 1.9°. Both controllers also recovered to
 `Init Done` after the Spark bridge was restarted before release without
 restarting the controllers. Mixed IDLE/WALK isolation and free-standing
 transport-restart tests remain open.
+
+#### Concurrent RTF sweep (2026-07-21)
+
+The follow-up sweep used the same two-environment Isaac process and two SONIC
+processes. Each point started with fresh controllers and a robot re-arm/release;
+`CONTROL_WALL_SCALE` was set equal to RTF and `/tmp/sim_slowmo` to its reciprocal.
+Short screens are labelled as such and must not be interpreted as 60-second
+validation:
+
+| RTF | Duration observed | Outcome |
+|---:|---:|---|
+| 0.125 | 16.58 s | Both upright; short screen |
+| 0.1667 | 18.02 s | Both upright; short screen |
+| **0.20** | **60.02 s** | **Both succeeded; final tilt 2.1° / 2.4°, displacement 0.55 m / 1.84 m** |
+| **0.225** | ~29 s | **Both fell at 29.52 s / 28.98 s** |
+| 0.25 | 21.62 s | One fell at 19.40 s |
+| 0.2625 | 50.42 s | One fell at 44.40 s; survivor had drifted 1.70 m |
+| 0.275 | ~23 s | Both fell at 23.64 s / 22.74 s |
+| 0.30 | 4.22 s | One fell at 3.42 s |
+| 0.333 | 14–22 s | Intermittent: one fall at 14.48 s; repeat survived 21.5 s with degraded control |
+
+For this architecture, the measured long-horizon failure onset is bracketed to
+**RTF 0.20–0.225**. RTF 0.20 is the highest demonstrated 60-second no-fall
+setting, but it is not consistently stationary. Keep **RTF 0.10** as the normal
+operating point; use 0.20 only for supervised throughput experiments. Do not
+infer stability from an 18–20 second screen: the RTF 0.225 and 0.25 failures
+occurred just after or well beyond that window.
+
+#### RTF 0.15 concurrency sweep (2026-07-21)
+
+The count sweep used one vectorized Isaac process, one bridge on each host, one
+autossh tunnel, and one SONIC process per robot. Every controller used
+`CONTROL_WALL_SCALE=0.15`; Isaac used `SIM_SLOWMO=6.666666667`. Each qualifying
+run used the observed warmup pose, a cat-4 re-arm, a 10 s wall-clock settle, and
+a cat-3 release. A short pass is not counted as stable: the accepted count had
+to complete the 60.02-simulated-second evaluator.
+
+| Count | Outcome at RTF 0.15 |
+|---:|---|
+| **4** | **PASS, 60.02 s:** all four at 0.09 m displacement, 1.9–2.0° tilt, 0.682–0.684 m pelvis height |
+| **5** | **FAIL:** one fell at 14.06 s in the clean repeat; an earlier all-robot fall at ~23 s coincided with an autossh reconnect and was discarded |
+| 6 | Intermittent: passed short 8 s and >20 s runs, but two fell by 5.30 s in the long qualification |
+| 7 | FAIL in both attempts; first fall by 1.70 s and by 4.76 s in the repeat |
+| 8 | FAIL in both attempts; first fall by roughly 1.4–4.6 s |
+| 24 pinned | All 24 controllers initialized, but this was not released after the lower-count failures; see capacity result below |
+
+The verified concurrency limit is therefore **four balancing robots at RTF
+0.15**. In the accepted run, all four state feeds remained at 100.0–100.1 Hz
+with 68–76 ms maximum observed gaps, Isaac held RTF 0.150, and the four Spark
+processes used 2.13 GiB aggregate RSS and about 27.5% of one CPU core averaged
+over their lifetimes. No controller entered feed-loss recovery.
+
+The 24-process capacity check separates "starts" from "controls stably." All 24
+SONIC processes initialized (12.59 GiB aggregate RSS, about 7.9 CPU cores), but
+state delivery fell from about 90–93 Hz before controller startup to 24–26 Hz
+afterward, with roughly 125–235 ms gaps, and cumulative Isaac RTF fell toward
+0.12. Since five was already unstable with healthy transport, 24 was left
+pinned rather than released. Do not describe 24 as a supported control count.
+
+Use the one-participant diagnostic helper for count-wide lifecycle, feed, and
+evaluation checks; it avoids consuming one DDS participant per robot:
+
+```bash
+python3 rtx_pod/g1_concurrent_diag.py --count 4 probe --duration 8
+python3 rtx_pod/g1_concurrent_diag.py --count 4 lifecycle 4 --delay 2
+python3 rtx_pod/g1_concurrent_diag.py --count 4 lifecycle 3 --delay 1
+python3 rtx_pod/g1_concurrent_diag.py --count 4 eval \
+  --sim-seconds 60 --wall-timeout 460 --interval 10
+```
+
+An autossh interruption is a shared failure domain. During the discarded
+five-robot run, the SSH child exited and restarted, all five controllers entered
+feed-loss damping together, the bridges recovered without manual restart, and
+the robots nevertheless fell. Startup-order/restart resilience does not imply
+that an actively balancing robot can survive a multi-second WAN outage.
+
+#### RTF 0.10 concurrency follow-up (2026-07-21)
+
+Reducing RTF from 0.15 to 0.10 raises the verified count from four to **seven**:
+
+| Count | Outcome at RTF 0.10 |
+|---:|---|
+| **7** | **PASS, 60.02 s:** all seven at 0.09 m displacement, 1.8–2.2° tilt, 0.683–0.684 m pelvis height |
+| **8** | **FAIL at 10.50 s:** two fallen and several other robots already degraded |
+
+The accepted seven-robot run held RTF 0.100. Its state feeds averaged
+99.7–99.8 Hz; an eight-second post-run probe saw 141–210 ms maximum gaps, but no
+controller crossed the one-second feed-loss threshold or entered recovery. The
+seven Spark processes used 3.72 GiB aggregate RSS, about 42.5% of one CPU core
+averaged over their lifetimes, and 168 threads. This is a control-margin limit,
+not a memory limit: eight had healthy state rates but still lost balance.
+
+Use **seven at RTF 0.10** when robot count matters most. Use **four at RTF 0.15**
+when the 50% faster simulation is more valuable. Counts above those boundaries
+need a new full-duration pass before being treated as supported.
 
 ### 4a-bis. Watch it: WebRTC 3rd-person viewport (from a WARP laptop, NO tunnel)
 
@@ -655,11 +762,13 @@ Authoritative RTF (measured via `env.sim.current_time` vs wall-clock), single en
 
 ## 8. Open items
 
-- ✅ **Two-controller concurrent IDLE passed** (2026-07-21): one
-  two-environment Isaac process on the RTX and two namespaced SONIC processes on
-  the Spark, both released for 60.02 simulated seconds at RTF 0.1 with zero
-  displacement and no fall. Complete the mixed-mode, selective-reset, and restart
-  acceptance tests before scaling to four.
+- ✅ **Concurrent IDLE scaling passed** (2026-07-21): four robots completed
+  60.02 simulated seconds at RTF 0.15, and seven completed 60.02 seconds at RTF
+  0.10; every accepted robot finished at 0.09 m displacement without a fall.
+  Five is the first unreliable count at RTF 0.15 and eight is the first failure
+  at RTF 0.10. Complete the mixed-mode, selective-reset, and
+  one-controller-restart acceptance tests before expanding either supported
+  boundary.
 - ✅ **Full VLA loop closed** (2026-07-08): GR00T `bs256/checkpoint-12000` on `:5551` →
   deploy `g1zenoh` (POSE mode) → sim G1, prompt `"put the bar into the crate"`. Confirmed
   the arms move under policy control (arm-joint Δ ≈ 3.9 rad / 3 s; deploy consuming 64-D

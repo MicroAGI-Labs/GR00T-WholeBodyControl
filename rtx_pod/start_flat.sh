@@ -20,8 +20,8 @@ SIM_ROBOT_COUNT="${SIM_ROBOT_COUNT:-1}"
 case "$SIM_ROBOT_COUNT" in
   ''|*[!0-9]*) echo "SIM_ROBOT_COUNT must be an integer" >&2; exit 2 ;;
 esac
-if [ "$SIM_ROBOT_COUNT" -lt 1 ] || [ "$SIM_ROBOT_COUNT" -gt 16 ]; then
-  echo "SIM_ROBOT_COUNT must be between 1 and 16" >&2
+if [ "$SIM_ROBOT_COUNT" -lt 1 ] || [ "$SIM_ROBOT_COUNT" -gt 24 ]; then
+  echo "SIM_ROBOT_COUNT must be between 1 and 24" >&2
   exit 2
 fi
 export SIM_ROBOT_COUNT

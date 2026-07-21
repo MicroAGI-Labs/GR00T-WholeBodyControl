@@ -10,6 +10,12 @@ export CONTROL_WALL_SCALE=${CONTROL_WALL_SCALE:-1.0}     # set to sim RTF; 1.0 o
 export PRED_HORIZON_S=${PRED_HORIZON_S:-0.0}
 DDS_INTERFACE=${DDS_INTERFACE:-$(ip -4 route show default | awk 'NR==1 {print $5}')}
 DDS_INTERFACE=${DDS_INTERFACE:-lo}
+# Namespaced controllers are the concurrent Spark simulation path.  Use an
+# explicit CycloneDDS participant range there: the SDK default permits only
+# indices 0..9, which is exhausted by eight controllers plus the local bridge.
+if [[ -n "${SONIC_TOPIC_PREFIX:-}" && -z "${DDS_CONFIG_FILE:-}" ]]; then
+  export DDS_CONFIG_FILE="$PWD/dds_sim_spark.json"
+fi
 case "$CONTROL_WALL_SCALE" in
   1|1.0|1.00|1.000) ;;
   *)
