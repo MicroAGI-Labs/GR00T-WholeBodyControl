@@ -20,6 +20,8 @@
 #define ROBOT_PARAMETERS_HPP
 
 #include <array>
+#include <cstdlib>
+#include <string>
 
 // ---------------------------------------------------------------------------
 // Unitree SDK DDS topic names
@@ -27,6 +29,35 @@
 static const std::string HG_CMD_TOPIC = "rt/lowcmd";       ///< Low-level motor command topic.
 static const std::string HG_IMU_TORSO = "rt/secondary_imu";///< Secondary (torso) IMU topic.
 static const std::string HG_STATE_TOPIC = "rt/lowstate";    ///< Low-level motor / sensor state topic.
+
+/**
+ * Return a DDS topic for this SONIC instance.
+ *
+ * With no SONIC_TOPIC_PREFIX this is deliberately an identity function, so the
+ * physical-robot wire contract remains byte-for-byte compatible.  Concurrent
+ * simulation processes set, for example, SONIC_TOPIC_PREFIX=rt/sim/g1/1 and
+ * receive rt/sim/g1/1/lowstate instead of rt/lowstate.
+ */
+inline std::string SonicDdsTopic(const std::string& default_topic) {
+    const char* configured = std::getenv("SONIC_TOPIC_PREFIX");
+    if (configured == nullptr || configured[0] == '\0') {
+        return default_topic;
+    }
+
+    std::string prefix(configured);
+    while (!prefix.empty() && prefix.back() == '/') {
+        prefix.pop_back();
+    }
+    if (prefix.empty()) {
+        return default_topic;
+    }
+
+    constexpr const char* kUnitreeRoot = "rt/";
+    if (default_topic.rfind(kUnitreeRoot, 0) == 0) {
+        return prefix + "/" + default_topic.substr(3);
+    }
+    return prefix + "/" + default_topic;
+}
 
 /// Total number of actuated joints on the G1 (29-DOF configuration).
 const int G1_NUM_MOTOR = 29;

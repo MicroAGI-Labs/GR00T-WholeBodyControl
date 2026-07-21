@@ -78,9 +78,17 @@ parser.add_argument("--camera_exclude", type=str, default="world_camera", help="
 
 parser.add_argument("--env_reward_interval", type=int, default=5, help="environment reward compute interval (steps)")
 parser.add_argument("--seed", type=int, default=42, help="environment seed")
+parser.add_argument(
+    "--num_envs",
+    type=int,
+    default=int(os.environ.get("SIM_ROBOT_COUNT", "1")),
+    help="number of vectorized G1 robots (default: SIM_ROBOT_COUNT or 1)",
+)
 # add AppLauncher parameters
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+if args_cli.num_envs < 1 or args_cli.num_envs > 16:
+    parser.error("--num_envs must be between 1 and 16")
 # Omniverse WebRTC viewport livestream is ON by default; pass --no_livestream to disable.
 # (Kept independent of --no_render: that flag freezes the viewport via render_interval->1e6,
 # so the two must be decoupled to stream the live 3rd-person view while rendering normally.)
@@ -192,7 +200,9 @@ def main():
 
     # parse environment configuration
     try:
-        env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1)
+        env_cfg = parse_env_cfg(
+            args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs
+        )
         env_cfg.env_name = args_cli.task
     except Exception as e:
         print(f"Failed to parse environment configuration: {e}")
@@ -401,7 +411,23 @@ def main():
         print("========= create image server success =========")
         print("========= create dds =========")
         try:
-            reset_pose_dds,sim_state_dds,dds_manager = create_dds_objects(args_cli,env)
+            multi_robot_dds = None
+            if args_cli.num_envs > 1:
+                from dds.g1_multi_robot_dds import G1MultiRobotDDS
+                multi_robot_dds = G1MultiRobotDDS(
+                    args_cli.num_envs,
+                    prefix_base=os.environ.get(
+                        "SIM_TOPIC_PREFIX_BASE", "rt/sim/g1"
+                    ),
+                )
+                env._multi_robot_dds = multi_robot_dds
+                multi_robot_dds.start()
+                reset_pose_dds = None
+                sim_state_dds = None
+                dds_lifecycle = multi_robot_dds
+            else:
+                reset_pose_dds,sim_state_dds,dds_manager = create_dds_objects(args_cli,env)
+                dds_lifecycle = dds_manager
         except Exception as e:
             print(f"Failed to create dds: {e}")
             return
@@ -455,7 +481,7 @@ def main():
 
     # set signal handlers
     if not args_cli.replay_data:
-        setup_signal_handlers(controller,dds_manager,image_server)
+        setup_signal_handlers(controller,dds_lifecycle,image_server)
     else:
         setup_signal_handlers(controller)
         
@@ -529,6 +555,18 @@ def main():
         # reset-all (rt/reset_pose/cmd cat 2) then RELEASES the hold so the controller balances.
         _HOLD_FOREVER = 1.0e18
         _base_hold_until = _HOLD_FOREVER if _base_hold_s > 0.0 else 0.0
+        _multi_mode = args_cli.num_envs > 1
+        if _multi_mode:
+            env._base_hold_mask = torch.full(
+                (env.num_envs,), _base_hold_s > 0.0,
+                dtype=torch.bool, device=env.device,
+            )
+            env._warmup_joint_mask = torch.full(
+                (env.num_envs,),
+                _base_hold_s > 0.0
+                and os.environ.get("SIM_WARMUP_JOINTS", "0") == "1",
+                dtype=torch.bool, device=env.device,
+            )
         # By default only the BASE is pinned and the controller drives the legs while held.
         # SIM_WARMUP_JOINTS=1 is the explicit static-pose experiment: joint positions and
         # velocities are pinned to the environment default as well.  Merely sending that
@@ -558,6 +596,8 @@ def main():
         # and RESPOND to the controller, so its obs stays in-distribution and it settles
         # onto its feet at a real Isaac equilibrium before release. Toggle: SIM_BASE_SOFT=1.
         _bh_soft = os.environ.get("SIM_BASE_SOFT", "0") == "1"
+        if _multi_mode and _bh_soft:
+            raise ValueError("multi-robot MVP supports only SIM_BASE_SOFT=0")
         _bh_soft_applied = False
         try:
             _bh_base_bid = env.scene["robot"].data.body_names.index("pelvis")
@@ -581,7 +621,20 @@ def main():
         if os.environ.get("EVAL", "1") != "0":
             try:
                 from tools.stand_eval import StandEval
-                stand_eval = StandEval(env.scene["robot"], lambda: float(env.sim.current_time))
+                if _multi_mode:
+                    stand_eval = [
+                        StandEval(
+                            env.scene["robot"],
+                            lambda: float(env.sim.current_time),
+                            env_id=robot_id,
+                            topic=multi_robot_dds.topic(robot_id, "eval"),
+                        )
+                        for robot_id in range(env.num_envs)
+                    ]
+                else:
+                    stand_eval = StandEval(
+                        env.scene["robot"], lambda: float(env.sim.current_time)
+                    )
             except Exception as _e:
                 print(f"[sim] stand_eval init failed (continuing without eval): {_e}", flush=True)
 
@@ -601,24 +654,29 @@ def main():
                 current_time = time.time()
                 loop_count += 1
                 if not args_cli.replay_data:
-                    try:
-                        env_state = env.scene.get_state()
-                        env_state_json =  sim_state_to_json(env_state)
-                        sim_state = {"init_state":env_state_json,"task_name":args_cli.task}
-                    except Exception as e:
-                        print(f"Failed to get env state: {e}")
-                        raise e
-                    try:
-                    # sim_state = json.dumps(sim_state)
-                        sim_state_dds.write_sim_state_data(sim_state)
-                    except Exception as e:
-                        print(f"Failed to write sim state: {e}")
-                        raise e
-                    try:
-                        reset_pose_cmd = reset_pose_dds.get_reset_pose_command()
-                    except Exception as e:
-                        print(f"Failed to get reset pose command: {e}")
-                        raise e
+                    if sim_state_dds is not None:
+                        try:
+                            env_state = env.scene.get_state()
+                            env_state_json = sim_state_to_json(env_state)
+                            sim_state = {
+                                "init_state": env_state_json,
+                                "task_name": args_cli.task,
+                            }
+                            sim_state_dds.write_sim_state_data(sim_state)
+                        except Exception as e:
+                            print(f"Failed to write sim state: {e}")
+                            raise e
+
+                    if _multi_mode:
+                        reset_requests = multi_robot_dds.pop_reset_requests()
+                        reset_pose_cmd = None
+                    else:
+                        reset_requests = []
+                        try:
+                            reset_pose_cmd = reset_pose_dds.get_reset_pose_command()
+                        except Exception as e:
+                            print(f"Failed to get reset pose command: {e}")
+                            raise e
                     # Compute current reward values manually if needed for debugging
                     try:
                         if (loop_count % reward_interval) == 0:
@@ -628,6 +686,61 @@ def main():
                         print(f"奖励计算失败: {e}")
                         pass
                     
+                    for robot_id, reset_seq, reset_category in reset_requests:
+                        try:
+                            env_id = torch.tensor(
+                                [robot_id], dtype=torch.long, device=env.device
+                            )
+                            if reset_category in ("2", "4"):
+                                robot = env.scene["robot"]
+                                root = robot.data.default_root_state[env_id].clone()
+                                joint_q = robot.data.default_joint_pos[env_id].clone()
+                                joint_dq = torch.zeros_like(
+                                    robot.data.default_joint_vel[env_id]
+                                )
+                                robot.write_root_pose_to_sim(
+                                    root[:, :7], env_ids=env_id
+                                )
+                                robot.write_root_velocity_to_sim(
+                                    root[:, 7:], env_ids=env_id
+                                )
+                                robot.write_joint_state_to_sim(
+                                    joint_q, joint_dq, env_ids=env_id
+                                )
+                                multi_robot_dds.invalidate_commands([robot_id])
+                                env._base_hold_mask[robot_id] = True
+                                if os.environ.get("SIM_WARMUP_JOINTS", "0") == "1":
+                                    env._warmup_joint_mask[robot_id] = True
+                                if stand_eval is not None:
+                                    stand_eval[robot_id].disarm()
+                                print(
+                                    f"[sim:{robot_id}] re-arm hold "
+                                    f"(reset seq {reset_seq})",
+                                    flush=True,
+                                )
+                            elif reset_category == "3":
+                                if not multi_robot_dds.has_fresh_command(robot_id):
+                                    print(
+                                        f"[sim:{robot_id}] release deferred: "
+                                        "waiting for a post-rearm LowCmd",
+                                        flush=True,
+                                    )
+                                    continue
+                                env._base_hold_mask[robot_id] = False
+                                env._warmup_joint_mask[robot_id] = False
+                                if stand_eval is not None:
+                                    stand_eval[robot_id].arm()
+                                print(
+                                    f"[sim:{robot_id}] release-only -> controller balances",
+                                    flush=True,
+                                )
+                        except Exception as e:
+                            print(
+                                f"[sim:{robot_id}] reset request failed: {e}",
+                                flush=True,
+                            )
+                            raise
+
                     if reset_pose_cmd is not None:
                         try:
                             reset_category = reset_pose_cmd.get("reset_category")
@@ -737,12 +850,16 @@ def main():
                 # observable inter-step velocity.  Position and orientation stay
                 # measured; only velocity channels are made consistent with the
                 # rigidly held pose seen by the external controller.
-                env._rigid_hold_active = bool(
-                    _base_hold_until > current_time and not _bh_soft
-                )
-                env._joint_warmup_active = bool(
-                    time.time() < getattr(env, "_warmup_joint_until", 0.0)
-                )
+                if _multi_mode:
+                    env._rigid_hold_active = False
+                    env._joint_warmup_active = False
+                else:
+                    env._rigid_hold_active = bool(
+                        _base_hold_until > current_time and not _bh_soft
+                    )
+                    env._joint_warmup_active = bool(
+                        time.time() < getattr(env, "_warmup_joint_until", 0.0)
+                    )
                 
                 # execute control step (in main thread, support rendering)
                 controller.step()
@@ -751,7 +868,20 @@ def main():
                 # physics/control step, like the rigid base pin below, so the next LowState
                 # contains precisely the requested default posture with zero joint speed.
                 # On release the write stops and the already-running controller takes over.
-                if env._joint_warmup_active:
+                if _multi_mode and torch.any(env._warmup_joint_mask):
+                    try:
+                        _robot = env.scene["robot"]
+                        _ids = torch.nonzero(
+                            env._warmup_joint_mask, as_tuple=False
+                        ).squeeze(-1)
+                        _q0 = _robot.data.default_joint_pos[_ids]
+                        _dq0 = torch.zeros_like(_robot.data.default_joint_vel[_ids])
+                        _robot.write_joint_state_to_sim(
+                            _q0, _dq0, env_ids=_ids
+                        )
+                    except Exception as _e:
+                        print(f"[sim] multi joint-warmup pin failed: {_e}", flush=True)
+                elif env._joint_warmup_active:
                     try:
                         _robot = env.scene["robot"]
                         _q0 = _robot.data.default_joint_pos
@@ -766,7 +896,29 @@ def main():
                 # during the physics step -> the IMU stays clean and the policy's 4-step
                 # history refills with upright data. A hard post-hoc pose write does NOT
                 # (the base flies free during the step, corrupting base_ang_vel).
-                if _base_hold_until > current_time and _bh_soft:
+                if _multi_mode:
+                    if torch.any(env._base_hold_mask):
+                        try:
+                            _robot = env.scene["robot"]
+                            _ids = torch.nonzero(
+                                env._base_hold_mask, as_tuple=False
+                            ).squeeze(-1)
+                            _cur = _robot.data.root_state_w[_ids].clone()
+                            _r0 = _robot.data.default_root_state[_ids]
+                            _pose = _cur[:, :7].clone()
+                            _pose[:, 0:2] = _r0[:, 0:2]
+                            _pose[:, 3:7] = _r0[:, 3:7]
+                            _robot.write_root_pose_to_sim(_pose, env_ids=_ids)
+                            _vel = _cur[:, 7:].clone()
+                            _vel[:, 0:2] = 0.0
+                            _vel[:, 3:6] = 0.0
+                            _vel[:, 2] = torch.minimum(
+                                _vel[:, 2], torch.zeros_like(_vel[:, 2])
+                            )
+                            _robot.write_root_velocity_to_sim(_vel, env_ids=_ids)
+                        except Exception as _e:
+                            print(f"[sim] multi base-hold pin failed: {_e}", flush=True)
+                elif _base_hold_until > current_time and _bh_soft:
                     # SOFT compliant hold: clamped PD wrench on the pelvis in the WORLD frame.
                     # Applied via set_external_force_and_torque -> written to sim on the NEXT
                     # env.step (one-step lag, ~20ms). The base stays free to move & respond to
@@ -840,10 +992,13 @@ def main():
                     except Exception:
                         pass
                     _bh_soft_applied = False
-                _bh_was_active = _base_hold_until > current_time
+                _bh_was_active = (
+                    bool(torch.any(env._base_hold_mask))
+                    if _multi_mode else _base_hold_until > current_time
+                )
 
                 # file-triggered external-force disturbance (skip while base is held)
-                if not (_base_hold_until > current_time):
+                if not _multi_mode and not (_base_hold_until > current_time):
                     _sim_now = float(env.sim.current_time)
                     try:
                         if os.path.exists(_push_file):
@@ -878,7 +1033,11 @@ def main():
 
                 # deterministic balance eval -> rt/eval (sim-time throttled, never raises)
                 if stand_eval is not None:
-                    stand_eval.update()
+                    if _multi_mode:
+                        for evaluator in stand_eval:
+                            evaluator.update()
+                    else:
+                        stand_eval.update()
 
                 # print statistics and loop frequency periodically
                 if current_time - last_stats_time >= args_cli.stats_interval:

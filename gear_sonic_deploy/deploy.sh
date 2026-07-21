@@ -588,7 +588,25 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
         # Write config FILES before docker run. If these paths don't exist,
         # Docker silently creates them as directories and the bridge crash-loops.
         cat > "$HOME/cyclonedds_spark.xml" <<'XML'
-<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="lo" priority="default" multicast="default" /></Interfaces></General></Domain></CycloneDDS>
+<CycloneDDS>
+  <Domain>
+    <General>
+      <Interfaces>
+        <NetworkInterface name="lo" priority="default" multicast="false" />
+      </Interfaces>
+    </General>
+    <!-- Loopback has no multicast discovery.  Give the bridge a participant
+         index and explicitly scan localhost so controllers can start before
+         or after the bridge without relying on Zenoh discovery replicas. -->
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>99</MaxAutoParticipantIndex>
+      <Peers AddLocalhost="true">
+        <Peer Address="127.0.0.1" />
+      </Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
 XML
         cat > "$HOME/zenoh-spark-config.json5" <<JSON5
 {
@@ -601,8 +619,18 @@ XML
   plugins: {
     dds: {
       domain: 0,
-      allow: ["rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/eval", "rt/api/motion_switcher/request", "rt/api/motion_switcher/response"],
-      forward_discovery: true
+      allow: [
+        "rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/eval",
+        "rt/api/motion_switcher/request", "rt/api/motion_switcher/response",
+        "rt/sim/g1/0/lowstate", "rt/sim/g1/0/lowcmd", "rt/sim/g1/0/secondary_imu",
+        "rt/sim/g1/0/reset_pose/cmd", "rt/sim/g1/0/eval",
+        "rt/sim/g1/1/lowstate", "rt/sim/g1/1/lowcmd", "rt/sim/g1/1/secondary_imu",
+        "rt/sim/g1/1/reset_pose/cmd", "rt/sim/g1/1/eval"
+      ],
+      // Unitree topics need data routing, not remote endpoint replication.
+      // Local route mode avoids discovery feedback and survives either bridge
+      // starting before its local DDS readers/writers.
+      forward_discovery: false
     }
   },
   open: {

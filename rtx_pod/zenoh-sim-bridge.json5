@@ -9,8 +9,18 @@
   plugins: {
     dds: {
       domain: 1,
-      allow: ["rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/reset_pose/cmd", "rt/eval", "rt/api/motion_switcher/request", "rt/api/motion_switcher/response"],
-      forward_discovery: true
+      allow: [
+        "rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/reset_pose/cmd", "rt/eval",
+        "rt/api/motion_switcher/request", "rt/api/motion_switcher/response",
+        "rt/sim/g1/0/lowstate", "rt/sim/g1/0/lowcmd", "rt/sim/g1/0/secondary_imu",
+        "rt/sim/g1/0/reset_pose/cmd", "rt/sim/g1/0/eval",
+        "rt/sim/g1/1/lowstate", "rt/sim/g1/1/lowcmd", "rt/sim/g1/1/secondary_imu",
+        "rt/sim/g1/1/reset_pose/cmd", "rt/sim/g1/1/eval"
+      ],
+      // Generic Unitree DDS topics do not need remote DDS endpoint replicas.
+      // Local route mode publishes/subscribes directly through Zenoh and is
+      // insensitive to which bridge or DDS endpoint starts first.
+      forward_discovery: false
     }
   },
   open: {

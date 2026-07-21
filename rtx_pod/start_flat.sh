@@ -16,6 +16,15 @@ cd "$LS"
 # SIM_WARMUP_POSE=vertical, or the measured balance equilibrium with
 # SIM_WARMUP_POSE=observed, for A/B tests.
 export SIM_WARMUP_POSE="${SIM_WARMUP_POSE:-sonic}"
+SIM_ROBOT_COUNT="${SIM_ROBOT_COUNT:-1}"
+case "$SIM_ROBOT_COUNT" in
+  ''|*[!0-9]*) echo "SIM_ROBOT_COUNT must be an integer" >&2; exit 2 ;;
+esac
+if [ "$SIM_ROBOT_COUNT" -lt 1 ] || [ "$SIM_ROBOT_COUNT" -gt 16 ]; then
+  echo "SIM_ROBOT_COUNT must be between 1 and 16" >&2
+  exit 2
+fi
+export SIM_ROBOT_COUNT
 
 # ---- Single-instance guard (SIM_RESILIENCE_PLAN.md Workstream G) -------------
 # Two overlapping bring-ups used to race past the pkill guards into DUPLICATE
@@ -43,7 +52,20 @@ fi
 python3 "$LS/stack_singleton.py" kill || true
 
 POD_IP="$(hostname -i | awk '{print $1}')"
-SIM_ARGS="--device cuda --headless --enable_cameras --task Isaac-Flat-G129-Dex3 --robot_type g129 --enable_dex3_dds --action_source dds_lowcmd29 --render_interval 12"
+DDS_INTERFACE="${SIM_DDS_INTERFACE:-$(ip -4 route show default | awk 'NR==1 {print $5}')}"
+DDS_INTERFACE="${DDS_INTERFACE:-eth0}"
+DDS_CONFIG="$LS/cyclonedds_rtx.xml"
+cat > "$DDS_CONFIG" <<XML
+<CycloneDDS><Domain><General><Interfaces><NetworkInterface name="$DDS_INTERFACE" priority="default" multicast="default" /></Interfaces></General></Domain></CycloneDDS>
+XML
+echo "    RTX DDS bridge interface: $DDS_INTERFACE"
+SIM_ARGS="--device cuda --headless --enable_cameras --task Isaac-Flat-G129-Dex3 --robot_type g129 --action_source dds_lowcmd29 --render_interval 12 --num_envs $SIM_ROBOT_COUNT"
+if [ "$SIM_ROBOT_COUNT" -eq 1 ]; then
+  # The legacy single-robot workflow has a matching Dex3 DDS endpoint.  Hands
+  # are deliberately disabled in the concurrent body-control MVP until they
+  # have per-environment state and command routing.
+  SIM_ARGS="$SIM_ARGS --enable_dex3_dds"
+fi
 
 alive() { local p; p="$(cat "$1" 2>/dev/null)"; [ -n "$p" ] && kill -0 "$p" 2>/dev/null; }
 
@@ -58,7 +80,7 @@ stop_pidfile() {
 }
 
 start_zenoh_bridge() {
-  env -u CYCLONEDDS_URI \
+  env CYCLONEDDS_URI="$DDS_CONFIG" \
       LD_LIBRARY_PATH=/usr/local/nvidia/lib64 \
       UHLC_MAX_DELTA_MS=2000 \
       setsid "$LS/zenoh-bridge-dds" --config "$LS/zenoh-sim-bridge.json5" \
@@ -102,13 +124,18 @@ fi
 
 echo "==> [3/4] Secondary IMU adapter"
 pkill -9 -f "secondary_imu_adapter.py" 2>/dev/null; sleep 1
-(
-  source "$LS/venv/bin/activate"
-  export LD_LIBRARY_PATH="$LS/cyclonedds/install/lib:/usr/local/nvidia/lib64"
-  env -u CYCLONEDDS_URI nohup python "$LS/secondary_imu_adapter.py" \
-      > "$LS/imu_adapter.log" 2>&1 &
-  echo $! > "$LS/imu.pid"
-)
+rm -f "$LS/imu.pid"
+if [ "$SIM_ROBOT_COUNT" -eq 1 ]; then
+  (
+    source "$LS/venv/bin/activate"
+    export LD_LIBRARY_PATH="$LS/cyclonedds/install/lib:/usr/local/nvidia/lib64"
+    env -u CYCLONEDDS_URI nohup python "$LS/secondary_imu_adapter.py" \
+        > "$LS/imu_adapter.log" 2>&1 &
+    echo $! > "$LS/imu.pid"
+  )
+else
+  echo "    skipped: multi-robot DDS publishes namespaced secondary IMUs directly"
+fi
 
 echo "==> [4/4] gear_sonic camera publisher"
 pkill -9 -f "gear_sonic_camera_pub.py" 2>/dev/null; sleep 1
@@ -123,7 +150,9 @@ pkill -9 -f "gear_sonic_camera_pub.py" 2>/dev/null; sleep 1
 sleep 4
 echo
 echo "===== status ====="
-for entry in "Isaac Sim:sim.pid" "Zenoh bridge:zenoh.pid" "IMU adapter:imu.pid" "Camera pub:campub.pid"; do
+status_entries=("Isaac Sim:sim.pid" "Zenoh bridge:zenoh.pid" "Camera pub:campub.pid")
+[ "$SIM_ROBOT_COUNT" -eq 1 ] && status_entries+=("IMU adapter:imu.pid")
+for entry in "${status_entries[@]}"; do
   name="${entry%%:*}"; pidf="${entry##*:}"
   if alive "$LS/$pidf"; then printf "  OK    %-14s (pid %s)\n" "$name" "$(cat "$LS/$pidf")"
   else printf "  DEAD  %-14s -> see %s\n" "$name" "$LS/${pidf%.pid}*.log"; fi
@@ -135,5 +164,5 @@ python3 "$LS/stack_singleton.py" assert || {
   echo "     inconsistent state (multiple DDS publishers). Run: python3 $LS/stack_singleton.py kill"
   echo "     then re-run this script."; }
 echo
-echo "Whole-body flat sim up. Drive it from the Spark exactly like start_all.sh:"
+echo "Whole-body flat sim up with $SIM_ROBOT_COUNT robot(s)."
 echo "  deploy (g1zenoh) -> keyboard -> VLA -> k/i/p.  POD IP: $POD_IP  (DDS :7447 camera :5555)"

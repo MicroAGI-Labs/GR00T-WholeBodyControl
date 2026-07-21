@@ -170,7 +170,15 @@ def get_robot_boy_joint_states(
     # physics state.  Publish the post-step pinned state that actually persists
     # between steps; otherwise SONIC freezes a gravity-deflected IDLE reference
     # even though the articulation itself is held at its default posture.
-    if getattr(env, "_joint_warmup_active", False):
+    joint_warmup_mask = getattr(env, "_warmup_joint_mask", None)
+    if joint_warmup_mask is not None:
+        joint_warmup_mask = joint_warmup_mask.to(device=device, dtype=torch.bool)
+        if torch.any(joint_warmup_mask):
+            default_joint_pos = env.scene["robot"].data.default_joint_pos
+            default_body_pos = torch.gather(default_joint_pos, 1, idx_batch)
+            pos_buf[joint_warmup_mask] = default_body_pos[joint_warmup_mask]
+            vel_buf[joint_warmup_mask] = 0.0
+    elif getattr(env, "_joint_warmup_active", False):
         default_joint_pos = env.scene["robot"].data.default_joint_pos
         try:
             torch.gather(default_joint_pos, 1, idx_batch, out=pos_buf)
@@ -189,8 +197,18 @@ def get_robot_boy_joint_states(
             import time
             now_ms = int(time.time() * 1000)
             if now_ms - _obs_cache["dds_last_ms"] >= _obs_cache["dds_min_interval_ms"]:
-                g1_robot_dds = _get_g1_robot_dds_instance()
-                if g1_robot_dds:
+                multi_robot_dds = getattr(env, "_multi_robot_dds", None)
+                g1_robot_dds = None if multi_robot_dds else _get_g1_robot_dds_instance()
+                if multi_robot_dds is not None:
+                    imu_data = get_robot_imu_data(env, use_torso_imu=False)
+                    multi_robot_dds.update_states(
+                        pos_buf.contiguous().cpu().numpy(),
+                        vel_buf.contiguous().cpu().numpy(),
+                        torque_buf.contiguous().cpu().numpy(),
+                        imu_data.contiguous().cpu().numpy(),
+                    )
+                    _obs_cache["dds_last_ms"] = now_ms
+                elif g1_robot_dds:
                     # MAIN lowstate IMU MUST be the PELVIS (floating-base root), matching
                     # the MuJoCo reference the SONIC policy was trained on:
                     #   unitree_sdk2py_bridge.py: low_state.imu_state.quaternion =
@@ -331,8 +349,18 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
         lin_vel = root_state[:, 7:10]
         ang_vel_world = root_state[:, 10:13]
 
-    rigid_hold_active = getattr(env, "_rigid_hold_active", False)
-    if rigid_hold_active:
+    rigid_hold_mask = getattr(env, "_base_hold_mask", None)
+    if rigid_hold_mask is not None:
+        rigid_hold_mask = rigid_hold_mask.to(device=lin_vel.device, dtype=torch.bool)
+        if torch.any(rigid_hold_mask):
+            if not use_torso_imu:
+                quat = quat.clone()
+                quat[rigid_hold_mask] = data.default_root_state[rigid_hold_mask, 3:7]
+            lin_vel = lin_vel.clone()
+            ang_vel_world = ang_vel_world.clone()
+            lin_vel[rigid_hold_mask] = 0.0
+            ang_vel_world[rigid_hold_mask] = 0.0
+    elif getattr(env, "_rigid_hold_active", False):
         # The rigid pin is applied after the physics sample represented by this
         # cache.  Publish its post-step orientation (the environment default),
         # plus zero velocity, because that is the state which persists until the

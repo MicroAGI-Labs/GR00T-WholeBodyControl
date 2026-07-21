@@ -4,6 +4,9 @@
 set -uo pipefail
 LS="${LIVE_SIM_DIR:-$HOME/live-sim}"
 POLL_S="${BRIDGE_SUPERVISOR_POLL_S:-2}"
+DDS_INTERFACE="${SIM_DDS_INTERFACE:-$(ip -4 route show default | awk 'NR==1 {print $5}')}"
+DDS_INTERFACE="${DDS_INTERFACE:-eth0}"
+DDS_CONFIG="$LS/cyclonedds_rtx.xml"
 
 alive() {
   local pid
@@ -13,7 +16,10 @@ alive() {
 
 start_bridge() {
   echo "$(date -Is) [bridge-supervisor] starting zenoh-bridge-dds"
-  env -u CYCLONEDDS_URI \
+  if [ ! -s "$DDS_CONFIG" ]; then
+    printf '%s\n' "<CycloneDDS><Domain><General><Interfaces><NetworkInterface name=\"$DDS_INTERFACE\" priority=\"default\" multicast=\"default\" /></Interfaces></General></Domain></CycloneDDS>" > "$DDS_CONFIG"
+  fi
+  env CYCLONEDDS_URI="$DDS_CONFIG" \
       LD_LIBRARY_PATH=/usr/local/nvidia/lib64 \
       UHLC_MAX_DELTA_MS=2000 \
       setsid "$LS/zenoh-bridge-dds" --config "$LS/zenoh-sim-bridge.json5" \

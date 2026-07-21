@@ -24,6 +24,15 @@ memory `sonic-rtf-delay-tolerance-levers`, `sim-resilience-implementation`,
 > jams the knees to ~1.9 and topples on release; SOFT hold flails. See `SIM_RESILIENCE_PLAN.md`
 > §8 and memory `sim-resilience-implementation`.
 
+> **Update 2026-07-21.** The same RTF 0.1 transport now carries two independent
+> namespaced SONIC control loops through one tunnel and one bridge per host. One
+> vectorized Isaac process publishes both 100 Hz state streams in-process. The
+> Spark measured 102.0 Hz and 101.9 Hz with no gaps above 100 ms during the probe;
+> Isaac held RTF 0.100. Both robots were released under separate SONIC processes
+> and both completed 60.02 simulated seconds with zero displacement and no fall;
+> final tilt was 2.0° and 1.9°. See
+> [`CONCURRENT_SONIC_CONTROL_TO_REMOTE_RTX.md`](CONCURRENT_SONIC_CONTROL_TO_REMOTE_RTX.md).
+
 ---
 
 ## 1. Setup and constraint
@@ -153,6 +162,13 @@ gap (that earlier framing was wrong). The dependence is purely loop delay.
 This keeps the G1 upright under SONIC control on the Spark despite the current tunnel
 latency.
 
+For the two-robot bring-up, both controllers still used
+`CONTROL_WALL_SCALE=0.1`, but the warmup and frozen IDLE reference were matched
+to the observed posture: `SIM_WARMUP_POSE=observed`,
+`SONIC_IDLE_PITCH_BIAS_DEG=0`, and `SONIC_IDLE_LEG_BLEND=0`. Both concurrent
+evaluators reached 60.02 simulated seconds successfully; this is now the
+recommended two-robot IDLE configuration.
+
 ### Real-robot path is preserved
 All new deploy code is off by default:
 - `CONTROL_WALL_SCALE` defaults to 1.0 (real-time),
@@ -188,6 +204,9 @@ CONTROL_WALL_SCALE=0.1 ./run_deploy_direct.sh     # also enables measured IDLE +
 
 For the **real G1**: run `./run_deploy_direct.sh` with no env overrides
 (`CONTROL_WALL_SCALE=1.0`, prediction/gain off) — unchanged interface.
+
+For two concurrent robots, use the namespaced launch and lifecycle commands in
+[`RTX_SIM_GUIDE.md`](RTX_SIM_GUIDE.md#4a-concurrent-two-g1s-controlled-by-two-spark-sonic-processes).
 
 ---
 

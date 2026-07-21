@@ -1,34 +1,35 @@
 # Running the G1 in Isaac Sim as a Real-Robot Stand-In (RTX box + DGX Spark)
 
 This guide sets up a **hardware-in-the-loop Isaac Sim testbench** for the Unitree
-G1: a G1 simulated in Isaac Sim on an RTX PRO 6000 box, driven by the **exact same
-SONIC deploy + GR00T VLA stack** that runs the real robot, with **zero code changes
-on the Spark side**.
+G1: one or more G1s simulated in Isaac Sim on an RTX PRO 6000 box, driven by the
+**same SONIC binary and Unitree DDS message types** used for the real robot.
+Simulation-only routing and timing are selected with environment variables;
+empty topic prefixes and default timing preserve the physical-robot path.
 
 The core design principle:
 
 > **The sim impersonates the real robot on both of its interfaces** — the Unitree
 > **DDS** control bus (`rt/lowstate` / `rt/lowcmd`) and the **camera server**
-> (gear_sonic ZMQ `:5555`). The Spark-side deploy, policy server, and VLA client
-> are byte-for-byte identical whether they talk to the sim or the real Orin — only
-> the endpoints change. **Never fork the Spark code for sim.**
+> (gear_sonic ZMQ `:5555`). A concurrent simulation uses namespaced DDS topics
+> such as `rt/sim/g1/0/lowstate`; the unprefixed hardware topics remain the
+> default. **Do not maintain a separate simulation controller binary.**
 
 ```
                  DGX Spark (GB10)                       RTX PRO 6000 pod (k8s)
    ┌───────────────────────────────────┐        ┌──────────────────────────────────┐
    │ GR00T N1.7 policy server (:5550)   │        │ Isaac Sim G1 (CPU physics)         │
-   │ SONIC deploy  ── rt/lowcmd ──────┐ │  DDS   │  ├─ DDS domain 1 (rt/lowstate…)    │
+   │ SONIC deploy(s) ─ lowcmd ────────┐ │  DDS   │  ├─ DDS domain 1 (lowstate…)       │
    │ VLA client (run_vla_inference)   │ │◄─Zenoh─┤  ├─ shared-mem cameras             │
    │   --camera-host 127.0.0.1 ───────┘ │  :7447 │ zenoh-bridge-dds (:7447)           │
-   │                                     │  :5555 │ secondary_imu adapter              │
+   │                                     │  :5555 │ in-process per-robot DDS/IMU (N>1)  │
    │  (ssh -L tunnels for :7447, :5555)  │◄───────┤ gear_sonic_camera_pub (:5555)      │
    └───────────────────────────────────┘        │  GPU: rendering only                │
                                                   └──────────────────────────────────┘
 ```
 
-Everything runs **real-time (~0.95×)** with the GPU free for rendering and the VLA
-running on the Spark. See **§7 Gotchas** — several are non-obvious and each cost
-real debugging time.
+The pick/place stack can run near real time, but remote SONIC balance is
+latency-limited and is validated at **RTF 0.1** with the current SSH route. See
+[`RTX_SIM_LATENCY.md`](RTX_SIM_LATENCY.md) and **§7 Gotchas**.
 
 ---
 
@@ -348,6 +349,99 @@ default route; set `DDS_INTERFACE=<name>` to override it. On the pod,
 `g1_dds_diag.py capture` also records the latest absolute root position/quaternion from
 `rt/eval`, alongside measured and commanded joints.
 
+### 4a-concurrent. Two G1s controlled by two Spark SONIC processes
+
+The concurrent MVP keeps one Isaac process, one bridge per host, and one SSH
+tunnel. Isolation comes from namespaced topics, not extra DDS domains or
+sidecars. The tested two-robot setup is documented in full in
+[`CONCURRENT_SONIC_CONTROL_TO_REMOTE_RTX.md`](CONCURRENT_SONIC_CONTROL_TO_REMOTE_RTX.md).
+
+Start two environments on the RTX pod:
+
+```bash
+SIM_ROBOT_COUNT=2 SIM_SLOWMO=10 SIM_BASE_HOLD_S=9999 \
+  SIM_BASE_SOFT=0 SIM_WARMUP_JOINTS=1 SIM_WARMUP_POSE=observed \
+  bash ~/live-sim/start_flat.sh
+```
+
+This launches exactly one Isaac process, one RTX Zenoh bridge, one camera
+publisher, and no secondary-IMU adapter. The in-process multi-robot DDS endpoint
+publishes each robot's LowState and secondary IMU directly. Concurrent Dex3 is
+disabled for this body-control MVP; `start_flat.sh` retains `--enable_dex3_dds`
+only for the legacy single-robot path until hand state and commands are routed
+per environment.
+
+The Spark bridge is still created by the normal `g1zenoh` deployment. It uses
+DDS domain 0 on `lo`, explicit localhost discovery, and
+`forward_discovery: false`. Once the `zenoh-spark-bridge` container exists, it
+can be restarted independently and controllers may start before or after it:
+
+```bash
+docker restart zenoh-spark-bridge
+docker logs --tail 30 zenoh-spark-bridge
+```
+
+Launch the controllers in clean tmux sessions. The explicit zero pitch bias and
+zero leg blend make the IDLE reference match the observed warmup posture used
+by this concurrent run:
+
+```bash
+ROOT=/home/microagi/repos/GR00T-WholeBodyControl
+
+tmux new-session -d -s sonic0 \
+  "env DDS_INTERFACE=lo CONTROL_WALL_SCALE=0.1 \
+   SONIC_INSTANCE_ID=0 SONIC_TOPIC_PREFIX=rt/sim/g1/0 \
+   SONIC_SKIP_MOTION_SWITCHER=1 SONIC_IDLE_HOLD_REFERENCE=1 \
+   SONIC_IDLE_PITCH_BIAS_DEG=0 SONIC_IDLE_LEG_BLEND=0 \
+   ZMQ_INPUT_PORT=5556 ZMQ_OUTPUT_PORT=5657 \
+   IDLE_TELEMETRY_LOGFILE=/tmp/sonic0_idle.csv \
+   $ROOT/run_deploy_clean.sh"
+
+tmux new-session -d -s sonic1 \
+  "env DDS_INTERFACE=lo CONTROL_WALL_SCALE=0.1 \
+   SONIC_INSTANCE_ID=1 SONIC_TOPIC_PREFIX=rt/sim/g1/1 \
+   SONIC_SKIP_MOTION_SWITCHER=1 SONIC_IDLE_HOLD_REFERENCE=1 \
+   SONIC_IDLE_PITCH_BIAS_DEG=0 SONIC_IDLE_LEG_BLEND=0 \
+   ZMQ_INPUT_PORT=5558 ZMQ_OUTPUT_PORT=5658 \
+   IDLE_TELEMETRY_LOGFILE=/tmp/sonic1_idle.csv \
+   $ROOT/run_deploy_clean.sh"
+```
+
+Wait for `Init Done` in both sessions. Send `]`, then Enter, then `1` to each,
+waiting for planner initialization between keys. Re-arm and release each robot
+through its own lifecycle topic:
+
+```bash
+cd "$ROOT"
+for i in 0 1; do
+  DDS_DOMAIN=0 DDS_INTERFACE=lo python3 rtx_pod/fire_reset.py 3 4 rt/sim/g1/$i
+done
+sleep 5
+for i in 0 1; do
+  DDS_DOMAIN=0 DDS_INTERFACE=lo python3 rtx_pod/fire_reset.py 3 3 rt/sim/g1/$i
+done
+```
+
+Verify both feeds and evaluators independently:
+
+```bash
+python3 rtx_pod/g1_dds_diag.py --domain 0 --interface lo \
+  --topic-prefix rt/sim/g1/0 probe --dur 5
+python3 rtx_pod/g1_dds_diag.py --domain 0 --interface lo \
+  --topic-prefix rt/sim/g1/1 probe --dur 5
+python3 rtx_pod/g1_dds_diag.py --domain 0 --interface lo \
+  --topic-prefix rt/sim/g1/0 eval 10
+python3 rtx_pod/g1_dds_diag.py --domain 0 --interface lo \
+  --topic-prefix rt/sim/g1/1 eval 10
+```
+
+The 2026-07-21 run measured about 102 Hz for each Spark-side state stream and
+RTF 0.100. Both robots completed 60.02 simulated seconds with zero displacement
+and no fall; final tilt was 2.0° and 1.9°. Both controllers also recovered to
+`Init Done` after the Spark bridge was restarted before release without
+restarting the controllers. Mixed IDLE/WALK isolation and free-standing
+transport-restart tests remain open.
+
 ### 4a-bis. Watch it: WebRTC 3rd-person viewport (from a WARP laptop, NO tunnel)
 
 The Omniverse viewport livestream (enabled by `--livestream_type 2 --public_ip <POD_IP>`
@@ -517,10 +611,12 @@ Authoritative RTF (measured via `env.sim.current_time` vs wall-clock), single en
 10. **Wire parity is verifiable:** the camera message's `images` dict must have keys
     `ego_view` / `left_wrist` / `right_wrist` (480×640×3 uint8). The VLA client reads
     `images["ego_view"]` directly — a `head` key gives `KeyError: 'ego_view'` (see §2).
-11. **Shared memory is fragile — the sim owns it; don't touch `/dev/shm`.** Both the camera
-    feed *and* the DDS state path run through Python
-    `multiprocessing.shared_memory` segments (named `/dev/shm/psm_*`). Two ways to break it,
-    both seen in practice:
+11. **Shared memory is fragile — the sim owns it; don't touch `/dev/shm`.** In the legacy
+    single-robot path, both the camera feed and DDS state path use Python
+    `multiprocessing.shared_memory` segments (named `/dev/shm/psm_*`). The concurrent
+    path keeps body command/state records inside the Isaac process, but the camera path
+    still uses shared memory. Two ways to break legacy/shared-memory consumers, both seen
+    in practice:
     - **On deployments without the resilience patch, restarting the camera pub alone** while
       the sim runs: `MultiImageReader`'s
       `resource_tracker` *unlinks* the segments on exit ("N leaked shared_memory objects to
@@ -559,6 +655,11 @@ Authoritative RTF (measured via `env.sim.current_time` vs wall-clock), single en
 
 ## 8. Open items
 
+- ✅ **Two-controller concurrent IDLE passed** (2026-07-21): one
+  two-environment Isaac process on the RTX and two namespaced SONIC processes on
+  the Spark, both released for 60.02 simulated seconds at RTF 0.1 with zero
+  displacement and no fall. Complete the mixed-mode, selective-reset, and restart
+  acceptance tests before scaling to four.
 - ✅ **Full VLA loop closed** (2026-07-08): GR00T `bs256/checkpoint-12000` on `:5551` →
   deploy `g1zenoh` (POSE mode) → sim G1, prompt `"put the bar into the crate"`. Confirmed
   the arms move under policy control (arm-joint Δ ≈ 3.9 rad / 3 s; deploy consuming 64-D

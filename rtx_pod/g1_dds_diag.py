@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """g1_dds_diag.py — G1 SONIC balance-stack DDS diagnostics.
 
-One CLI over the stack's DDS traffic: ``rt/lowstate`` (observations the
-controller sees — measured joints + IMU) and ``rt/lowcmd`` (commands it
-sends). Consolidates the ad-hoc capture/probe/warm/watch scripts used while
-debugging the Isaac-sim balance work into a single reusable tool.
+One CLI over the stack's DDS traffic.  With no prefix it observes the legacy
+``rt/lowstate`` / ``rt/lowcmd`` topics.  ``--topic-prefix rt/sim/g1/0``
+selects one robot in a concurrent simulation.
 
 Subcommands
 -----------
@@ -22,10 +21,10 @@ match where you're listening. Default 0 (Spark/deploy side).
 
 Examples
 --------
-  ./g1_dds_diag.py watch                 # live stand check on domain 0
-  ./g1_dds_diag.py capture 16 iso /tmp/iso.csv
-  ./g1_dds_diag.py probe --domain 0 --dur 8
-  ./g1_dds_diag.py warm --domain 1       # keep pod-side route warm
+  ./g1_dds_diag.py watch                 # legacy topics, domain 0
+  ./g1_dds_diag.py --topic-prefix rt/sim/g1/0 watch 10
+  ./g1_dds_diag.py --domain 0 --topic-prefix rt/sim/g1/1 capture 16 robot1
+  ./g1_dds_diag.py --domain 1 warm       # keep pod-side route warm
 """
 import argparse
 import json
@@ -80,6 +79,15 @@ def _init(domain, interface=None):
         ChannelFactoryInitialize(domain)
 
 
+def _topic(args, legacy_topic):
+    """Return a legacy topic or its per-robot namespaced equivalent."""
+    prefix = args.topic_prefix.strip().rstrip("/")
+    if not prefix:
+        return legacy_topic
+    suffix = legacy_topic[3:] if legacy_topic.startswith("rt/") else legacy_topic
+    return f"{prefix}/{suffix}"
+
+
 # --------------------------------------------------------------------------- watch
 def cmd_watch(args):
     """Live one-line tilt / knee / |gyro| — quick free-standing sanity check."""
@@ -91,8 +99,9 @@ def cmd_watch(args):
         st["gyro"] = list(m.imu_state.gyroscope)
         st["knee"] = (m.motor_state[KNEE[0]].q, m.motor_state[KNEE[1]].q)
 
-    ChannelSubscriber("rt/lowstate", LowState_).Init(cb, 10)
-    print(f"[watch] domain={args.domain}  waiting for rt/lowstate...", flush=True)
+    state_topic = _topic(args, "rt/lowstate")
+    ChannelSubscriber(state_topic, LowState_).Init(cb, 10)
+    print(f"[watch] domain={args.domain} waiting for {state_topic}...", flush=True)
     t0 = time.time()
     while args.dur <= 0 or time.time() - t0 < args.dur:
         if st["quat"]:
@@ -108,8 +117,9 @@ def cmd_eval(args):
     import json
     _init(args.domain, args.interface)
     st = {"last": None}
-    ChannelSubscriber("rt/eval", String_).Init(lambda m: st.__setitem__("last", m.data), 10)
-    print(f"[eval] domain={args.domain}  waiting for rt/eval...", flush=True)
+    eval_topic = _topic(args, "rt/eval")
+    ChannelSubscriber(eval_topic, String_).Init(lambda m: st.__setitem__("last", m.data), 10)
+    print(f"[eval] domain={args.domain} waiting for {eval_topic}...", flush=True)
     t0 = time.time()
     seen = None
     while args.dur <= 0 or time.time() - t0 < args.dur:
@@ -157,9 +167,12 @@ def cmd_capture(args):
         except (TypeError, ValueError):
             pass
 
-    ChannelSubscriber("rt/lowstate", LowState_).Init(scb, 10)
-    ChannelSubscriber("rt/lowcmd", LowCmd_).Init(ccb, 10)
-    ChannelSubscriber("rt/eval", String_).Init(ecb, 10)
+    state_topic = _topic(args, "rt/lowstate")
+    command_topic = _topic(args, "rt/lowcmd")
+    eval_topic = _topic(args, "rt/eval")
+    ChannelSubscriber(state_topic, LowState_).Init(scb, 10)
+    ChannelSubscriber(command_topic, LowCmd_).Init(ccb, 10)
+    ChannelSubscriber(eval_topic, String_).Init(ecb, 10)
 
     out = args.out or f"/tmp/cap_{args.label}.csv"
     cols = (["t", "tilt", "wnorm"]
@@ -169,7 +182,8 @@ def cmd_capture(args):
             + ["accx", "accy", "accz", "eval_t", "root_x", "root_y", "root_z",
                "root_qw", "root_qx", "root_qy", "root_qz", "eval_dist",
                "eval_tilt", "eval_result", "eval_termination"])
-    print(f"[capture] domain={args.domain} label={args.label} dur={args.dur}s -> {out}", flush=True)
+    print(f"[capture] domain={args.domain} prefix={args.topic_prefix or '<legacy>'} "
+          f"label={args.label} dur={args.dur}s -> {out}", flush=True)
     time.sleep(1.0)  # let both topics arrive
     n = 0
     with open(out, "w") as f:
@@ -211,8 +225,9 @@ def cmd_probe(args):
             state["gaps"].append(now - state["last"])
         state["last"] = now
 
-    ChannelSubscriber("rt/lowstate", LowState_).Init(cb, 10)
-    print(f"[probe] domain={args.domain}  listening {args.dur}s...", flush=True)
+    state_topic = _topic(args, "rt/lowstate")
+    ChannelSubscriber(state_topic, LowState_).Init(cb, 10)
+    print(f"[probe] domain={args.domain} listening to {state_topic} for {args.dur}s...", flush=True)
     t0 = time.time()
     while time.time() - t0 < args.dur:
         time.sleep(0.2)
@@ -232,8 +247,9 @@ def cmd_warm(args):
     """Persistent subscriber that keeps the zenoh<->DDS route warm; prints a heartbeat."""
     _init(args.domain, args.interface)
     n = [0]
-    ChannelSubscriber("rt/lowstate", LowState_).Init(lambda m: n.__setitem__(0, n[0] + 1), 10)
-    print(f"[warm] domain={args.domain} holding rt/lowstate route warm", flush=True)
+    state_topic = _topic(args, "rt/lowstate")
+    ChannelSubscriber(state_topic, LowState_).Init(lambda m: n.__setitem__(0, n[0] + 1), 10)
+    print(f"[warm] domain={args.domain} holding {state_topic} route warm", flush=True)
     last = 0
     while True:
         time.sleep(2.0)
@@ -248,6 +264,8 @@ def main():
                    help="DDS domain (0=Spark/deploy side, 1=pod sim). Default 0.")
     p.add_argument("--interface", default=None,
                    help="DDS network interface (default: CycloneDDS auto-selection).")
+    p.add_argument("--topic-prefix", default="",
+                   help="robot topic prefix, e.g. rt/sim/g1/0 (default: legacy rt/* topics)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     w = sub.add_parser("watch", help="live tilt/knee/|gyro| stand check")

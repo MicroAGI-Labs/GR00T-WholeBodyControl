@@ -26,6 +26,15 @@ telemetry_args=()
 if [[ -n "${IDLE_TELEMETRY_LOGFILE:-}" ]]; then
   telemetry_args=(--idle-telemetry-logfile "$IDLE_TELEMETRY_LOGFILE")
 fi
+instance_id=${SONIC_INSTANCE_ID:-default}
+zmq_input_port=${ZMQ_INPUT_PORT:-5556}
+zmq_output_port=${ZMQ_OUTPUT_PORT:-5557}
+zmq_input_topic=${ZMQ_INPUT_TOPIC:-pose_${instance_id}}
+zmq_output_topic=${ZMQ_OUTPUT_TOPIC:-g1_debug_${instance_id}}
+log_args=()
+if [[ -n "${SONIC_LOGS_DIR:-}" ]]; then
+  log_args=(--logs-dir "$SONIC_LOGS_DIR")
+fi
 exec ./target/release/g1_deploy_onnx_ref \
     "$DDS_INTERFACE" \
     policy/release/model_decoder.onnx \
@@ -37,4 +46,9 @@ exec ./target/release/g1_deploy_onnx_ref \
     --input-type manager \
     --output-type all \
     --zmq-host localhost \
-    "${telemetry_args[@]}"
+    --zmq-port "$zmq_input_port" \
+    --zmq-topic "$zmq_input_topic" \
+    --zmq-out-port "$zmq_output_port" \
+    --zmq-out-topic "$zmq_output_topic" \
+    "${telemetry_args[@]}" \
+    "${log_args[@]}"

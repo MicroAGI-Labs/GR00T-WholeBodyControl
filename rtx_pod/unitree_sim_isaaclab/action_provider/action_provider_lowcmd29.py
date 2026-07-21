@@ -27,6 +27,8 @@ class DDSLowCmd29ActionProvider(ActionProvider):
         self.enable_robot = args_cli.robot_type
         self.enable_dex3 = args_cli.enable_dex3_dds
         self.env = env
+        self.num_envs = int(env.num_envs)
+        self.multi_robot = getattr(env, "_multi_robot_dds", None)
         self.robot_dds = None
         self.dex3_dds = None
         self._setup_dds()
@@ -34,6 +36,15 @@ class DDSLowCmd29ActionProvider(ActionProvider):
 
     def _setup_dds(self):
         try:
+            if self.multi_robot is not None:
+                self.robot_dds = self.multi_robot
+                # Dex3 vectorization is deliberately deferred until body
+                # control is proven. Body/arm commands still cover all 29 G1
+                # joints; fingers stay at their environment defaults.
+                self.dex3_dds = None
+                print(f"[{self.name}] namespaced multi-robot DDS initialized "
+                      f"({self.num_envs} robots, Dex3 held at default)")
+                return
             if self.enable_robot in ("g129", "h1_2"):
                 self.robot_dds = dds_manager.get_object("g129")
             if self.enable_dex3:
@@ -82,7 +93,7 @@ class DDSLowCmd29ActionProvider(ActionProvider):
 
         # Hold the default standing pose until commands arrive (ActionsCfg uses
         # use_default_offset=False, so the raw action IS the absolute joint target).
-        default_q = self.env.scene["robot"].data.default_joint_pos[0].clone()
+        default_q = self.env.scene["robot"].data.default_joint_pos.clone()
         self._full_action_buf = default_q.to(device=device, dtype=torch.float32)
         self._default_full = default_q.to(device=device, dtype=torch.float32).clone()
         # The environment default is the measured free-standing equilibrium.
@@ -90,7 +101,9 @@ class DDSLowCmd29ActionProvider(ActionProvider):
         # default-angle offsets are a policy coordinate convention, not a
         # physically self-consistent pinned pose in Isaac.
         self._warmup_full = self._default_full.clone()
-        self._positions_buf = torch.empty(29, device=device, dtype=torch.float32)
+        self._positions_buf = torch.empty(
+            (self.num_envs, 29), device=device, dtype=torch.float32
+        )
 
         # Action-latency model (SIM_ACT_LATENCY = N control steps, 50Hz -> 20ms each).
         # SONIC balances the real G1, which has ~tens of ms of actuation delay; Isaac's
@@ -117,13 +130,13 @@ class DDSLowCmd29ActionProvider(ActionProvider):
             print(f"[{self.name}] joint limit fetch failed ({e}); clamping disabled")
             self._q_lo = self._q_hi = None
 
-        # Buffers for the FULL per-command PD protocol (kp/kd/dq/tau), shape [1, 29],
+        # Buffers for the FULL per-command PD protocol (kp/kd/dq/tau), shape [N, 29],
         # column i corresponds to Isaac joint self._body_target_indices[i] (Unitree order).
-        self._kp_buf = torch.zeros((1, 29), device=device, dtype=torch.float32)
-        self._kd_buf = torch.zeros((1, 29), device=device, dtype=torch.float32)
+        self._kp_buf = torch.zeros((self.num_envs, 29), device=device, dtype=torch.float32)
+        self._kd_buf = torch.zeros((self.num_envs, 29), device=device, dtype=torch.float32)
         self._gains_written = False  # cache: only push kp/kd to sim when they change
-        self._dq_buf = torch.zeros((1, 29), device=device, dtype=torch.float32)
-        self._tau_buf = torch.zeros((1, 29), device=device, dtype=torch.float32)
+        self._dq_buf = torch.zeros((self.num_envs, 29), device=device, dtype=torch.float32)
+        self._tau_buf = torch.zeros((self.num_envs, 29), device=device, dtype=torch.float32)
 
         # --- ROOT-CAUSE TEST: match MuJoCo training torso inertial (gated) ---
         import os as _os_torso
@@ -145,30 +158,50 @@ class DDSLowCmd29ActionProvider(ActionProvider):
 
 
     def get_action(self, env) -> Optional[torch.Tensor]:
-        print(f"[{self.name}] get_action called, robot_dds is not None: {self.robot_dds is not None}")
         try:
             # During the exact joint warmup, continue ingesting LowCmd into the
             # persistent buffers even though the applied action remains the held
             # pose.  Returning before this read left a command from the preceding
             # trial queued for the first released step, making identical re-arm
             # tests non-deterministic.
-            warmup_active = (
-                time.time() < getattr(self.env, "_warmup_joint_until", 0.0)
-            )
+            warmup_mask = getattr(self.env, "_warmup_joint_mask", None)
+            if warmup_mask is None:
+                warmup_active = time.time() < getattr(
+                    self.env, "_warmup_joint_until", 0.0
+                )
+                warmup_mask = torch.full(
+                    (self.num_envs,), warmup_active,
+                    dtype=torch.bool, device=self.env.device,
+                )
+            else:
+                warmup_mask = warmup_mask.to(
+                    device=self.env.device, dtype=torch.bool
+                )
 
             full_action = self._full_action_buf  # persists last command / default pose
             robot = self.env.scene["robot"]
             if self.robot_dds is not None:
-                cmd = self.robot_dds.get_robot_command()
-                if cmd and 'motor_cmd' in cmd:
+                if self.multi_robot is not None:
+                    commands = self.robot_dds.snapshot_commands()
+                else:
+                    commands = [self.robot_dds.get_robot_command()]
+
+                gains_changed = False
+                for robot_id, cmd in enumerate(commands):
+                    if not cmd or 'motor_cmd' not in cmd:
+                        continue
                     mc = cmd['motor_cmd']
                     positions = mc['positions']
                     if len(positions) >= 29:
                         dev = self.env.device
-                        self._positions_buf.copy_(
+                        self._positions_buf[robot_id].copy_(
                             torch.tensor(positions[:29], dtype=torch.float32, device=dev))
-                        body_vals = self._positions_buf.index_select(0, self._body_source_idx_t)
-                        full_action.index_copy_(0, self._body_target_idx_t, body_vals)
+                        body_vals = self._positions_buf[robot_id].index_select(
+                            0, self._body_source_idx_t
+                        )
+                        full_action[robot_id].index_copy_(
+                            0, self._body_target_idx_t, body_vals
+                        )
 
                         # --- Faithful lowcmd PD protocol -------------------------------
                         # Push the COMMANDED per-joint gains + dq/tau into the implicit
@@ -184,12 +217,12 @@ class DDSLowCmd29ActionProvider(ActionProvider):
                             # SONIC sends CONSTANT gains; write_joint_stiffness/damping_to_sim
                             # are (relatively) expensive USD writes on the CPU pipeline. Only
                             # push them when they actually change, not every 50 Hz tick.
-                            if not self._gains_written or not torch.equal(new_kp, self._kp_buf[0]) or not torch.equal(new_kd, self._kd_buf[0]):
-                                self._kp_buf[0].copy_(new_kp)
-                                self._kd_buf[0].copy_(new_kd)
-                                robot.write_joint_stiffness_to_sim(self._kp_buf, joint_ids=jids)
-                                robot.write_joint_damping_to_sim(self._kd_buf, joint_ids=jids)
-                                self._gains_written = True
+                            if (not self._gains_written
+                                    or not torch.equal(new_kp, self._kp_buf[robot_id])
+                                    or not torch.equal(new_kd, self._kd_buf[robot_id])):
+                                self._kp_buf[robot_id].copy_(new_kp)
+                                self._kd_buf[robot_id].copy_(new_kd)
+                                gains_changed = True
                                 # DIAGNOSTIC: read back the ACTUAL sim gains to confirm the
                                 # SONIC gains stuck (vs the cfg gains 150-200/ankle 20).
                                 if not getattr(self, "_gains_logged", False):
@@ -206,11 +239,28 @@ class DDSLowCmd29ActionProvider(ActionProvider):
                                         print(f"[{self.name}] gain readback failed: {_e}", flush=True)
                                     self._gains_logged = True
                         if dq is not None and len(dq) >= 29:
-                            self._dq_buf[0].copy_(torch.tensor(dq[:29], dtype=torch.float32, device=dev))
-                            robot.set_joint_velocity_target(self._dq_buf, joint_ids=jids)
+                            self._dq_buf[robot_id].copy_(torch.tensor(
+                                dq[:29], dtype=torch.float32, device=dev
+                            ))
                         if tau is not None and len(tau) >= 29:
-                            self._tau_buf[0].copy_(torch.tensor(tau[:29], dtype=torch.float32, device=dev))
-                            robot.set_joint_effort_target(self._tau_buf, joint_ids=jids)
+                            self._tau_buf[robot_id].copy_(torch.tensor(
+                                tau[:29], dtype=torch.float32, device=dev
+                            ))
+
+                if gains_changed:
+                    robot.write_joint_stiffness_to_sim(
+                        self._kp_buf, joint_ids=self._body_target_indices
+                    )
+                    robot.write_joint_damping_to_sim(
+                        self._kd_buf, joint_ids=self._body_target_indices
+                    )
+                    self._gains_written = True
+                robot.set_joint_velocity_target(
+                    self._dq_buf, joint_ids=self._body_target_indices
+                )
+                robot.set_joint_effort_target(
+                    self._tau_buf, joint_ids=self._body_target_indices
+                )
             if self.dex3_dds is not None:
                 hand_cmds = self.dex3_dds.get_hand_commands()
                 if hand_cmds:
@@ -224,24 +274,22 @@ class DDSLowCmd29ActionProvider(ActionProvider):
                                 torch.tensor(lp[:len(self._left_hand_buf)], dtype=torch.float32, device=self.env.device))
                             self._right_hand_buf.copy_(
                                 torch.tensor(rp[:len(self._right_hand_buf)], dtype=torch.float32, device=self.env.device))
-                            full_action.index_copy_(0, self._left_hand_target_idx_t,
-                                                    self._left_hand_buf.index_select(0, self._left_hand_source_idx_t))
-                            full_action.index_copy_(0, self._right_hand_target_idx_t,
-                                                    self._right_hand_buf.index_select(0, self._right_hand_source_idx_t))
+                            full_action[0].index_copy_(0, self._left_hand_target_idx_t,
+                                                       self._left_hand_buf.index_select(0, self._left_hand_source_idx_t))
+                            full_action[0].index_copy_(0, self._right_hand_target_idx_t,
+                                                       self._right_hand_buf.index_select(0, self._right_hand_source_idx_t))
             if self._q_lo is not None:
                 full_action = torch.clamp(full_action, self._q_lo, self._q_hi)
-            if warmup_active:
-                fa = self._warmup_full
-                if self._q_lo is not None:
-                    fa = torch.clamp(fa, self._q_lo, self._q_hi)
-                return fa.unsqueeze(0)
+            if torch.any(warmup_mask):
+                full_action = full_action.clone()
+                full_action[warmup_mask] = self._warmup_full[warmup_mask]
             # apply the position target from N control steps ago (action latency)
             if self._act_latency > 0:
                 self._act_buf.append(full_action.clone())
                 if len(self._act_buf) > self._act_latency + 1:
                     self._act_buf.pop(0)
                 full_action = self._act_buf[0]
-            return full_action.unsqueeze(0)
+            return full_action
         except Exception as e:
             print(f"[{self.name}] Get DDS action failed: {e}")
             return None

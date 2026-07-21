@@ -2221,6 +2221,14 @@ class G1Deploy {
                 << " (interface '" << networkInterface << "')" << std::endl;
       ChannelFactory::Instance()->Init(_dds_domain, networkInterface);
 
+      const char* _instance_env = std::getenv("SONIC_INSTANCE_ID");
+      const char* _topic_prefix_env = std::getenv("SONIC_TOPIC_PREFIX");
+      std::cout << "[deploy] SONIC instance="
+                << (_instance_env && *_instance_env ? _instance_env : "default")
+                << " topic_prefix="
+                << (_topic_prefix_env && *_topic_prefix_env ? _topic_prefix_env : "<physical-default>")
+                << std::endl;
+
       // Initialize Dex3 hands (ChannelFactory already initialized above)
       dex3_hands_.initialize("");
 
@@ -2347,22 +2355,28 @@ class G1Deploy {
       planner_motion_->timesteps = 0;
       planner_motion_->name = "planner_motion";
       // try to shutdown motion control-related service
-      msc_ = std::make_unique<unitree::robot::b2::MotionSwitcherClient>();
-      msc_->SetTimeout(5.0f);
-      msc_->Init();
-      std::string form, name;
-      while (msc_->CheckMode(form, name), !name.empty()) {
-        if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
-        sleep(5);
+      const char* _skip_msc_env = std::getenv("SONIC_SKIP_MOTION_SWITCHER");
+      const bool _skip_msc = _skip_msc_env && std::string(_skip_msc_env) != "0";
+      if (_skip_msc) {
+        std::cout << "[deploy] skipping MotionSwitcher client (simulation mode)" << std::endl;
+      } else {
+        msc_ = std::make_unique<unitree::robot::b2::MotionSwitcherClient>();
+        msc_->SetTimeout(5.0f);
+        msc_->Init();
+        std::string form, name;
+        while (msc_->CheckMode(form, name), !name.empty()) {
+          if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
+          std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
       }
 
       // create publisher
-      lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(HG_CMD_TOPIC));
+      lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(SonicDdsTopic(HG_CMD_TOPIC)));
       lowcmd_publisher_->InitChannel();
       // create subscriber
-      lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
+      lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(SonicDdsTopic(HG_STATE_TOPIC)));
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
-      imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
+      imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(SonicDdsTopic(HG_IMU_TORSO)));
       imutorso_subscriber_->InitChannel(std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1), 1);
       // Load motion data
       if (motion_reader_.ReadFromCSV(motion_data_path)) {
@@ -2737,13 +2751,30 @@ class G1Deploy {
     }
 
     void SetThreadPriority() {
+      const char* topic_prefix = std::getenv("SONIC_TOPIC_PREFIX");
+      const char* cpu_env = std::getenv("SONIC_CPU_ID");
+      const bool simulation_instance = topic_prefix && *topic_prefix;
+      if (simulation_instance && !(cpu_env && *cpu_env)) {
+        std::cout << "[deploy] simulation instance: CPU affinity disabled" << std::endl;
+        return;
+      }
+
       struct sched_param param;
       param.sched_priority = sched_get_priority_max(SCHED_FIFO);
       pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+      int cpu_id = 0;
+      if (cpu_env && *cpu_env) {
+        cpu_id = std::atoi(cpu_env);
+      }
+      if (cpu_id < 0 || cpu_id >= CPU_SETSIZE) {
+        std::cerr << "[deploy] ignoring invalid SONIC_CPU_ID=" << cpu_id << std::endl;
+        return;
+      }
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
-      CPU_SET(0, &cpuset);
+      CPU_SET(cpu_id, &cpuset);
       pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+      std::cout << "[deploy] main thread pinned to CPU " << cpu_id << std::endl;
     }
 
     /// Live-refresh commanded-gain scales from GAIN_SCALE_FILE (default /tmp/gain_scale),
@@ -4866,22 +4897,26 @@ int main(int argc, char const* argv[]) {
 #if HAS_ROS2
   if (inputType == "ros2") {
     while (!custom.operator_state.stop && rclcpp::ok()) { 
-      sleep(0.02); 
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     if (!rclcpp::ok()) {
       std::cout << "[INFO] ROS2 shutdown detected (Ctrl+C)" << std::endl;
     }
   } else {
-    while (!custom.operator_state.stop) { sleep(0.02); }
+    while (!custom.operator_state.stop) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
   }
 #else
-  while (!custom.operator_state.stop) { sleep(0.02); }
+  while (!custom.operator_state.stop) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;
   custom.Stop();
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
-  sleep(0.5);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }

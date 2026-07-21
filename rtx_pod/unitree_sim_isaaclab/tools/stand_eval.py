@@ -52,11 +52,13 @@ def _envf(name, default):
 class StandEval:
     """Deterministic balance eval → rt/eval. See module docstring."""
 
-    def __init__(self, robot, sim_time_fn):
+    def __init__(self, robot, sim_time_fn, env_id=0, topic="rt/eval"):
         # robot: IsaacLab Articulation (env.scene["robot"]).
         # sim_time_fn: () -> float, monotonic sim-time in seconds.
         self.robot = robot
         self.sim_time = sim_time_fn
+        self.env_id = int(env_id)
+        self.topic = topic
 
         # ---- tunables (env-overridable; defaults match the flat-stand recipe) --
         self.window_s = _envf("EVAL_WINDOW_S", 60.0)   # sim-sec standing == success
@@ -86,9 +88,12 @@ class StandEval:
         self._err_once = False
 
         try:
-            self.pub = ChannelPublisher("rt/eval", String_)
+            self.pub = ChannelPublisher(self.topic, String_)
             self.pub.Init()
-            print("[stand_eval] publishing rt/eval (String JSON)", flush=True)
+            print(
+                f"[stand_eval:{self.env_id}] publishing {self.topic} (String JSON)",
+                flush=True,
+            )
         except Exception as e:  # noqa: BLE001 - never break bring-up
             self.pub = None
             print(f"[stand_eval] publisher init failed: {e}", flush=True)
@@ -107,7 +112,7 @@ class StandEval:
         self._done = False
         self._final = None
         self._last_pub_t = -1e18
-        print(f"[stand_eval] ARMED at t={self._t0:.2f}s p0=({pos[0]:.2f},{pos[1]:.2f}) "
+        print(f"[stand_eval:{self.env_id}] ARMED at t={self._t0:.2f}s p0=({pos[0]:.2f},{pos[1]:.2f}) "
               f"z0={pos[2]:.3f} window={self.window_s:.0f}s", flush=True)
 
     def disarm(self):
@@ -115,7 +120,7 @@ class StandEval:
         self._armed = False
         self._done = False
         self._final = None
-        print("[stand_eval] DISARMED (start-hold)", flush=True)
+        print(f"[stand_eval:{self.env_id}] DISARMED (start-hold)", flush=True)
 
     # -- per-step ------------------------------------------------------------
     def update(self):
@@ -125,7 +130,7 @@ class StandEval:
         except Exception as e:  # noqa: BLE001 - the eval must never crash the sim
             if not self._err_once:
                 self._err_once = True
-                print(f"[stand_eval] update error (silenced): {e}", flush=True)
+                print(f"[stand_eval:{self.env_id}] update error (silenced): {e}", flush=True)
 
     def _update(self):
         if self.pub is None:
@@ -173,7 +178,7 @@ class StandEval:
             }
             self._done = True
             self._final = payload
-            print(f"[stand_eval] FALL ({fall_reason}) at t={elapsed:.2f}s -> result=-100", flush=True)
+            print(f"[stand_eval:{self.env_id}] FALL ({fall_reason}) at t={elapsed:.2f}s -> result=-100", flush=True)
             self._maybe_pub(t, payload)
             return
 
@@ -210,7 +215,7 @@ class StandEval:
         if success:
             self._done = True
             self._final = payload
-            print(f"[stand_eval] SUCCESS: {self.window_s:.0f}s stand complete -> "
+            print(f"[stand_eval:{self.env_id}] SUCCESS: {self.window_s:.0f}s stand complete -> "
                   f"result={result:.1f}", flush=True)
         self._maybe_pub(t, payload)
 
@@ -220,6 +225,8 @@ class StandEval:
             return
         self._last_pub_t = t
         m = std_msgs_msg_dds__String_()
+        payload = dict(payload)
+        payload["robot_id"] = self.env_id
         m.data = json.dumps(payload, separators=(",", ":"))
         self.pub.Write(m)
 
@@ -227,9 +234,9 @@ class StandEval:
         """(pos[x,y,z], quat[w,x,y,z], root_finite, joint_finite) or Nones."""
         import torch
         data = self.robot.data
-        rs = data.root_state_w[0]
+        rs = data.root_state_w[self.env_id]
         finite_root = bool(torch.isfinite(rs).all())
-        finite_joint = bool(torch.isfinite(data.joint_pos[0]).all())
+        finite_joint = bool(torch.isfinite(data.joint_pos[self.env_id]).all())
         rs = rs.detach().float().cpu().tolist()
         pos = rs[0:3]
         quat = rs[3:7]
@@ -244,8 +251,8 @@ class StandEval:
             lim = getattr(data, "joint_pos_limits", None)
         if lim is None:
             return 0.0
-        q = data.joint_pos[0].detach().float().cpu().tolist()
-        lim = lim[0].detach().float().cpu().tolist()  # [J, 2]
+        q = data.joint_pos[self.env_id].detach().float().cpu().tolist()
+        lim = lim[self.env_id].detach().float().cpu().tolist()  # [J, 2]
         total = 0.0
         for qi, (lo, hi) in zip(q, lim):
             rng = hi - lo

@@ -33,6 +33,8 @@
 #ifndef DEX3_HANDS_HPP
 #define DEX3_HANDS_HPP
 
+#include "robot_parameters.hpp"
+
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -72,11 +74,11 @@ public:
         }
 
         // Left hand namespaces
-        const std::string leftPubNs = "rt/dex3/left";
-        const std::string leftSubNs = "rt/dex3/left/state";
+        const std::string leftPubNs = SonicDdsTopic("rt/dex3/left");
+        const std::string leftSubNs = SonicDdsTopic("rt/dex3/left/state");
         // Right hand namespaces
-        const std::string rightPubNs = "rt/dex3/right";
-        const std::string rightSubNs = "rt/dex3/right/state";
+        const std::string rightPubNs = SonicDdsTopic("rt/dex3/right");
+        const std::string rightSubNs = SonicDdsTopic("rt/dex3/right/state");
 
 
         // initialize left hand cmd with default value

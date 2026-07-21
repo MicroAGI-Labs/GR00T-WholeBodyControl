@@ -1,13 +1,11 @@
 # SIM Resilience Plan — continuous, self-recovering Spark ↔ RTX-sim operation
 
-**TL;DR** — Today the SONIC-controller-on-Spark ↔ Isaac-sim-on-RTX6000 loop is brittle:
-a WARP hiccup, a bounced sidecar, or a pod-side shm glitch silently stops `rt/lowstate`
-and the G1 falls, and nothing comes back without hands-on restarts. This plan makes the
-loop **fail-then-auto-recover**: when the link drops, the controller goes to damping; when
-it returns, the controller **re-arms and resumes on its own, with no operator input**. We
-get there with three self-healing layers — a supervised tunnel (`autossh`), an auto-recovery
-state in the deploy, and self-healing shm consumers — while keeping the deploy's real↔sim
-interface byte-identical.
+**TL;DR** — The resilience work is implemented. The SONIC-controller-on-Spark ↔
+Isaac-sim-on-RTX6000 loop now uses a supervised tunnel (`autossh`), deploy-side
+damping and automatic recovery, self-healing legacy shared-memory consumers, and
+supervised bridge processes. A temporary feed loss no longer requires a controller
+or bridge restart. The same transport now also carries two namespaced SONIC/G1 pairs;
+see [`CONCURRENT_SONIC_CONTROL_TO_REMOTE_RTX.md`](CONCURRENT_SONIC_CONTROL_TO_REMOTE_RTX.md).
 
 Related: [`RTX_SIM_GUIDE.md`](RTX_SIM_GUIDE.md) (bring-up), [`RTX_SIM_LATENCY.md`](RTX_SIM_LATENCY.md)
 (the RTF/latency ceiling), [`ELIXIR_SUPERVISOR_GOAL.md`](ELIXIR_SUPERVISOR_GOAL.md) (the
@@ -52,9 +50,9 @@ resumption clean (no snap/jump on re-engage), not to "make the sim safe."
 
 ---
 
-## 4. The system today (what breaks, and why it doesn't come back)
+## 4. Original failure model
 
-Transport chain, sim path:
+The transport chain before this plan was implemented:
 
 ```
 Isaac sim (domain 1, /dev/shm isaac_*)
@@ -251,6 +249,19 @@ The revalidation run with controller-side synchronized IDLE telemetry also compl
 60.02 sim-seconds (0.03 m final displacement, 0.707 m height, 1.3° tilt, result +71.56).
 Use `--idle-telemetry-logfile` (or `IDLE_TELEMETRY_LOGFILE` in the launch helpers) and
 `rtx_pod/analyze_idle_telemetry.py` for per-joint reference/measured/commanded comparisons.
+
+**Concurrent extension brought up 2026-07-21:** one two-environment Isaac process and
+two Spark SONIC processes now use namespaced LowState, LowCmd, secondary-IMU,
+reset/re-arm, and evaluator topics. The concurrent body path stores command/state
+records inside Isaac and therefore does not add DDS sidecars or per-robot shared
+memory. Both bridges use local route mode (`forward_discovery: false`); the RTX bridge
+is pinned to its default-route interface and the Spark bridge uses explicit localhost
+discovery because `lo` is not multicast-capable. The Spark bridge was restarted before
+controller initialization and both controllers recovered without being restarted.
+Both robots subsequently passed the 60.02-simulated-second concurrent IDLE run
+with zero displacement and no fall. Free-standing transport disruption remains
+open, so the older single-robot disruption results must not be treated as proof
+of concurrent free-standing recovery.
 
 Deferred (§3): control plane, Docker removal, bridge simplification. The D watchdog's
 auto-restart path should get flock/backoff refinement before being relied on.
