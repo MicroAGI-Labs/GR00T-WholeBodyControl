@@ -13,7 +13,8 @@ cd "$LS"
 
 # The policy-native crouch is the validated handoff pose for stationary IDLE.
 # A caller can still select the straighter visual pose with
-# SIM_WARMUP_POSE=vertical for A/B tests.
+# SIM_WARMUP_POSE=vertical, or the measured balance equilibrium with
+# SIM_WARMUP_POSE=observed, for A/B tests.
 export SIM_WARMUP_POSE="${SIM_WARMUP_POSE:-sonic}"
 
 # ---- Single-instance guard (SIM_RESILIENCE_PLAN.md Workstream G) -------------

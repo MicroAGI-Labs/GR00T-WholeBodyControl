@@ -165,14 +165,17 @@ def get_robot_boy_joint_states(
         vel_buf.copy_(torch.gather(joint_vel, 1, idx_batch))
         torque_buf.copy_(torch.gather(joint_torque, 1, idx_batch))
 
-    # sim_main's legacy rigid hold corrects root pose/velocity after the
-    # environment step.  The pre-correction velocities sampled here are motion
-    # that is discarded before the next externally visible pose, so publishing
-    # them produces the impossible state "fixed pose, non-zero velocity".  A
-    # controller with velocity history interprets that as a persistent balance
-    # error.  Preserve measured positions, but publish the inter-step velocity
-    # implied by a rigid hold: zero.
+    # sim_main's exact joint warmup corrects q/dq after the environment step.
+    # The Isaac data cache sampled above still describes the pre-correction
+    # physics state.  Publish the post-step pinned state that actually persists
+    # between steps; otherwise SONIC freezes a gravity-deflected IDLE reference
+    # even though the articulation itself is held at its default posture.
     if getattr(env, "_joint_warmup_active", False):
+        default_joint_pos = env.scene["robot"].data.default_joint_pos
+        try:
+            torch.gather(default_joint_pos, 1, idx_batch, out=pos_buf)
+        except TypeError:
+            pos_buf.copy_(torch.gather(default_joint_pos, 1, idx_batch))
         vel_buf.zero_()
 
     # 组合为一个缓冲，避免 cat 分配
@@ -330,9 +333,12 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
 
     rigid_hold_active = getattr(env, "_rigid_hold_active", False)
     if rigid_hold_active:
-        # See the joint-velocity explanation above.  The rigid pin discards the
-        # sampled root motion before the next visible pose, therefore zero is
-        # the consistent angular/linear velocity for the published held state.
+        # The rigid pin is applied after the physics sample represented by this
+        # cache.  Publish its post-step orientation (the environment default),
+        # plus zero velocity, because that is the state which persists until the
+        # next step and the state from which a release actually begins.
+        if not use_torso_imu:
+            quat = data.default_root_state[:, 3:7]
         lin_vel = torch.zeros_like(lin_vel)
         ang_vel_world = torch.zeros_like(ang_vel_world)
 

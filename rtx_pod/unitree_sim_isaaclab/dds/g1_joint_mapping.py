@@ -60,6 +60,20 @@ UNITREE_G1_29_DEFAULT_POSITIONS = (
 )
 
 
+# Mean measured posture during the telemetry-validated stationary-IDLE run
+# (d3b6205, steady window t=12..67 controller seconds).  This is an explicit
+# experiment pose, not a new policy default: it lets the simulator start at the
+# equilibrium SONIC reached with the -8 degree reference trim, then tests
+# whether that physical posture is self-sustaining with zero trim.
+UNITREE_G1_29_OBSERVED_IDLE_POSITIONS = (
+    -0.53222, 0.00882, -0.00650, 1.03026, -0.48201, -0.04204,
+    -0.60370, 0.02039, 0.02956, 1.01412, -0.39293, -0.01822,
+    0.02465, -0.00543, 0.02076,
+    0.25436, 0.18537, -0.08430, 0.86602, -0.19635, -0.12514, -0.00198,
+    0.20477, -0.22416, 0.19572, 0.93303, 0.34969, -0.10616, -0.06221,
+)
+
+
 # Per-joint effort contract used by the SONIC deploy. These values mirror
 # policy_parameters.hpp and must also be the Isaac actuator limits: the policy's
 # action scale is computed from them. In particular, current SONIC uses the

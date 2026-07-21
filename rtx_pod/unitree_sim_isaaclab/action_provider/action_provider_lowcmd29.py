@@ -147,17 +147,14 @@ class DDSLowCmd29ActionProvider(ActionProvider):
     def get_action(self, env) -> Optional[torch.Tensor]:
         print(f"[{self.name}] get_action called, robot_dds is not None: {self.robot_dds is not None}")
         try:
-            # WARMUP HOLD: while the sim's base-hold window is active (set by sim_main on
-            # reset as env._warmup_joint_until), ignore the external lowcmd and command the
-            # DEFAULT standing pose. Together with the base band this keeps the whole robot
-            # static-upright so the SONIC controller's 4-step obs history fills with clean
-            # standing data BEFORE it takes over. Without this the controller's fallen/OOD
-            # startup commands whip the legs and explode PhysX. cfg gains hold default.
-            if time.time() < getattr(self.env, "_warmup_joint_until", 0.0):
-                fa = self._warmup_full
-                if self._q_lo is not None:
-                    fa = torch.clamp(fa, self._q_lo, self._q_hi)
-                return fa.unsqueeze(0)
+            # During the exact joint warmup, continue ingesting LowCmd into the
+            # persistent buffers even though the applied action remains the held
+            # pose.  Returning before this read left a command from the preceding
+            # trial queued for the first released step, making identical re-arm
+            # tests non-deterministic.
+            warmup_active = (
+                time.time() < getattr(self.env, "_warmup_joint_until", 0.0)
+            )
 
             full_action = self._full_action_buf  # persists last command / default pose
             robot = self.env.scene["robot"]
@@ -233,6 +230,11 @@ class DDSLowCmd29ActionProvider(ActionProvider):
                                                     self._right_hand_buf.index_select(0, self._right_hand_source_idx_t))
             if self._q_lo is not None:
                 full_action = torch.clamp(full_action, self._q_lo, self._q_hi)
+            if warmup_active:
+                fa = self._warmup_full
+                if self._q_lo is not None:
+                    fa = torch.clamp(fa, self._q_lo, self._q_hi)
+                return fa.unsqueeze(0)
             # apply the position target from N control steps ago (action latency)
             if self._act_latency > 0:
                 self._act_buf.append(full_action.clone())

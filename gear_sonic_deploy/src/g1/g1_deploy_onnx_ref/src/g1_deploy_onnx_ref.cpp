@@ -234,6 +234,11 @@ class G1Deploy {
     // generated motions remain untouched.
     bool idle_hold_reference_enabled_ = false;
     double idle_hold_pitch_bias_rad_ = 0.0;
+    // Blend the 12 leg-joint IDLE references from the measured handoff pose
+    // toward SONIC's native standing angles.  Zero preserves the measured-pose
+    // hold; one requests the complete native leg pose.  This changes reference
+    // observations only--the learned policy remains the low-level controller.
+    double idle_hold_leg_blend_ = 0.0;
     std::atomic<bool> next_planner_motion_is_idle_{true};
     
     // Planner command state. Requested WALK -> IDLE changes pass through a
@@ -2328,10 +2333,13 @@ class G1Deploy {
           idle_hold_pitch_bias_rad_ = degrees * M_PI / 180.0;
         }
       }
+      { const char* e = std::getenv("SONIC_IDLE_LEG_BLEND");
+        if (e) idle_hold_leg_blend_ = std::clamp(std::atof(e), 0.0, 1.0); }
       std::cout << "[deploy] SONIC_IDLE_HOLD_REFERENCE="
                 << (idle_hold_reference_enabled_ ? "on" : "off")
                 << " (IDLE target = measured pose at transition, pitch bias="
-                << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg)" << std::endl;
+                << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg, leg blend="
+                << idle_hold_leg_blend_ << ")" << std::endl;
 
       // Initialize planner motion state as shared_ptr
       planner_motion_ = std::make_shared<MotionSequence>();
@@ -3406,8 +3414,17 @@ class G1Deploy {
         for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
              ++hardware_joint) {
           const int policy_joint = isaaclab_to_mujoco[hardware_joint];
-          planner_motion_->JointPositions(frame)[policy_joint] =
+          const double measured_q =
               low_state->motor_state()[hardware_joint].q();
+          // Hardware joints 0..11 are the two six-joint legs.  A partial blend
+          // is deliberately safer than substituting an arbitrary full-body
+          // pose: arms and waist retain the known-good measured reference.
+          const double reference_q = hardware_joint < 12
+              ? measured_q + idle_hold_leg_blend_ *
+                  (default_angles[hardware_joint] - measured_q)
+              : measured_q;
+          planner_motion_->JointPositions(frame)[policy_joint] =
+              reference_q;
           planner_motion_->JointVelocities(frame)[policy_joint] = 0.0;
         }
         planner_motion_->BodyQuaternions(frame)[0] = base_quat;
@@ -3419,7 +3436,8 @@ class G1Deploy {
 
       std::cout << "[idle-hold] froze " << planner_motion_->timesteps
                 << " reference frames at measured standing pose (pitch bias="
-                << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg)" << std::endl;
+                << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg, leg blend="
+                << idle_hold_leg_blend_ << ")" << std::endl;
       return true;
     }
 

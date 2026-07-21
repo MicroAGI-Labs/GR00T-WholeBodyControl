@@ -529,12 +529,11 @@ def main():
         # reset-all (rt/reset_pose/cmd cat 2) then RELEASES the hold so the controller balances.
         _HOLD_FOREVER = 1.0e18
         _base_hold_until = _HOLD_FOREVER if _base_hold_s > 0.0 else 0.0
-        # NOTE: we intentionally do NOT freeze the joints during the hold. Holding default
-        # joints made the controller's commands a no-op, so it never saw them take effect
-        # and emitted an inconsistent/OOD pose (asymmetric ankle +0.2/+0.4). Instead, pin
-        # only the BASE and let the controller actually DRIVE the legs while pinned, so it
-        # converges to its OWN self-consistent standing pose before release (no lurch).
-        # SIM_WARMUP_JOINTS=1 restores the old joint-freeze behavior if ever needed.
+        # By default only the BASE is pinned and the controller drives the legs while held.
+        # SIM_WARMUP_JOINTS=1 is the explicit static-pose experiment: joint positions and
+        # velocities are pinned to the environment default as well.  Merely sending that
+        # pose through the implicit PD actuator is not a freeze (gravity deflects it), and
+        # would make a measured-pose IDLE reference differ from the requested hold pose.
         if _base_hold_s > 0.0 and os.environ.get("SIM_WARMUP_JOINTS", "0") == "1":
             try:
                 env._warmup_joint_until = _HOLD_FOREVER
@@ -747,6 +746,19 @@ def main():
                 
                 # execute control step (in main thread, support rendering)
                 controller.step()
+
+                # Exact joint freeze for the static-pose experiment.  Apply this after the
+                # physics/control step, like the rigid base pin below, so the next LowState
+                # contains precisely the requested default posture with zero joint speed.
+                # On release the write stops and the already-running controller takes over.
+                if env._joint_warmup_active:
+                    try:
+                        _robot = env.scene["robot"]
+                        _q0 = _robot.data.default_joint_pos
+                        _dq0 = torch.zeros_like(_robot.data.default_joint_vel)
+                        _robot.write_joint_state_to_sim(_q0, _dq0)
+                    except Exception as _e:
+                        print(f"[sim] joint-warmup pin failed: {_e}", flush=True)
 
                 # virtual elastic band: apply a SOFT PD force+torque on the base while
                 # the hold window is active (mirrors MuJoCo's band). A soft, continuously

@@ -29,6 +29,7 @@ from tasks.common_event.event_manager import SimpleEvent, SimpleEventManager
 from dds.g1_joint_mapping import (
     UNITREE_G1_29_DEFAULT_POSITIONS,
     UNITREE_G1_29_JOINT_NAMES,
+    UNITREE_G1_29_OBSERVED_IDLE_POSITIONS,
     UNITREE_G1_EFFORT_LIMIT_BY_NAME,
 )
 
@@ -157,15 +158,34 @@ class FlatG1Dex3EnvCfg(ManagerBasedRLEnvCfg):
             "left_ankle_roll_joint"
         ]
 
-        # Keep both startup poses available for controlled A/B testing.  The
+        # Keep startup poses available for controlled A/B testing.  The
         # policy-native pose is the known 0.1x balance recipe; ``vertical`` is
-        # the later, straighter visual pose.  Default remains unchanged.
+        # the later, straighter visual pose; ``observed`` is the measured
+        # equilibrium from the telemetry-validated -8 degree run. Default
+        # remains unchanged.
         import os as _os_solver
         _warmup_pose = _os_solver.environ.get("SIM_WARMUP_POSE", "vertical")
         if _warmup_pose == "sonic":
             self.scene.robot.init_state.pos = (0.0, 0.0, 0.793)
             self.scene.robot.init_state.joint_pos = dict(
                 zip(UNITREE_G1_29_JOINT_NAMES, UNITREE_G1_29_DEFAULT_POSITIONS)
+            )
+        elif _warmup_pose == "observed":
+            # Mean free-balance root roll/pitch was +0.579/-1.114 degrees.
+            # Preserve that attitude and height while removing the reference
+            # pitch trim, so hold pose and frozen IDLE reference begin matched.
+            self.scene.robot.init_state.pos = (0.0, 0.0, 0.70701)
+            self.scene.robot.init_state.rot = (
+                0.9999399823,
+                0.0050524679,
+                -0.0097212067,
+                0.0000491190,
+            )
+            self.scene.robot.init_state.joint_pos = dict(
+                zip(
+                    UNITREE_G1_29_JOINT_NAMES,
+                    UNITREE_G1_29_OBSERVED_IDLE_POSITIONS,
+                )
             )
         elif _warmup_pose == "vertical":
             self.scene.robot.init_state.pos = (0.0, 0.0, 0.80)
@@ -185,7 +205,8 @@ class FlatG1Dex3EnvCfg(ManagerBasedRLEnvCfg):
             }
         else:
             raise ValueError(
-                f"SIM_WARMUP_POSE must be 'vertical' or 'sonic', got {_warmup_pose!r}"
+                "SIM_WARMUP_POSE must be 'vertical', 'sonic', or 'observed', "
+                f"got {_warmup_pose!r}"
             )
         print(f"[sim] warmup pose: {_warmup_pose}", flush=True)
         # 100 Hz physics, 50 Hz control (control period 0.02 s == deploy Control thread).

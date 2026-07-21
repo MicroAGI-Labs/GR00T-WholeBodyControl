@@ -14,6 +14,7 @@ from dds.g1_joint_mapping import (  # noqa: E402
     UNITREE_G1_29_EFFORT_LIMITS,
     UNITREE_G1_EFFORT_LIMIT_BY_NAME,
     UNITREE_G1_29_JOINT_NAMES,
+    UNITREE_G1_29_OBSERVED_IDLE_POSITIONS,
     isaac_to_unitree,
     unitree_indices_in,
     unitree_to_isaac,
@@ -47,6 +48,15 @@ class TestG1JointMapping(unittest.TestCase):
         pose = dict(zip(UNITREE_G1_29_JOINT_NAMES, UNITREE_G1_29_DEFAULT_POSITIONS))
         self.assertEqual(pose["left_knee_joint"], 0.669)
         self.assertEqual(pose["right_ankle_pitch_joint"], -0.363)
+
+    def test_observed_idle_pose_covers_every_hardware_joint(self) -> None:
+        self.assertEqual(len(UNITREE_G1_29_OBSERVED_IDLE_POSITIONS), 29)
+        pose = dict(
+            zip(UNITREE_G1_29_JOINT_NAMES, UNITREE_G1_29_OBSERVED_IDLE_POSITIONS)
+        )
+        self.assertAlmostEqual(pose["left_knee_joint"], 1.03026)
+        self.assertAlmostEqual(pose["right_knee_joint"], 1.01412)
+        self.assertAlmostEqual(pose["waist_pitch_joint"], 0.02076)
 
     def test_sonic_effort_contract_covers_every_hardware_joint(self) -> None:
         self.assertEqual(len(UNITREE_G1_29_EFFORT_LIMITS), 29)
