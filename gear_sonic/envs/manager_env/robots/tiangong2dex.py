@@ -7,12 +7,20 @@
                   (commit 5c221783fb92fcc4af891ef1dc0502963caf2266)
 - MJCF          : same repo, tiangong2dex_torq.xml (fixed sensor/tcp bodies
                   stripped so it is 32 bodies; see mjcf/tiangong2dex.xml header)
-- Actuator gains: Open-X-Humanoid/TienKung-Lab `dev`
+- Actuator gains: legs/feet/waist/shoulder/elbow_pitch stiffness+damping from
+                  Open-X-Humanoid/TienKung-Lab `dev`
                   (commit 164f615002b7ce7ae393a25f9397d27955c9dd6d),
                   legged_lab/assets/EVT2/tiangong.py DEX_V3_CFG (23-DOF
-                  locomotion config for this exact URDF) + its commented-out
-                  wrist/elbow_yaw gains. Effort/velocity limits are taken from
-                  the URDF (NOT DEX_V3_CFG, whose effort table diverges).
+                  locomotion config for this exact URDF). elbow_yaw + wrist
+                  gains are VENDOR-VERIFIED from Open-X-Humanoid/Deploy_Tienkung
+                  `3.0` mimic-policy deploy configs (beyondzero.yaml /
+                  BeyondMimic.yaml, identical arm kps/kds). Effort/velocity
+                  limits are taken from the URDF (NOT DEX_V3_CFG, whose effort
+                  table diverges).
+- Armature      : VENDOR-VERIFIED per-joint rotor inertia from
+                  Open-X-Humanoid/xSIM_MUJOCO resources/evt2/urdf/evt2.xml
+                  <default> motor classes (head has no vendor value — small
+                  guess kept). Joint friction 0.1 from evt2.xml frictionloss.
 
 Naming differs from Unitree: side is a SUFFIX (`hip_pitch_l_joint`), there is
 no `torso_link` (its equivalent is `waist_pitch_link`), the elbow is split into
@@ -236,29 +244,52 @@ TIANGONG2DEX_ISAACLAB_TO_MUJOCO_MAPPING = {
 }
 
 # ---------------------------------------------------------------------------
-# Armature (rotor inertia)
+# Armature (rotor inertia) — VENDOR VALUES
 # ---------------------------------------------------------------------------
-# DEX_V3_CFG defines NO armature; TienKung-Lab instead randomizes joint armature
-# over the abs range (0.002, 0.060) at reset (walk_cfg.py randomize_joint_params).
-# There is no vendor per-joint armature anywhere. We therefore seed a fixed
-# nominal per torque class, monotonically scaled by the URDF effort limit and
-# kept inside that (0.002, 0.060) range. GUESS — tune/verify on the cluster.
-ARM_400 = 0.060  # knee_pitch (400 Nm)
-ARM_235 = 0.045  # hip_pitch / hip_roll (235 Nm)
-ARM_150 = 0.030  # hip_yaw, waist_roll, waist_pitch (150 Nm)
-ARM_90 = 0.020  # waist_yaw (91 Nm), shoulder_pitch / shoulder_roll (90 Nm)
-ARM_50 = 0.012  # ankle_pitch / ankle_roll (55 Nm), shoulder_yaw / elbow_pitch (50 Nm)
-ARM_25 = 0.006  # elbow_yaw, wrist_pitch, wrist_roll (25 Nm)
-ARM_6 = 0.002  # head_yaw / head_pitch (6.3 Nm)
+# Source: Open-X-Humanoid/xSIM_MUJOCO resources/evt2/urdf/evt2.xml <default>
+#   joint classes:
+#   https://github.com/Open-X-Humanoid/xSIM_MUJOCO/blob/main/resources/evt2/urdf/evt2.xml
+# Each MJCF <default class="*_motor"> sets a per-class `armature`. Values below
+# are keyed by that motor class and applied to the joints the evt2 body tree
+# assigns to each class (verified firsthand from every joint's `class=` attr).
+#
+# evt2 arm-chain class map (verified from evt2.xml joint `class=`, BOTH arms):
+#   shoulder_pitch/roll/yaw + elbow_pitch + elbow_yaw -> arm_motor (0.1);
+#   ONLY wrist_pitch/wrist_roll -> wrist_motor (0.0236).
+#   >>> elbow_yaw is arm_motor, NOT wrist_motor. It shares the wrist's 25 Nm
+#   >>> effort cap but a larger rotor. (The prior audit/task expected 0.0236
+#   >>> here — evt2.xml says 0.1; firsthand verification wins.)
+#
+# NOTE: this CONTRADICTS TienKung-Lab, which defines no armature and instead
+# randomizes joint armature over abs (0.002, 0.060) at reset (walk_cfg.py). The
+# vendor MuJoCo model is authoritative for the physical rotor inertia, so it is
+# the nominal here; the TienKung-Lab band is a training-time DR choice.
+ARM_HIP_PITCH = 0.24  # evt2 hip_pitch_motor
+ARM_HIP_ROLL = 0.24  # evt2 hip_roll_motor
+ARM_HIP_YAW = 0.18  # evt2 hip_yaw_motor
+ARM_KNEE = 0.37  # evt2 knee_motor
+ARM_ANKLE = 0.032  # evt2 ankle_motor (ankle_pitch / ankle_roll)
+ARM_WAIST = 0.17  # evt2 waist_motor (waist_yaw / roll / pitch)
+ARM_ARM = 0.1  # evt2 arm_motor (shoulder_pitch/roll/yaw, elbow_pitch, elbow_yaw)
+ARM_WRIST = 0.0236  # evt2 wrist_motor (wrist_pitch / wrist_roll)
+# Head has NO vendor value anywhere (evt2 models no head joint). Keep a small
+# guess; TienKung-Lab's (0.002, 0.060) armature DR band is the only nearby
+# reference and head sits at its floor.
+ARM_HEAD = 0.002  # GUESS — no vendor value exists for head_yaw / head_pitch
 
 # ---------------------------------------------------------------------------
 # Articulation config
 # ---------------------------------------------------------------------------
-# Stiffness/damping: TienKung-Lab DEX_V3_CFG (starting point, NOT ground truth;
-#   its waist gains are placeholders and head/wrist/elbow_yaw are absent there).
+# Stiffness/damping: legs/feet/waist/shoulder/elbow_pitch from TienKung-Lab
+#   DEX_V3_CFG (starting point, NOT ground truth; its waist gains are
+#   placeholders). elbow_yaw + wrist_pitch + wrist_roll are now VENDOR-VERIFIED
+#   from Deploy_Tienkung 3.0 mimic-policy deploy configs (beyondzero.yaml /
+#   BeyondMimic.yaml, identical arm kps/kds):
+#   https://github.com/Open-X-Humanoid/Deploy_Tienkung/blob/3.0/policy/beyond_mimic/config/BeyondMimic.yaml
+# Armature: VENDOR-VERIFIED from xSIM_MUJOCO evt2.xml (see ARM_* block above).
+# Joint friction: 0.1 on every group, from evt2.xml frictionloss default.
 # Effort/velocity limits: parsed from the vendored URDF.
-# head gains (20/1) and elbow_yaw/wrist gains (from DEX_V3_CFG's commented block)
-#   are our best guesses and marked below.
+# head gains (20/1) and head armature (0.002) remain guesses (no vendor head).
 TIANGONG2DEX_CFG = ArticulationCfg(
     spawn=sim_utils.UrdfFileCfg(
         fix_base=False,
@@ -330,12 +361,13 @@ TIANGONG2DEX_CFG = ArticulationCfg(
                 ".*hip_pitch.*joint": 10.0,
                 ".*knee_pitch.*joint": 10.0,
             },
-            armature={
-                ".*hip_yaw.*joint": ARM_150,
-                ".*hip_roll.*joint": ARM_235,
-                ".*hip_pitch.*joint": ARM_235,
-                ".*knee_pitch.*joint": ARM_400,
+            armature={  # evt2.xml motor classes
+                ".*hip_yaw.*joint": ARM_HIP_YAW,
+                ".*hip_roll.*joint": ARM_HIP_ROLL,
+                ".*hip_pitch.*joint": ARM_HIP_PITCH,
+                ".*knee_pitch.*joint": ARM_KNEE,
             },
+            friction=0.1,  # evt2.xml frictionloss default
         ),
         "feet": ImplicitActuatorCfg(
             joint_names_expr=[".*ankle_pitch.*joint", ".*ankle_roll.*joint"],
@@ -355,10 +387,11 @@ TIANGONG2DEX_CFG = ArticulationCfg(
                 ".*ankle_pitch.*joint": 2.5,
                 ".*ankle_roll.*joint": 1.4,
             },
-            armature={
-                ".*ankle_pitch.*joint": ARM_50,
-                ".*ankle_roll.*joint": ARM_50,
+            armature={  # evt2.xml ankle_motor
+                ".*ankle_pitch.*joint": ARM_ANKLE,
+                ".*ankle_roll.*joint": ARM_ANKLE,
             },
+            friction=0.1,  # evt2.xml frictionloss default
         ),
         "waist": ImplicitActuatorCfg(
             joint_names_expr=["waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint"],
@@ -382,21 +415,23 @@ TIANGONG2DEX_CFG = ArticulationCfg(
                 "waist_roll_joint": 10.0,
                 "waist_pitch_joint": 10.0,
             },
-            armature={
-                "waist_yaw_joint": ARM_90,
-                "waist_roll_joint": ARM_150,
-                "waist_pitch_joint": ARM_150,
+            armature={  # evt2.xml waist_motor (uniform 0.17)
+                "waist_yaw_joint": ARM_WAIST,
+                "waist_roll_joint": ARM_WAIST,
+                "waist_pitch_joint": ARM_WAIST,
             },
+            friction=0.1,  # evt2.xml frictionloss default
         ),
         "head": ImplicitActuatorCfg(
-            # GUESS: DEX_V3_CFG has no head (head fixed there). Small gains,
-            # effort/velocity from URDF. Tune/verify.
+            # GUESS: DEX_V3_CFG has no head (head fixed there) and evt2.xml models
+            # no head joint. Small gains + armature, effort/velocity from URDF.
             joint_names_expr=["head_yaw_joint", "head_pitch_joint"],
             effort_limit_sim=6.3,  # URDF
             velocity_limit_sim=7.645,  # URDF
             stiffness=20.0,  # GUESS
             damping=1.0,  # GUESS
-            armature=ARM_6,
+            armature=ARM_HEAD,  # GUESS (no vendor head armature)
+            friction=0.1,  # evt2.xml frictionloss default (extrapolated to head)
         ),
         "arms": ImplicitActuatorCfg(
             joint_names_expr=[
@@ -426,33 +461,39 @@ TIANGONG2DEX_CFG = ArticulationCfg(
                 ".*wrist_pitch.*joint": 12.218,
                 ".*wrist_roll.*joint": 12.218,
             },
-            stiffness={  # DEX_V3_CFG (shoulder/elbow_pitch); elbow_yaw/wrist from its commented block (GUESS)
+            # stiffness/damping: shoulder + elbow_pitch from TienKung-Lab DEX_V3_CFG;
+            # elbow_yaw + wrist_pitch + wrist_roll VENDOR-VERIFIED from
+            # Deploy_Tienkung 3.0 mimic-policy deploy configs (beyondzero.yaml /
+            # BeyondMimic.yaml, identical arm kps/kds):
+            # https://github.com/Open-X-Humanoid/Deploy_Tienkung/blob/3.0/policy/beyond_mimic/config/BeyondMimic.yaml
+            stiffness={
                 ".*shoulder_pitch.*joint": 150.0,
                 ".*shoulder_roll.*joint": 50.0,
                 ".*shoulder_yaw.*joint": 50.0,
                 ".*elbow_pitch.*joint": 150.0,
-                ".*elbow_yaw.*joint": 50.0,
-                ".*wrist_pitch.*joint": 20.0,
-                ".*wrist_roll.*joint": 20.0,
+                ".*elbow_yaw.*joint": 150.0,  # Deploy_Tienkung 3.0 mimic (was 50.0 GUESS)
+                ".*wrist_pitch.*joint": 200.0,  # Deploy_Tienkung 3.0 mimic (was 20.0 GUESS)
+                ".*wrist_roll.*joint": 200.0,  # Deploy_Tienkung 3.0 mimic (was 20.0 GUESS)
             },
-            damping={  # DEX_V3_CFG (shoulder/elbow_pitch); elbow_yaw/wrist from its commented block (GUESS)
+            damping={
                 ".*shoulder_pitch.*joint": 5.0,
                 ".*shoulder_roll.*joint": 2.5,
                 ".*shoulder_yaw.*joint": 2.5,
                 ".*elbow_pitch.*joint": 5.0,
-                ".*elbow_yaw.*joint": 5.0,
-                ".*wrist_pitch.*joint": 2.0,
-                ".*wrist_roll.*joint": 2.0,
+                ".*elbow_yaw.*joint": 5.0,  # Deploy_Tienkung 3.0 mimic (matches prior value)
+                ".*wrist_pitch.*joint": 2.0,  # Deploy_Tienkung 3.0 mimic (matches prior value)
+                ".*wrist_roll.*joint": 2.0,  # Deploy_Tienkung 3.0 mimic (matches prior value)
             },
-            armature={
-                ".*shoulder_pitch.*joint": ARM_90,
-                ".*shoulder_roll.*joint": ARM_90,
-                ".*shoulder_yaw.*joint": ARM_50,
-                ".*elbow_pitch.*joint": ARM_50,
-                ".*elbow_yaw.*joint": ARM_25,
-                ".*wrist_pitch.*joint": ARM_25,
-                ".*wrist_roll.*joint": ARM_25,
+            armature={  # evt2.xml: arm_motor (0.1) for shoulders+elbow_pitch+elbow_yaw; wrist_motor (0.0236) for wrist_pitch/roll
+                ".*shoulder_pitch.*joint": ARM_ARM,
+                ".*shoulder_roll.*joint": ARM_ARM,
+                ".*shoulder_yaw.*joint": ARM_ARM,
+                ".*elbow_pitch.*joint": ARM_ARM,
+                ".*elbow_yaw.*joint": ARM_ARM,  # arm_motor 0.1, NOT wrist_motor (verified evt2.xml)
+                ".*wrist_pitch.*joint": ARM_WRIST,
+                ".*wrist_roll.*joint": ARM_WRIST,
             },
+            friction=0.1,  # evt2.xml frictionloss default
         ),
     },
 )
