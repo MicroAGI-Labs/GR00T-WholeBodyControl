@@ -730,6 +730,20 @@ def main():
                 # keep recent 100 loop times
                 if len(recent_loop_times) > 100:
                     recent_loop_times.pop(0)
+
+                # The rigid hold is applied after controller.step(), so the raw
+                # PhysX velocity at the observation point describes motion that
+                # is discarded by the post-step pose/velocity pin below.  Tell
+                # the DDS observation path when that sampled velocity is not an
+                # observable inter-step velocity.  Position and orientation stay
+                # measured; only velocity channels are made consistent with the
+                # rigidly held pose seen by the external controller.
+                env._rigid_hold_active = bool(
+                    _base_hold_until > current_time and not _bh_soft
+                )
+                env._joint_warmup_active = bool(
+                    time.time() < getattr(env, "_warmup_joint_until", 0.0)
+                )
                 
                 # execute control step (in main thread, support rendering)
                 controller.step()

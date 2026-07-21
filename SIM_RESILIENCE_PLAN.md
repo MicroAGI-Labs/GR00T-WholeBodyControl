@@ -238,13 +238,19 @@ Forced-disruption tests all auto-recovered with **zero operator input**: tunnel 
 (autossh healed → deploy damped → resumed), camera-pub bounce (shm re-attached, `cams=[…]`
 not `NONE`), and full sim restart (deploy damped → auto-resumed).
 
-**Balancing achieved:** SONIC balances the G1 unaided in Isaac for **60 s** at RTF 0.10
-(final tilt ≈2.5°, no fall). Working recipe: RIGID hold + `SIM_WARMUP_JOINTS=1` + init z
-0.793 (clean default stance), **fresh** deploy, `sim_slowmo=10` with matched
-`CONTROL_WALL_SCALE=0.1`, then cat-4 re-arm and cat-3 release. The whole-body flat task
-must accept cat-3/cat-4 even with `--enable_wholebody_dds`; do not gate those handlers to
-the non-whole-body path. See memory `sim-resilience-implementation` and
+**Stationary balance achieved:** SONIC balances the G1 unaided in Isaac for **60.02 s**
+at RTF 0.10 (final displacement 0.10 m, tilt 0.7°, no fall). Working recipe: RIGID hold
++ `SIM_WARMUP_JOINTS=1` + `SIM_WARMUP_POSE=sonic` at init z 0.793, **fresh** deploy,
+`sim_slowmo=10` with matched `CONTROL_WALL_SCALE=0.1`, and the sim-only stationary-IDLE
+settings `SONIC_IDLE_HOLD_REFERENCE=1` + `SONIC_IDLE_PITCH_BIAS_DEG=-8`; then cat-4
+re-arm and cat-3 release. The whole-body flat task must accept cat-3/cat-4 even with
+`--enable_wholebody_dds`; do not gate those handlers to the non-whole-body path. See
 `RTX_SIM_LATENCY.md`.
+
+The revalidation run with controller-side synchronized IDLE telemetry also completed
+60.02 sim-seconds (0.03 m final displacement, 0.707 m height, 1.3° tilt, result +71.56).
+Use `--idle-telemetry-logfile` (or `IDLE_TELEMETRY_LOGFILE` in the launch helpers) and
+`rtx_pod/analyze_idle_telemetry.py` for per-joint reference/measured/commanded comparisons.
 
 Deferred (§3): control plane, Docker removal, bridge simplification. The D watchdog's
 auto-restart path should get flock/backoff refinement before being relied on.

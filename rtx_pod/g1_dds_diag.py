@@ -28,6 +28,7 @@ Examples
   ./g1_dds_diag.py warm --domain 1       # keep pod-side route warm
 """
 import argparse
+import json
 import math
 import os
 import sys
@@ -69,14 +70,20 @@ def gyro_norm(gyro):
     return math.sqrt(sum(v * v for v in gyro))
 
 
-def _init(domain):
-    ChannelFactoryInitialize(domain, "lo")
+def _init(domain, interface=None):
+    # Let CycloneDDS select its configured/default interface unless the caller
+    # explicitly asks for one.  Hard-coding loopback made ``--domain 1`` unable
+    # to observe the pod simulator, whose DDS participant is on eth0.
+    if interface:
+        ChannelFactoryInitialize(domain, interface)
+    else:
+        ChannelFactoryInitialize(domain)
 
 
 # --------------------------------------------------------------------------- watch
 def cmd_watch(args):
     """Live one-line tilt / knee / |gyro| — quick free-standing sanity check."""
-    _init(args.domain)
+    _init(args.domain, args.interface)
     st = {"quat": None, "gyro": None, "knee": None}
 
     def cb(m):
@@ -99,7 +106,7 @@ def cmd_watch(args):
 def cmd_eval(args):
     """Print the in-sim balance eval stream (rt/eval): termination + result score."""
     import json
-    _init(args.domain)
+    _init(args.domain, args.interface)
     st = {"last": None}
     ChannelSubscriber("rt/eval", String_).Init(lambda m: st.__setitem__("last", m.data), 10)
     print(f"[eval] domain={args.domain}  waiting for rt/eval...", flush=True)
@@ -126,10 +133,10 @@ def cmd_eval(args):
 
 # ------------------------------------------------------------------------- capture
 def cmd_capture(args):
-    """Record measured (q/dq/tau) + commanded (q/kp/kd) 29-joint state + IMU to CSV."""
-    _init(args.domain)
+    """Record measured/commanded joints, IMU, and latest absolute sim root pose."""
+    _init(args.domain, args.interface)
     st = {"mq": None, "mdq": None, "mtau": None, "cq": None, "ckp": None, "ckd": None,
-          "quat": None, "gyro": None, "acc": None}
+          "quat": None, "gyro": None, "acc": None, "eval": {}}
 
     def scb(m):
         st["mq"] = [m.motor_state[i].q for i in range(N)]
@@ -144,15 +151,24 @@ def cmd_capture(args):
         st["ckp"] = [m.motor_cmd[i].kp for i in range(N)]
         st["ckd"] = [m.motor_cmd[i].kd for i in range(N)]
 
+    def ecb(m):
+        try:
+            st["eval"] = json.loads(m.data)
+        except (TypeError, ValueError):
+            pass
+
     ChannelSubscriber("rt/lowstate", LowState_).Init(scb, 10)
     ChannelSubscriber("rt/lowcmd", LowCmd_).Init(ccb, 10)
+    ChannelSubscriber("rt/eval", String_).Init(ecb, 10)
 
     out = args.out or f"/tmp/cap_{args.label}.csv"
     cols = (["t", "tilt", "wnorm"]
             + [f"mq{i}" for i in range(N)] + [f"mdq{i}" for i in range(N)]
             + [f"mtau{i}" for i in range(N)] + [f"cq{i}" for i in range(N)]
             + [f"ckp{i}" for i in range(N)] + [f"ckd{i}" for i in range(N)]
-            + ["accx", "accy", "accz"])
+            + ["accx", "accy", "accz", "eval_t", "root_x", "root_y", "root_z",
+               "root_qw", "root_qx", "root_qy", "root_qz", "eval_dist",
+               "eval_tilt", "eval_result", "eval_termination"])
     print(f"[capture] domain={args.domain} label={args.label} dur={args.dur}s -> {out}", flush=True)
     time.sleep(1.0)  # let both topics arrive
     n = 0
@@ -161,12 +177,19 @@ def cmd_capture(args):
         t0 = time.time()
         while time.time() - t0 < args.dur:
             if st["mq"] and st["cq"]:
+                ev = st["eval"]
+                pos = ev.get("position") or [float("nan")] * 3
+                quat = ev.get("quaternion") or [float("nan")] * 4
                 row = ([f"{time.time()-t0:.3f}", f"{tilt_deg(st['quat']):.3f}",
                         f"{gyro_norm(st['gyro']):.4f}"]
                        + [f"{v:.4f}" for v in st["mq"]] + [f"{v:.4f}" for v in st["mdq"]]
                        + [f"{v:.4f}" for v in st["mtau"]] + [f"{v:.4f}" for v in st["cq"]]
                        + [f"{v:.2f}" for v in st["ckp"]] + [f"{v:.2f}" for v in st["ckd"]]
-                       + [f"{v:.4f}" for v in st["acc"]])
+                       + [f"{v:.4f}" for v in st["acc"]]
+                       + [f"{ev.get('t', float('nan')):.4f}"]
+                       + [f"{v:.6f}" for v in pos] + [f"{v:.7f}" for v in quat]
+                       + [f"{ev.get(k, float('nan')):.4f}" for k in
+                          ("dist", "tilt", "result", "termination")])
                 f.write(",".join(row) + "\n")
                 n += 1
             time.sleep(args.period)
@@ -176,7 +199,7 @@ def cmd_capture(args):
 # --------------------------------------------------------------------------- probe
 def cmd_probe(args):
     """Report rt/lowstate inter-arrival gaps — steady ~20ms vs burst-then-stall."""
-    _init(args.domain)
+    _init(args.domain, args.interface)
     state = {"n": 0, "last": None, "gaps": [], "first": None}
 
     def cb(m):
@@ -207,7 +230,7 @@ def cmd_probe(args):
 # ---------------------------------------------------------------------------- warm
 def cmd_warm(args):
     """Persistent subscriber that keeps the zenoh<->DDS route warm; prints a heartbeat."""
-    _init(args.domain)
+    _init(args.domain, args.interface)
     n = [0]
     ChannelSubscriber("rt/lowstate", LowState_).Init(lambda m: n.__setitem__(0, n[0] + 1), 10)
     print(f"[warm] domain={args.domain} holding rt/lowstate route warm", flush=True)
@@ -223,6 +246,8 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--domain", type=int, default=0,
                    help="DDS domain (0=Spark/deploy side, 1=pod sim). Default 0.")
+    p.add_argument("--interface", default=None,
+                   help="DDS network interface (default: CycloneDDS auto-selection).")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     w = sub.add_parser("watch", help="live tilt/knee/|gyro| stand check")

@@ -309,14 +309,16 @@ Use `start_flat.sh` for the free-base, flat-world task. It intentionally uses GP
 pick/place task, not this balance recipe.
 
 ```bash
-# RTX pod: start from a clean flat stack and hold the upright stance while SONIC warms up.
+# RTX pod: start from a clean flat stack and hold SONIC's policy-native stance.
 echo 10 > /tmp/sim_slowmo
 SIM_SLOWMO=10 SIM_BASE_HOLD_S=9999 SIM_BASE_SOFT=0 SIM_WARMUP_JOINTS=1 \
+  SIM_WARMUP_POSE=sonic \
   bash ~/live-sim/start_flat.sh
 
-# Spark: launch a fresh sim deploy with matching wall-time scaling.
+# Spark: launch a fresh sim deploy with matching timing and stationary-IDLE trim.
 ZENOH_JETSON_ENDPOINT=tcp/127.0.0.1:7447 UHLC_MAX_DELTA_MS=2000 \
-  CONTROL_WALL_SCALE=0.1 DEPLOY_YES=1 \
+  CONTROL_WALL_SCALE=0.1 SONIC_IDLE_HOLD_REFERENCE=1 \
+  SONIC_IDLE_PITCH_BIAS_DEG=-8 DEPLOY_YES=1 \
   ./deploy.sh --input-type zmq_manager --output-type all g1zenoh
 ```
 
@@ -324,6 +326,27 @@ Start the controller, send cat-4 to teleport/re-arm the upright hold, allow the 
 initialize, then send cat-3 to release. In `sim_main.py`, cat-3 and cat-4 **must not** be
 gated by `not args_cli.enable_wholebody_dds`; otherwise this workflow is silently ignored by
 the flat task.
+
+The stationary-IDLE reference is captured once when the IDLE clip is accepted: all 29
+measured joint positions are repeated with zero target velocity, and the measured pelvis
+orientation receives a -8 degree pitch trim. The trim cancels the forward-biased recovery
+cycle without changing the policy or its measured-state inputs. It is sim-opt-in; real-robot
+launches retain the original planner reference unless these variables are explicitly set.
+
+To record what the policy is actually tracking, set `IDLE_TELEMETRY_LOGFILE` on the
+deploy. Each 50 Hz control row contains the reference pose, the exact `LowState` snapshot
+used for inference, and the resulting motor command in canonical Unitree hardware order:
+
+```bash
+IDLE_TELEMETRY_LOGFILE=/tmp/sonic_idle.csv \
+  CONTROL_WALL_SCALE=0.1 ./run_deploy_direct.sh
+python3 rtx_pod/analyze_idle_telemetry.py /tmp/sonic_idle.csv --discard 12
+```
+
+`run_deploy_direct.sh` and `run_deploy_clean.sh` select the interface on the active IPv4
+default route; set `DDS_INTERFACE=<name>` to override it. On the pod,
+`g1_dds_diag.py capture` also records the latest absolute root position/quaternion from
+`rt/eval`, alongside measured and commanded joints.
 
 ### 4a-bis. Watch it: WebRTC 3rd-person viewport (from a WARP laptop, NO tunnel)
 

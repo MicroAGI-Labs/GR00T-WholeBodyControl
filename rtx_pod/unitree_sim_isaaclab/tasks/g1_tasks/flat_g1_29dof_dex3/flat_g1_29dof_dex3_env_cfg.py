@@ -27,6 +27,8 @@ from tasks.g1_tasks.move_cylinder_g1_29dof_dex3_wholebody import mdp
 from tasks.common_config import G1RobotPresets, CameraPresets  # isort: skip
 from tasks.common_event.event_manager import SimpleEvent, SimpleEventManager
 from dds.g1_joint_mapping import (
+    UNITREE_G1_29_DEFAULT_POSITIONS,
+    UNITREE_G1_29_JOINT_NAMES,
     UNITREE_G1_EFFORT_LIMIT_BY_NAME,
 )
 
@@ -155,26 +157,37 @@ class FlatG1Dex3EnvCfg(ManagerBasedRLEnvCfg):
             "left_ankle_roll_joint"
         ]
 
-        # Reset and rigid-hold warmup share the measured free-standing
-        # equilibrium from the verified 60 s balance run.  Do not substitute
-        # SONIC's default-angle offsets here: those are an action-coordinate
-        # convention, and pinning the pelvis at z=0.793 with that crouched pose
-        # forces the knees from 0.669 to about 0.95 rad before release.
-        self.scene.robot.init_state.pos = (0.0, 0.0, 0.80)
-        self.scene.robot.init_state.joint_pos = {
-            "left_hip_pitch_joint": -0.05,
-            "left_knee_joint": 0.47,
-            "left_ankle_pitch_joint": 0.0,
-            "right_hip_pitch_joint": -0.05,
-            "right_knee_joint": 0.47,
-            "right_ankle_pitch_joint": 0.0,
-            "left_shoulder_roll_joint": 0.3,
-            "left_shoulder_yaw_joint": -0.65,
-            "left_elbow_joint": 0.76,
-            "right_shoulder_roll_joint": -0.3,
-            "right_shoulder_yaw_joint": 0.65,
-            "right_elbow_joint": 0.76,
-        }
+        # Keep both startup poses available for controlled A/B testing.  The
+        # policy-native pose is the known 0.1x balance recipe; ``vertical`` is
+        # the later, straighter visual pose.  Default remains unchanged.
+        import os as _os_solver
+        _warmup_pose = _os_solver.environ.get("SIM_WARMUP_POSE", "vertical")
+        if _warmup_pose == "sonic":
+            self.scene.robot.init_state.pos = (0.0, 0.0, 0.793)
+            self.scene.robot.init_state.joint_pos = dict(
+                zip(UNITREE_G1_29_JOINT_NAMES, UNITREE_G1_29_DEFAULT_POSITIONS)
+            )
+        elif _warmup_pose == "vertical":
+            self.scene.robot.init_state.pos = (0.0, 0.0, 0.80)
+            self.scene.robot.init_state.joint_pos = {
+                "left_hip_pitch_joint": -0.05,
+                "left_knee_joint": 0.47,
+                "left_ankle_pitch_joint": 0.0,
+                "right_hip_pitch_joint": -0.05,
+                "right_knee_joint": 0.47,
+                "right_ankle_pitch_joint": 0.0,
+                "left_shoulder_roll_joint": 0.3,
+                "left_shoulder_yaw_joint": -0.65,
+                "left_elbow_joint": 0.76,
+                "right_shoulder_roll_joint": -0.3,
+                "right_shoulder_yaw_joint": 0.65,
+                "right_elbow_joint": 0.76,
+            }
+        else:
+            raise ValueError(
+                f"SIM_WARMUP_POSE must be 'vertical' or 'sonic', got {_warmup_pose!r}"
+            )
+        print(f"[sim] warmup pose: {_warmup_pose}", flush=True)
         # 100 Hz physics, 50 Hz control (control period 0.02 s == deploy Control thread).
         # NOTE: single-env CPU PhysX at 200 Hz (decim=4) only reaches RTF~0.69 -> the
         # deploy's wall-clock 50 Hz loop over-samples a slow-motion sim and the balance
@@ -190,7 +203,6 @@ class FlatG1Dex3EnvCfg(ManagerBasedRLEnvCfg):
         # only marginally in Isaac (holds ~1s then diverges); doubling the physics rate to
         # match training can restore the stability margin. SIM_DT / SIM_DECIM override
         # (keep dt*decim = 0.02 s so control stays 50 Hz == the deploy loop).
-        import os as _os_solver
         self.decimation = int(_os_solver.environ.get("SIM_DECIM", "2"))
         self.episode_length_s = 1.0e9  # effectively never time out
         self.sim.dt = float(_os_solver.environ.get("SIM_DT", "0.01"))

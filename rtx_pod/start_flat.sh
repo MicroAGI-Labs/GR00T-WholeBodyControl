@@ -11,6 +11,11 @@ set -uo pipefail
 LS="$HOME/live-sim"
 cd "$LS"
 
+# The policy-native crouch is the validated handoff pose for stationary IDLE.
+# A caller can still select the straighter visual pose with
+# SIM_WARMUP_POSE=vertical for A/B tests.
+export SIM_WARMUP_POSE="${SIM_WARMUP_POSE:-sonic}"
+
 # ---- Single-instance guard (SIM_RESILIENCE_PLAN.md Workstream G) -------------
 # Two overlapping bring-ups used to race past the pkill guards into DUPLICATE
 # rt/lowstate / rt/secondary_imu publishers, which silently corrupt the DDS state

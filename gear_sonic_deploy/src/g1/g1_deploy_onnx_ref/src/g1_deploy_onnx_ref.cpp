@@ -67,6 +67,7 @@
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <atomic>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -225,6 +226,15 @@ class G1Deploy {
     std::string planner_path;
     std::unique_ptr<LocalMotionPlannerBase> planner_;
     std::shared_ptr<MotionSequence> planner_motion_;
+    // The locomotion planner's learned IDLE clip is not necessarily the pose
+    // the robot is actually standing in.  In sim that mismatch can put the
+    // low-level policy into a perpetual balance-recovery step.  For the
+    // opt-in stationary-IDLE mode, replace only the IDLE reference with the
+    // measured pose at the point the new clip is accepted.  WALK and all other
+    // generated motions remain untouched.
+    bool idle_hold_reference_enabled_ = false;
+    double idle_hold_pitch_bias_rad_ = 0.0;
+    std::atomic<bool> next_planner_motion_is_idle_{true};
     
     // Planner command state. Requested WALK -> IDLE changes pass through a
     // model-native deceleration before the final IDLE request.
@@ -317,6 +327,8 @@ class G1Deploy {
     std::unique_ptr<std::ofstream> target_motion_file_;
     std::unique_ptr<std::ofstream> planner_motion_file_;
     std::unique_ptr<std::ofstream> policy_input_file_;
+    std::unique_ptr<std::ofstream> idle_telemetry_file_;
+    uint64_t idle_telemetry_rows_ = 0;
     std::unique_ptr<std::ofstream> record_input_file_;
     std::unique_ptr<std::ifstream> playback_input_file_;
 
@@ -2155,6 +2167,7 @@ class G1Deploy {
       std::string target_motion_file_path = "",
       std::string planner_motion_file_path = "",
       std::string policy_input_file_path = "",
+      std::string idle_telemetry_file_path = "",
       std::string input_type = "keyboard",
       std::string output_type = "zmq",
       std::string record_input_file_path = "",
@@ -2238,6 +2251,55 @@ class G1Deploy {
         policy_input_file_ = std::make_unique<std::ofstream>(policy_input_file_path, std::ios::app);
       }
 
+      if (!idle_telemetry_file_path.empty()) {
+        idle_telemetry_file_ =
+            std::make_unique<std::ofstream>(idle_telemetry_file_path,
+                                            std::ios::out | std::ios::trunc);
+        if (!*idle_telemetry_file_) {
+          throw std::runtime_error("cannot open idle telemetry file: " +
+                                   idle_telemetry_file_path);
+        }
+        (*idle_telemetry_file_)
+            << "seq,controller_time_s,frame,movement_mode,"
+               "ref_px,ref_py,ref_pz,ref_qw,ref_qx,ref_qy,ref_qz,"
+               "meas_qw,meas_qx,meas_qy,meas_qz,"
+               "meas_wx,meas_wy,meas_wz";
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",ref_q" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",ref_dq" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",meas_q" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",meas_dq" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",meas_tau" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",cmd_q" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",cmd_dq" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",cmd_tau" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",cmd_kp" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",cmd_kd" << i;
+        }
+        (*idle_telemetry_file_) << '\n';
+        idle_telemetry_file_->flush();
+        std::cout << "[idle-telemetry] recording synchronized reference/state/command to "
+                  << idle_telemetry_file_path << std::endl;
+      }
+
       if(!record_input_file_path.empty())
       {
         // clear existing file:
@@ -2257,6 +2319,19 @@ class G1Deploy {
       }
 
       movement_state_buffer_.SetData(MovementState());
+
+      { const char* e = std::getenv("SONIC_IDLE_HOLD_REFERENCE");
+        if (e) idle_hold_reference_enabled_ = (std::string(e) != "0"); }
+      { const char* e = std::getenv("SONIC_IDLE_PITCH_BIAS_DEG");
+        if (e) {
+          const double degrees = std::clamp(std::atof(e), -20.0, 20.0);
+          idle_hold_pitch_bias_rad_ = degrees * M_PI / 180.0;
+        }
+      }
+      std::cout << "[deploy] SONIC_IDLE_HOLD_REFERENCE="
+                << (idle_hold_reference_enabled_ ? "on" : "off")
+                << " (IDLE target = measured pose at transition, pitch bias="
+                << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg)" << std::endl;
 
       // Initialize planner motion state as shared_ptr
       planner_motion_ = std::make_shared<MotionSequence>();
@@ -3294,6 +3369,144 @@ class G1Deploy {
     }
 
     /**
+     * Replace a newly accepted planner IDLE clip with a stationary reference
+     * matching the latest measured pose.  Must be called while the planner and
+     * current-motion mutexes are held, before planner_motion_ is published.
+     */
+    bool FreezeIdleReferenceAtMeasuredPose() {
+      if (!idle_hold_reference_enabled_ || planner_motion_->timesteps <= 0 ||
+          planner_motion_->GetNumJoints() < G1_NUM_MOTOR ||
+          planner_motion_->GetNumBodyQuaternions() < 1) {
+        return false;
+      }
+
+      const auto low_state = low_state_buffer_.GetDataWithTime().data;
+      if (!low_state || low_state->motor_state().size() < G1_NUM_MOTOR) {
+        std::cerr << "[idle-hold] cannot freeze reference: no complete LowState"
+                  << std::endl;
+        return false;
+      }
+
+      auto base_quat = float_to_double<4>(low_state->imu_state().quaternion());
+      if (idle_hold_pitch_bias_rad_ != 0.0) {
+        // Apply the trim in the robot's heading-local pitch axis: q_target =
+        // q_measured * q_pitch.  This changes only the reference seen by the
+        // policy; measured gravity and angular velocity remain untouched.
+        const double c = std::cos(0.5 * idle_hold_pitch_bias_rad_);
+        const double s = std::sin(0.5 * idle_hold_pitch_bias_rad_);
+        const auto q = base_quat;
+        base_quat = {
+            q[0] * c - q[2] * s,
+            q[1] * c - q[3] * s,
+            q[0] * s + q[2] * c,
+            q[1] * s + q[3] * c,
+        };
+      }
+      for (int frame = 0; frame < planner_motion_->timesteps; ++frame) {
+        for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+             ++hardware_joint) {
+          const int policy_joint = isaaclab_to_mujoco[hardware_joint];
+          planner_motion_->JointPositions(frame)[policy_joint] =
+              low_state->motor_state()[hardware_joint].q();
+          planner_motion_->JointVelocities(frame)[policy_joint] = 0.0;
+        }
+        planner_motion_->BodyQuaternions(frame)[0] = base_quat;
+        if (planner_motion_->GetNumBodies() > 0) {
+          planner_motion_->BodyLinVelocities(frame)[0] = {0.0, 0.0, 0.0};
+          planner_motion_->BodyAngVelocities(frame)[0] = {0.0, 0.0, 0.0};
+        }
+      }
+
+      std::cout << "[idle-hold] froze " << planner_motion_->timesteps
+                << " reference frames at measured standing pose (pitch bias="
+                << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg)" << std::endl;
+      return true;
+    }
+
+    /**
+     * Record one control-tick snapshot in hardware joint order.  The measured
+     * state is exactly the LowState snapshot used to build this tick's policy
+     * observation; the command is the policy result produced from it.  Keeping
+     * the reference, measurement, and command in one row avoids timestamp and
+     * joint-order ambiguity when diagnosing stationary balance.
+     */
+    void WriteIdleTelemetryRow(
+        const std::shared_ptr<const MotionSequence>& motion, int frame) {
+      if (!idle_telemetry_file_ || !motion || motion->timesteps <= 0 ||
+          motion->GetNumJoints() < G1_NUM_MOTOR ||
+          motion->GetNumBodyQuaternions() < 1 || motion->GetNumBodies() < 1) {
+        return;
+      }
+
+      const auto low_state = used_low_state_data_.data;
+      const auto command = motor_command_buffer_.GetDataWithTime().data;
+      if (!low_state || low_state->motor_state().size() < G1_NUM_MOTOR ||
+          !command) {
+        return;
+      }
+
+      frame = std::clamp(frame, 0, motion->timesteps - 1);
+      const auto movement = movement_state_buffer_.GetDataWithTime().data;
+      const int movement_mode = movement ? movement->locomotion_mode : -1;
+      const auto ref_pos = motion->BodyPositions(frame)[0];
+      const auto ref_quat = motion->BodyQuaternions(frame)[0];
+      const auto& measured_imu = low_state->imu_state();
+      const auto& measured_quat = measured_imu.quaternion();
+      const auto& measured_gyro = measured_imu.gyroscope();
+
+      auto& out = *idle_telemetry_file_;
+      out << std::fixed << std::setprecision(9)
+          << idle_telemetry_rows_ << ','
+          << idle_telemetry_rows_ * control_dt_ << ',' << frame << ','
+          << movement_mode << ',' << ref_pos[0] << ',' << ref_pos[1] << ','
+          << ref_pos[2] << ',' << ref_quat[0] << ',' << ref_quat[1] << ','
+          << ref_quat[2] << ',' << ref_quat[3] << ',' << measured_quat[0]
+          << ',' << measured_quat[1] << ',' << measured_quat[2] << ','
+          << measured_quat[3] << ',' << measured_gyro[0] << ','
+          << measured_gyro[1] << ',' << measured_gyro[2];
+
+      for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+           ++hardware_joint) {
+        const int policy_joint = isaaclab_to_mujoco[hardware_joint];
+        out << ',' << motion->JointPositions(frame)[policy_joint];
+      }
+      for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+           ++hardware_joint) {
+        const int policy_joint = isaaclab_to_mujoco[hardware_joint];
+        out << ',' << motion->JointVelocities(frame)[policy_joint];
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << low_state->motor_state()[i].q();
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << low_state->motor_state()[i].dq();
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << low_state->motor_state()[i].tau_est();
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << command->q_target[i];
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << command->dq_target[i];
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << command->tau_ff[i];
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << command->kp[i];
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << command->kd[i];
+      }
+      out << '\n';
+      ++idle_telemetry_rows_;
+      if (idle_telemetry_rows_ % 10 == 0) {
+        out.flush();
+      }
+    }
+
+    /**
      * @brief Advance the playback cursor and blend planner output.
      *
      * Called at the end of each control tick.  Two cases:
@@ -3424,6 +3637,9 @@ class G1Deploy {
 
           if(success)
           {
+            if (next_planner_motion_is_idle_.load(std::memory_order_acquire)) {
+              FreezeIdleReferenceAtMeasuredPose();
+            }
             if(planner_motion_file_)
             {
               // log the motion that we just copied/blended over:
@@ -3675,6 +3891,7 @@ class G1Deploy {
               for (int i = 0; i < G1_NUM_MOTOR; i++) {
                 joint_positions[i] = ls->motor_state()[i].q();
               }
+              next_planner_motion_is_idle_.store(true, std::memory_order_release);
               // Initialize planner with robot state
               if(!planner_->Initialize(base_quat, joint_positions)) {
                 throw std::runtime_error("Error when initializing planner");
@@ -3844,6 +4061,9 @@ class G1Deploy {
               // Update planning with current movement parameters
 
               // gotta make sure planner_motion actually has data...
+              next_planner_motion_is_idle_.store(
+                  current_mode == static_cast<int>(LocomotionMode::IDLE),
+                  std::memory_order_release);
               if(!planner_->UpdatePlanning(
                 current_frame_,
                 planner_motion_,
@@ -4106,6 +4326,7 @@ class G1Deploy {
             operator_state.stop = true;
             return;
           }
+          WriteIdleTelemetryRow(current_motion_copy, current_frame_copy);
           auto motor_command_end_time = std::chrono::steady_clock::now();
 
           // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
@@ -4274,6 +4495,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --target-motion-logfile <path>: write target motion to a csv file if provided" << std::endl;
     std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
+    std::cout << "  --idle-telemetry-logfile <path>: write synchronized reference, measured state, and motor command CSV" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
@@ -4320,6 +4542,7 @@ int main(int argc, char const* argv[]) {
   std::string targetMotionLogfile = "";
   std::string plannerMotionLogfile = "";
   std::string policyInputLogfile = "";
+  std::string idleTelemetryLogfile = "";
   std::string recordInputFile = "";
   std::string playbackInputFile = "";
   std::string inputType = "keyboard"; // Default to keyboard
@@ -4386,6 +4609,17 @@ int main(int argc, char const* argv[]) {
         policyInputLogfile = argv[i + 1];
         std::cout << "[INFO] Using policy input logfile: " << policyInputLogfile << std::endl;
         i++; // Skip the next argument since it's the policy input logfile
+      }
+    } else if (std::string(argv[i]) == "--idle-telemetry-logfile") {
+      if (i + 1 < argc) {
+        idleTelemetryLogfile = argv[i + 1];
+        std::cout << "[INFO] Using IDLE telemetry logfile: "
+                  << idleTelemetryLogfile << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --idle-telemetry-logfile requires a path argument"
+                  << std::endl;
+        exit(1);
       }
     } else if (std::string(argv[i]) == "--input-type") {
       if (i + 1 < argc) {
@@ -4583,6 +4817,7 @@ int main(int argc, char const* argv[]) {
     targetMotionLogfile,
     plannerMotionLogfile,
     policyInputLogfile,
+    idleTelemetryLogfile,
     inputType,
     outputType,
     recordInputFile,

@@ -144,7 +144,11 @@ gap (that earlier framing was wrong). The dependence is purely loop delay.
 **RTF 0.10 is the verified operating point with the current autossh tunnel:**
 - Deploy: `CONTROL_WALL_SCALE=0.1` (must equal sim RTF).
 - Pod sim: `/tmp/sim_slowmo=10` (RTF = 1 / slowmo).
-- Confirmed: 60 s unaided stand; final tilt ≈2.5° with no fall.
+- Stationary IDLE: `SONIC_IDLE_HOLD_REFERENCE=1`,
+  `SONIC_IDLE_PITCH_BIAS_DEG=-8`, and `SIM_WARMUP_POSE=sonic`.
+- Confirmed: 60.02 s unaided stand; final displacement 0.10 m, tilt 0.7°, no fall.
+- Revalidated with synchronized reference/state/command telemetry: 60.02 s unaided
+  stand, final displacement 0.03 m, height 0.707 m, tilt 1.3°, result +71.56.
 
 This keeps the G1 upright under SONIC control on the Spark despite the current tunnel
 latency.
@@ -154,6 +158,8 @@ All new deploy code is off by default:
 - `CONTROL_WALL_SCALE` defaults to 1.0 (real-time),
 - `PRED_HORIZON_S` / `/tmp/pred_horizon` default 0 (no-op),
 - `/tmp/gain_scale` defaults to `1.0 1.0` (no-op).
+- `SONIC_IDLE_HOLD_REFERENCE` defaults off in the binary (the RTX sim launch helper
+  enables it only when `CONTROL_WALL_SCALE` is not 1.0).
 
 Launch the *same* binary for hardware with no knobs set → identical behavior to before.
 
@@ -168,7 +174,7 @@ echo 10 > /tmp/sim_slowmo                    # RTF 0.10 (sim re-reads live)
 # --- Spark ---
 echo "1.0 1.0" > /tmp/gain_scale             # gain scaling off
 echo "0.0"     > /tmp/pred_horizon           # prediction off
-CONTROL_WALL_SCALE=0.1 ./run_deploy_direct.sh     # in tmux `sonic_deploy`
+CONTROL_WALL_SCALE=0.1 ./run_deploy_direct.sh     # also enables measured IDLE + -8° trim
 #   then in the deploy: ']' start, ENTER enable planner, '1' standing set
 
 # release the sim base-hold so SONIC balances unaided (pod, DDS domain 1):

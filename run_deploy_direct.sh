@@ -7,14 +7,27 @@
 # the loop delay exceeds the policy's ~18-20ms delay margin and it falls (prediction and
 # gain-soften don't extend it -- see memory sonic-rtf-delay-tolerance-levers).
 #   CONTROL_WALL_SCALE MUST equal the sim RTF (=1/sim_slowmo).
-# For the REAL robot: unset these knobs -> CONTROL_WALL_SCALE defaults to 1.0, PRED/gain
-# scaling default to no-op, so behaviour is identical to before (interface unchanged).
+# For the REAL robot: unset these knobs -> CONTROL_WALL_SCALE defaults to 1.0 and all
+# sim-only IDLE trim/prediction settings remain off.
 #   Override at launch, e.g.:  CONTROL_WALL_SCALE=0.333 ./run_deploy_direct.sh
 cd /home/microagi/repos/GR00T-WholeBodyControl/gear_sonic_deploy
-export CONTROL_WALL_SCALE=${CONTROL_WALL_SCALE:-0.333}   # sim RTF; use 1.0 for the real robot
+export CONTROL_WALL_SCALE=${CONTROL_WALL_SCALE:-1.0}     # set to sim RTF; 1.0 on the real robot
 export PRED_HORIZON_S=${PRED_HORIZON_S:-0.0}             # forward state prediction; 0=off (see /tmp/pred_horizon to sweep live)
+DDS_INTERFACE=${DDS_INTERFACE:-$(ip -4 route show default | awk 'NR==1 {print $5}')}
+DDS_INTERFACE=${DDS_INTERFACE:-lo}
+case "$CONTROL_WALL_SCALE" in
+  1|1.0|1.00|1.000) ;;
+  *)
+    export SONIC_IDLE_HOLD_REFERENCE=${SONIC_IDLE_HOLD_REFERENCE:-1}
+    export SONIC_IDLE_PITCH_BIAS_DEG=${SONIC_IDLE_PITCH_BIAS_DEG:--8}
+    ;;
+esac
+telemetry_args=()
+if [[ -n "${IDLE_TELEMETRY_LOGFILE:-}" ]]; then
+  telemetry_args=(--idle-telemetry-logfile "$IDLE_TELEMETRY_LOGFILE")
+fi
 exec ./target/release/g1_deploy_onnx_ref \
-    lo \
+    "$DDS_INTERFACE" \
     policy/release/model_decoder.onnx \
     reference/example/ \
     --disable-crc-check \
@@ -23,4 +36,5 @@ exec ./target/release/g1_deploy_onnx_ref \
     --planner-file planner/target_vel/V2/planner_sonic.onnx \
     --input-type manager \
     --output-type all \
-    --zmq-host localhost
+    --zmq-host localhost \
+    "${telemetry_args[@]}"

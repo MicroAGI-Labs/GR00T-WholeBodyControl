@@ -139,10 +139,12 @@ class StandEval:
 
         # Not yet balancing: holding upright at the start == perfect start score.
         if not self._armed:
+            pos, quat, _, _ = self._read_root()
             self._maybe_pub(t, {
                 "t": 0.0, "termination": 0.0, "result": 100.0,
                 "fallen": False, "standing": False,
                 "dist": 0.0, "height": 0.0, "tilt": 0.0, "reason": "start-hold",
+                **self._pose_fields(pos, quat),
             })
             return
 
@@ -167,6 +169,7 @@ class StandEval:
                 "height": round(pos[2], 3) if pos else -1.0,
                 "tilt": round(self._tilt_deg(quat), 2) if pos else -1.0,
                 "reason": fall_reason,
+                **self._pose_fields(pos, quat),
             }
             self._done = True
             self._final = payload
@@ -202,6 +205,7 @@ class StandEval:
             "result": round(result, 2), "fallen": False, "standing": True,
             "dist": round(dist, 3), "height": round(pos[2], 3),
             "tilt": round(tilt, 2), "reason": "success" if success else "standing",
+            **self._pose_fields(pos, quat),
         }
         if success:
             self._done = True
@@ -260,6 +264,16 @@ class StandEval:
         dx = pos[0] - self._p0[0]
         dy = pos[1] - self._p0[1]
         return math.sqrt(dx * dx + dy * dy)
+
+    @staticmethod
+    def _pose_fields(pos, quat):
+        """Absolute root pose for synchronized external telemetry consumers."""
+        if pos is None or quat is None:
+            return {"position": None, "quaternion": None}
+        return {
+            "position": [round(float(v), 6) for v in pos],
+            "quaternion": [round(float(v), 7) for v in quat],
+        }
 
     @staticmethod
     def _tilt_deg(quat):

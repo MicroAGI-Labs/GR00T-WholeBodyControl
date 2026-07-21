@@ -165,6 +165,16 @@ def get_robot_boy_joint_states(
         vel_buf.copy_(torch.gather(joint_vel, 1, idx_batch))
         torque_buf.copy_(torch.gather(joint_torque, 1, idx_batch))
 
+    # sim_main's legacy rigid hold corrects root pose/velocity after the
+    # environment step.  The pre-correction velocities sampled here are motion
+    # that is discarded before the next externally visible pose, so publishing
+    # them produces the impossible state "fixed pose, non-zero velocity".  A
+    # controller with velocity history interprets that as a persistent balance
+    # error.  Preserve measured positions, but publish the inter-step velocity
+    # implied by a rigid hold: zero.
+    if getattr(env, "_joint_warmup_active", False):
+        vel_buf.zero_()
+
     # 组合为一个缓冲，避免 cat 分配
     combined_buf[:, 0:n].copy_(pos_buf)
     combined_buf[:, n:2*n].copy_(vel_buf)
@@ -317,6 +327,14 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
         quat = root_state[:, 3:7]
         lin_vel = root_state[:, 7:10]
         ang_vel_world = root_state[:, 10:13]
+
+    rigid_hold_active = getattr(env, "_rigid_hold_active", False)
+    if rigid_hold_active:
+        # See the joint-velocity explanation above.  The rigid pin discards the
+        # sampled root motion before the next visible pose, therefore zero is
+        # the consistent angular/linear velocity for the published held state.
+        lin_vel = torch.zeros_like(lin_vel)
+        ang_vel_world = torch.zeros_like(ang_vel_world)
 
     # device/dtype consistency
     device = lin_vel.device if isinstance(lin_vel, torch.Tensor) else torch.device("cpu")
