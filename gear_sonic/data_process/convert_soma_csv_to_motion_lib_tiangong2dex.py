@@ -187,23 +187,29 @@ def load_bones_csv(csv_path: str) -> dict:
     root_rotate{X,Y,Z} (euler xyz intrinsic, deg), then NUM_DOF DOF columns (deg),
     in MuJoCo/actuator order.
 
-    NOTE: columns are read POSITIONALLY (Frame + 3 trans + 3 rot + NUM_DOF dof),
-    NOT by header name. The current soma-retargeter ships only a 29-DOF G1 CSV
-    header (UnitreeG129DOF_CSVConfig), so a 31-DOF run emits correct DATA rows but
-    a G1-shaped/short HEADER. Positional extraction is robust to that; it also
-    consumes a properly-headed 31-DOF CSV identically. (A dedicated 31-DOF CSV
-    config for the retargeter is a separate follow-up -- see retarget/README.md.)
+    NOTE: rows are read POSITIONALLY (Frame + 3 trans + 3 rot + NUM_DOF dof), and
+    the header row is SKIPPED, never trusted. Rationale (a real rake): before the
+    retargeter got a 31-DOF CSV config, a tiangong run emitted RAGGED CSVs -- a
+    G1-shaped 29-DOF header (36 cols) over 31-DOF data rows (38 fields). With
+    pandas' default header=0 that misparses (the 2 extra data cols get absorbed as
+    an index) and silently corrupts everything. Reading header=None + skiprows=1
+    ignores the header entirely and takes every field by position, so it is correct
+    for both the ragged legacy CSVs and a properly-headed 31-DOF CSV
+    (Tiangong2Dex31DOF_CSVConfig). An exact field-count assertion guards the rest.
     """
     import pandas as pd
 
-    data = pd.read_csv(csv_path)
+    data = pd.read_csv(csv_path, header=None, skiprows=1)
     arr = data.values.astype(np.float64)
     T = arr.shape[0]
     ncols = arr.shape[1]
-    expected = 1 + 6 + NUM_DOF
-    if ncols < expected:
+    expected = 1 + 6 + NUM_DOF  # Frame + root(3 trans + 3 rot) + NUM_DOF dof
+    if ncols != expected:
         raise ValueError(
-            f"{csv_path}: expected >= {expected} columns (Frame + 6 root + {NUM_DOF} dof), got {ncols}"
+            f"{csv_path}: expected exactly {expected} fields per data row "
+            f"(Frame + 6 root + {NUM_DOF} dof), got {ncols}. Confirm the retarget "
+            f"target emitted a {NUM_DOF}-DOF CSV (Tiangong2Dex31DOF_CSVConfig); a "
+            f"G1-header/29-DOF CSV over 31-DOF data is the classic ragged-file bug."
         )
 
     # Root position: cm -> meters
@@ -372,7 +378,10 @@ def process_session_csvs(args_tuple):
                 entry = downsample_sequence(entry, fps_source, fps)
             joblib.dump({name: entry}, out_path, compress=True)
             converted += 1
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            # Surface the error -- do NOT silently swallow (the parallel-worker
+            # traceback swallow is what hid the ragged-CSV bug in the first pilot).
+            print(f"  [WARN] {session_name}/{csv_f}: {type(e).__name__}: {e}", flush=True)
             failed += 1
     return session_name, converted, failed, len(csv_files)
 
@@ -513,6 +522,44 @@ def run_selftest() -> int:
               "bones-CSV root pos cm->m")
         bentry = convert_sequence(seq, fps=30)
         check(bentry["pose_aa"].shape == (Tn, NUM_BODIES, 3), "bones-CSV entry pose_aa shape")
+
+        # --- RAGGED CSV: G1-shaped 29-DOF header (36 cols) over 31-DOF data rows
+        #     (38 fields). This is exactly the pod pilot failure. Must parse anyway.
+        import csv as _csv
+
+        root_names = ["root_translateX", "root_translateY", "root_translateZ",
+                      "root_rotateX", "root_rotateY", "root_rotateZ"]
+        g1_header = ["Frame", *root_names, *[f"g1_joint{i}_dof" for i in range(29)]]  # 36 cols
+        assert len(g1_header) == 36
+        fdr, ragged = tempfile.mkstemp(suffix=".csv")
+        os.close(fdr)
+        with open(ragged, "w", newline="") as fh:
+            w = _csv.writer(fh)
+            w.writerow(g1_header)  # 36-field header
+            for t in range(Tn):
+                w.writerow([t, 12.0, -3.0, 94.0, 10.0, 20.0, 30.0] + np.rad2deg(joint_pos_mj[t]).tolist())  # 38 fields
+        seq_r = load_bones_csv(ragged)
+        os.unlink(ragged)
+        check(seq_r["joint_pos"].shape == (Tn, NUM_DOF),
+              f"ragged-CSV (header=36,fields=38) parses to {seq_r['joint_pos'].shape}")
+        check(np.allclose(seq_r["joint_pos"], joint_pos_mj, atol=1e-4),
+              "ragged-CSV values correct despite header/field mismatch")
+
+        # --- WRONG FIELD COUNT: 37 fields (Frame + 6 root + 30 dof) must raise ---
+        fdb, badf = tempfile.mkstemp(suffix=".csv")
+        os.close(fdb)
+        with open(badf, "w", newline="") as fh:
+            w = _csv.writer(fh)
+            w.writerow(["Frame", *root_names, *[f"j{i}_dof" for i in range(30)]])
+            for t in range(Tn):
+                w.writerow([t, 0.0, 0.0, 90.0, 0.0, 0.0, 0.0] + [0.0] * 30)  # 37 fields
+        raised = False
+        try:
+            load_bones_csv(badf)
+        except ValueError:
+            raised = True
+        os.unlink(badf)
+        check(raised, "wrong field-count CSV (37 fields) raises ValueError")
     except ImportError:
         print("  [SKIP] bones-CSV sub-check (pandas not installed)")
 
