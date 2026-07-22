@@ -400,6 +400,65 @@ def main():
         root[:, :3] += origins
         return root
 
+    # Mixed-body MVP: keep two vectorized articulations in one Isaac scene and
+    # choose exactly one live body per logical DDS row. Even IDs use G1; odd IDs
+    # use TienKung. The unused copy is parked below the scene. This intentionally
+    # favors a small experiment over a new generic heterogeneous-scene layer.
+    _g1_robot = env.scene["robot"]
+    _tiangong_robot = env.scene.articulations.get("tiangong_robot")
+    _mixed_tiangong = _tiangong_robot is not None
+    _g1_active_mask = torch.tensor(
+        [not (_mixed_tiangong and robot_id % 2 == 1)
+         for robot_id in range(env.num_envs)],
+        dtype=torch.bool, device=env.device,
+    )
+    _tiangong_active_mask = ~_g1_active_mask
+
+    def logical_robot(robot_id):
+        if _mixed_tiangong and int(robot_id) % 2 == 1:
+            return _tiangong_robot
+        return _g1_robot
+
+    def ids_for_mask(mask):
+        return torch.nonzero(mask, as_tuple=False).squeeze(-1)
+
+    def park_inactive_mixed_bodies():
+        """Keep the duplicate articulation for each row out of view/contact."""
+        if not _mixed_tiangong:
+            return
+        for robot, inactive_mask in (
+            (_g1_robot, _tiangong_active_mask),
+            (_tiangong_robot, _g1_active_mask),
+        ):
+            inactive_ids = ids_for_mask(inactive_mask)
+            if inactive_ids.numel() == 0:
+                continue
+            root = default_root_state_world(robot, inactive_ids)
+            root[:, 2] = -10.0
+            robot.write_root_pose_to_sim(root[:, :7], env_ids=inactive_ids)
+            robot.write_root_velocity_to_sim(root[:, 7:], env_ids=inactive_ids)
+
+    if _mixed_tiangong:
+        for robot, active_mask in (
+            (_g1_robot, _g1_active_mask),
+            (_tiangong_robot, _tiangong_active_mask),
+        ):
+            active_ids = ids_for_mask(active_mask)
+            root = default_root_state_world(robot, active_ids)
+            robot.write_root_pose_to_sim(root[:, :7], env_ids=active_ids)
+            robot.write_root_velocity_to_sim(root[:, 7:], env_ids=active_ids)
+            robot.write_joint_state_to_sim(
+                robot.data.default_joint_pos[active_ids].clone(),
+                torch.zeros_like(robot.data.default_joint_vel[active_ids]),
+                env_ids=active_ids,
+            )
+        park_inactive_mixed_bodies()
+        print(
+            "[sim] mixed bodies initialized: G1 IDs=[0,2,4,6], "
+            "TienKung IDs=[1,3,5,7]",
+            flush=True,
+        )
+
     # The default viewer pose is intended for one environment.  Center an
     # elevated overview on the cloned environment grid so a WebRTC client sees
     # every robot without needing to navigate the viewport manually.
@@ -665,7 +724,7 @@ def main():
                 if _multi_mode:
                     stand_eval = [
                         StandEval(
-                            env.scene["robot"],
+                            logical_robot(robot_id),
                             lambda: float(env.sim.current_time),
                             env_id=robot_id,
                             topic=multi_robot_dds.topic(robot_id, "eval"),
@@ -740,7 +799,7 @@ def main():
                                 [robot_id], dtype=torch.long, device=env.device
                             )
                             if reset_category in ("2", "4"):
-                                robot = env.scene["robot"]
+                                robot = logical_robot(robot_id)
                                 root = default_root_state_world(robot, env_id)
                                 joint_q = robot.data.default_joint_pos[env_id].clone()
                                 joint_dq = torch.zeros_like(
@@ -912,21 +971,35 @@ def main():
                 # execute control step (in main thread, support rendering)
                 controller.step()
 
+                # The heterogeneous MVP contains one unused articulation per
+                # row. Re-pin those duplicates after physics so only the four G1
+                # and four TienKung bodies selected above can enter the scene.
+                park_inactive_mixed_bodies()
+
                 # Exact joint freeze for the static-pose experiment.  Apply this after the
                 # physics/control step, like the rigid base pin below, so the next LowState
                 # contains precisely the requested default posture with zero joint speed.
                 # On release the write stops and the already-running controller takes over.
                 if _multi_mode and torch.any(env._warmup_joint_mask):
                     try:
-                        _robot = env.scene["robot"]
-                        _ids = torch.nonzero(
-                            env._warmup_joint_mask, as_tuple=False
-                        ).squeeze(-1)
-                        _q0 = _robot.data.default_joint_pos[_ids]
-                        _dq0 = torch.zeros_like(_robot.data.default_joint_vel[_ids])
-                        _robot.write_joint_state_to_sim(
-                            _q0, _dq0, env_ids=_ids
-                        )
+                        for _robot, _body_mask in (
+                            (_g1_robot, _g1_active_mask),
+                            (_tiangong_robot, _tiangong_active_mask),
+                        ):
+                            if _robot is None:
+                                continue
+                            _ids = ids_for_mask(
+                                env._warmup_joint_mask & _body_mask
+                            )
+                            if _ids.numel() == 0:
+                                continue
+                            _q0 = _robot.data.default_joint_pos[_ids]
+                            _dq0 = torch.zeros_like(
+                                _robot.data.default_joint_vel[_ids]
+                            )
+                            _robot.write_joint_state_to_sim(
+                                _q0, _dq0, env_ids=_ids
+                            )
                     except Exception as _e:
                         print(f"[sim] multi joint-warmup pin failed: {_e}", flush=True)
                 elif env._joint_warmup_active:
@@ -947,23 +1020,34 @@ def main():
                 if _multi_mode:
                     if torch.any(env._base_hold_mask):
                         try:
-                            _robot = env.scene["robot"]
-                            _ids = torch.nonzero(
-                                env._base_hold_mask, as_tuple=False
-                            ).squeeze(-1)
-                            _cur = _robot.data.root_state_w[_ids].clone()
-                            _r0 = default_root_state_world(_robot, _ids)
-                            _pose = _cur[:, :7].clone()
-                            _pose[:, 0:2] = _r0[:, 0:2]
-                            _pose[:, 3:7] = _r0[:, 3:7]
-                            _robot.write_root_pose_to_sim(_pose, env_ids=_ids)
-                            _vel = _cur[:, 7:].clone()
-                            _vel[:, 0:2] = 0.0
-                            _vel[:, 3:6] = 0.0
-                            _vel[:, 2] = torch.minimum(
-                                _vel[:, 2], torch.zeros_like(_vel[:, 2])
-                            )
-                            _robot.write_root_velocity_to_sim(_vel, env_ids=_ids)
+                            for _robot, _body_mask in (
+                                (_g1_robot, _g1_active_mask),
+                                (_tiangong_robot, _tiangong_active_mask),
+                            ):
+                                if _robot is None:
+                                    continue
+                                _ids = ids_for_mask(
+                                    env._base_hold_mask & _body_mask
+                                )
+                                if _ids.numel() == 0:
+                                    continue
+                                _cur = _robot.data.root_state_w[_ids].clone()
+                                _r0 = default_root_state_world(_robot, _ids)
+                                _pose = _cur[:, :7].clone()
+                                _pose[:, 0:2] = _r0[:, 0:2]
+                                _pose[:, 3:7] = _r0[:, 3:7]
+                                _robot.write_root_pose_to_sim(
+                                    _pose, env_ids=_ids
+                                )
+                                _vel = _cur[:, 7:].clone()
+                                _vel[:, 0:2] = 0.0
+                                _vel[:, 3:6] = 0.0
+                                _vel[:, 2] = torch.minimum(
+                                    _vel[:, 2], torch.zeros_like(_vel[:, 2])
+                                )
+                                _robot.write_root_velocity_to_sim(
+                                    _vel, env_ids=_ids
+                                )
                         except Exception as _e:
                             print(f"[sim] multi base-hold pin failed: {_e}", flush=True)
                 elif _base_hold_until > current_time and _bh_soft:
@@ -1096,26 +1180,47 @@ def main():
                 if _perturb_command is not None and _sim_now < _perturb_until:
                     try:
                         _candidate, _eligible = _perturb_command
-                        _f = torch.zeros((env.num_envs, 1, 3), device=env.device)
-                        _tq = torch.zeros_like(_f)
-                        _ids = torch.tensor(_eligible, device=env.device, dtype=torch.long)
-                        _f[_ids, 0, :] = torch.tensor(
-                            _candidate.force_n, device=env.device, dtype=torch.float32
-                        )
-                        _tq[_ids, 0, :] = torch.tensor(
-                            _candidate.torque_nm, device=env.device, dtype=torch.float32
-                        )
-                        env.scene["robot"].set_external_force_and_torque(
-                            _f, _tq, body_ids=[_bh_base_bid], is_global=True
-                        )
+                        for _robot, _body_mask in (
+                            (_g1_robot, _g1_active_mask),
+                            (_tiangong_robot, _tiangong_active_mask),
+                        ):
+                            if _robot is None:
+                                continue
+                            _f = torch.zeros(
+                                (env.num_envs, 1, 3), device=env.device
+                            )
+                            _tq = torch.zeros_like(_f)
+                            _ids = torch.tensor(
+                                [robot_id for robot_id in _eligible
+                                 if bool(_body_mask[robot_id])],
+                                device=env.device, dtype=torch.long,
+                            )
+                            if _ids.numel() == 0:
+                                continue
+                            _f[_ids, 0, :] = torch.tensor(
+                                _candidate.force_n, device=env.device,
+                                dtype=torch.float32,
+                            )
+                            _tq[_ids, 0, :] = torch.tensor(
+                                _candidate.torque_nm, device=env.device,
+                                dtype=torch.float32,
+                            )
+                            _base_bid = _robot.data.body_names.index("pelvis")
+                            _robot.set_external_force_and_torque(
+                                _f, _tq, body_ids=[_base_bid], is_global=True
+                            )
                     except Exception as _e:
                         print(f"[sim] perturbation apply failed: {_e}", flush=True)
                 elif _perturb_command is not None and not _perturb_cleared:
                     try:
                         _z = torch.zeros((env.num_envs, 1, 3), device=env.device)
-                        env.scene["robot"].set_external_force_and_torque(
-                            _z, _z, body_ids=[_bh_base_bid], is_global=True
-                        )
+                        for _robot in (_g1_robot, _tiangong_robot):
+                            if _robot is None:
+                                continue
+                            _base_bid = _robot.data.body_names.index("pelvis")
+                            _robot.set_external_force_and_torque(
+                                _z, _z, body_ids=[_base_bid], is_global=True
+                            )
                     except Exception:
                         pass
                     _candidate, _eligible = _perturb_command

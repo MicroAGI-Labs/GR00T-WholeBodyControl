@@ -19,6 +19,11 @@ if TYPE_CHECKING:
 import torch
 
 from dds.g1_joint_mapping import UNITREE_G1_29_JOINT_NAMES, unitree_indices_in
+from dds.g1_tiangong_retarget import (
+    G1_CANONICAL_SIGNS,
+    indices_in as tiangong_indices_in,
+    is_tiangong_robot,
+)
 
 def get_robot_boy_joint_names() -> list[str]:
     return list(UNITREE_G1_29_JOINT_NAMES)
@@ -55,6 +60,7 @@ _obs_cache = {
     "batch": None,
     "boy_idx_t": None,
     "boy_idx_batch": None,
+    "tiangong_idx_t": None,
     "pos_buf": None,
     "vel_buf": None,
     "torque_buf": None,
@@ -65,11 +71,7 @@ _obs_cache = {
 
 # IMU 加速度缓存：用于通过速度差分计算加速度
 # IMU acceleration cache: for computing acceleration via velocity differentiation
-_imu_acc_cache = {
-    "prev_vel": None,
-    "dt": 0.01,
-    "initialized": False,
-}
+_imu_acc_cache = {}
 
 def _get_g1_robot_dds_instance():
     """get the DDS instance, delay initialization"""
@@ -165,6 +167,45 @@ def get_robot_boy_joint_states(
         vel_buf.copy_(torch.gather(joint_vel, 1, idx_batch))
         torque_buf.copy_(torch.gather(joint_torque, 1, idx_batch))
 
+    # In the mixed-body MVP, odd logical rows are represented by the second
+    # articulation. Convert its measured 29 active joints back into the G1
+    # canonical coordinate convention before publishing LowState. The two head
+    # joints do not participate in the SONIC interface.
+    tiangong = env.scene.articulations.get("tiangong_robot")
+    tiangong_mask = None
+    tg_idx_batch = None
+    if tiangong is not None:
+        if _obs_cache["tiangong_idx_t"] is None:
+            _obs_cache["tiangong_idx_t"] = torch.tensor(
+                tiangong_indices_in(tiangong.data.joint_names),
+                dtype=torch.long,
+                device=device,
+            )
+            print(
+                f"[g1_state] TienKung joint indices in articulation: "
+                f"{_obs_cache['tiangong_idx_t'].tolist()}",
+                flush=True,
+            )
+        tg_idx_t = _obs_cache["tiangong_idx_t"]
+        tg_idx_batch = tg_idx_t.unsqueeze(0).expand(batch, n)
+        tiangong_mask = torch.tensor(
+            [is_tiangong_robot(i) for i in range(batch)],
+            dtype=torch.bool,
+            device=device,
+        )
+        signs = torch.tensor(
+            G1_CANONICAL_SIGNS, dtype=joint_pos.dtype, device=device
+        ).unsqueeze(0)
+        pos_buf[tiangong_mask] = torch.gather(
+            tiangong.data.joint_pos, 1, tg_idx_batch
+        )[tiangong_mask] * signs
+        vel_buf[tiangong_mask] = torch.gather(
+            tiangong.data.joint_vel, 1, tg_idx_batch
+        )[tiangong_mask] * signs
+        torque_buf[tiangong_mask] = torch.gather(
+            tiangong.data.applied_torque, 1, tg_idx_batch
+        )[tiangong_mask] * signs
+
     # sim_main's exact joint warmup corrects q/dq after the environment step.
     # The Isaac data cache sampled above still describes the pre-correction
     # physics state.  Publish the post-step pinned state that actually persists
@@ -178,6 +219,12 @@ def get_robot_boy_joint_states(
             default_body_pos = torch.gather(default_joint_pos, 1, idx_batch)
             pos_buf[joint_warmup_mask] = default_body_pos[joint_warmup_mask]
             vel_buf[joint_warmup_mask] = 0.0
+            if tiangong is not None and torch.any(joint_warmup_mask & tiangong_mask):
+                tg_default = torch.gather(
+                    tiangong.data.default_joint_pos, 1, tg_idx_batch
+                ) * signs
+                held_tg = joint_warmup_mask & tiangong_mask
+                pos_buf[held_tg] = tg_default[held_tg]
     elif getattr(env, "_joint_warmup_active", False):
         default_joint_pos = env.scene["robot"].data.default_joint_pos
         try:
@@ -201,6 +248,12 @@ def get_robot_boy_joint_states(
                 g1_robot_dds = None if multi_robot_dds else _get_g1_robot_dds_instance()
                 if multi_robot_dds is not None:
                     imu_data = get_robot_imu_data(env, use_torso_imu=False)
+                    if tiangong is not None and torch.any(tiangong_mask):
+                        tg_imu = get_robot_imu_data(
+                            env, use_torso_imu=False,
+                            asset_name="tiangong_robot",
+                        )
+                        imu_data[tiangong_mask] = tg_imu[tiangong_mask]
                     multi_robot_dds.update_states(
                         pos_buf.contiguous().cpu().numpy(),
                         vel_buf.contiguous().cpu().numpy(),
@@ -304,18 +357,26 @@ def ensure_quat_w_first(quat, assume_w_first=None):
     # ambiguous: default to w-first but warn (can't print here reliably for all contexts)
     return quat
 
-def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = None) -> torch.Tensor:
+def get_robot_imu_data(
+    env,
+    use_torso_imu: bool = True,
+    quat_w_first: bool = None,
+    asset_name: str = "robot",
+) -> torch.Tensor:
     """
     Returns [batch, 13] = pos(world,3) | quat(w,x,y,z) | acc_body(3) | gyro_body(3)
     - accel/gyro are in IMU/body frame (proper accelerometer reading)
     - quat_w_first: if None do heuristic, if True assume input quat already (w,x,y,z),
                     if False assume input quat is (x,y,z,w)
     """
-    data = env.scene["robot"].data
+    data = env.scene[asset_name].data
     global _imu_acc_cache
+    cache = _imu_acc_cache.setdefault(
+        asset_name, {"prev_vel": None, "dt": 0.01, "initialized": False}
+    )
 
     # --- dt ---
-    dt = _imu_acc_cache["dt"]
+    dt = cache["dt"]
     try:
         if hasattr(env, "physics_dt"):
             dt = float(env.physics_dt)
@@ -326,7 +387,7 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
     except Exception:
         pass
     if dt <= 0:
-        dt = _imu_acc_cache["dt"]
+        dt = cache["dt"]
 
     # --- extract pose & vel ---
     if use_torso_imu:
@@ -377,15 +438,15 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
     ang_vel_world = ang_vel_world.to(device)
 
     # initialize prev_vel if needed
-    if _imu_acc_cache["prev_vel"] is None:
-        _imu_acc_cache["prev_vel"] = lin_vel.clone().detach().to(device)
-        _imu_acc_cache["initialized"] = False
+    if cache["prev_vel"] is None:
+        cache["prev_vel"] = lin_vel.clone().detach().to(device)
+        cache["initialized"] = False
     else:
-        if _imu_acc_cache["prev_vel"].device != device:
-            _imu_acc_cache["prev_vel"] = _imu_acc_cache["prev_vel"].to(device)
+        if cache["prev_vel"].device != device:
+            cache["prev_vel"] = cache["prev_vel"].to(device)
 
     # compute a_world
-    a_world = (lin_vel - _imu_acc_cache["prev_vel"]) / dt  # [B,3]
+    a_world = (lin_vel - cache["prev_vel"]) / dt  # [B,3]
 
     # gravity in world frame (z-up convention)
     g_world = torch.zeros_like(a_world)
@@ -408,14 +469,14 @@ def get_robot_imu_data(env, use_torso_imu: bool = True, quat_w_first: bool = Non
     omega_body = torch.bmm(R_world_to_body, ang_vel_world.unsqueeze(-1)).squeeze(-1)
 
     # handle first frame: prefer returning only gravity-compensated static reading
-    if not _imu_acc_cache["initialized"]:
+    if not cache["initialized"]:
         # set a_body to rotation of -g_world (so accelerometer reads gravity in body coords)
         a_body = torch.bmm(R_world_to_body, (-g_world).unsqueeze(-1)).squeeze(-1)
-        _imu_acc_cache["initialized"] = True
+        cache["initialized"] = True
 
     # update cache
-    _imu_acc_cache["prev_vel"] = lin_vel.clone().detach()
-    _imu_acc_cache["dt"] = dt
+    cache["prev_vel"] = lin_vel.clone().detach()
+    cache["dt"] = dt
 
     imu_data = torch.cat([pos, quat_wxyz, a_body, omega_body], dim=1)
     return imu_data

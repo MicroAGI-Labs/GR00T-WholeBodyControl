@@ -58,6 +58,10 @@ class FlatG1SceneCfg(InteractiveSceneCfg):
         init_rot=(1.0, 0.0, 0.0, 0.0),
     )
 
+    # Populated by FlatG1Dex3EnvCfg.__post_init__ only for the deliberately
+    # simple 4x G1 + 4x TienKung experiment.
+    tiangong_robot: ArticulationCfg | None = None
+
     # lighting
     light = AssetBaseCfg(
         prim_path="/World/light",
@@ -284,6 +288,16 @@ class FlatG1Dex3EnvCfg(ManagerBasedRLEnvCfg):
         if _ck > 0.0:
             self.sim.physics_material.compliant_contact_stiffness = _ck
             self.sim.physics_material.compliant_contact_damping = float(_os.environ.get("SIM_CONTACT_D", "2000"))
+
+        if _os.environ.get("SIM_MIXED_TIANGONG", "0") == "1":
+            from .tiangong2dex_sim_cfg import tiangong2dex_cfg
+
+            self.scene.tiangong_robot = tiangong2dex_cfg()
+            print(
+                "[sim] MIXED BODY MVP: even IDs=G1, odd IDs=TienKung 2dex; "
+                "TienKung head joints held at zero",
+                flush=True,
+            )
 
         # a "reset everything to default" event (no object in this scene)
         self.event_manager = SimpleEventManager()

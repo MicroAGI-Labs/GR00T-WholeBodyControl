@@ -16,6 +16,12 @@ from typing import Optional
 import time
 import torch
 from dds.dds_master import dds_manager
+from dds.g1_tiangong_retarget import (
+    G1_CANONICAL_SIGNS,
+    TIANGONG_HEAD_JOINT_NAMES,
+    indices_in as tiangong_indices_in,
+    is_tiangong_robot,
+)
 from tasks.common_observations.g1_29dof_state import get_robot_boy_joint_names
 
 
@@ -105,6 +111,48 @@ class DDSLowCmd29ActionProvider(ActionProvider):
             (self.num_envs, 29), device=device, dtype=torch.float32
         )
 
+        # Dumb mixed-body experiment: the same 29-value G1 command is mapped
+        # by joint meaning onto TienKung. Its two extra head joints stay at the
+        # articulation default (zero). Elbow flexion has the opposite sign.
+        self.tiangong = self.env.scene.articulations.get("tiangong_robot")
+        self._tiangong_mask = torch.tensor(
+            [is_tiangong_robot(i) for i in range(self.num_envs)],
+            dtype=torch.bool, device=device,
+        )
+        if self.tiangong is not None:
+            self._tg_target_indices = list(
+                tiangong_indices_in(self.tiangong.data.joint_names)
+            )
+            self._tg_head_indices = [
+                self.tiangong.data.joint_names.index(name)
+                for name in TIANGONG_HEAD_JOINT_NAMES
+            ]
+            self._tg_signs = torch.tensor(
+                G1_CANONICAL_SIGNS, device=device, dtype=torch.float32
+            )
+            self._tg_full_action = self.tiangong.data.default_joint_pos.clone().to(
+                device=device, dtype=torch.float32
+            )
+            self._tg_kp_buf = torch.zeros(
+                (self.num_envs, 29), device=device, dtype=torch.float32
+            )
+            self._tg_kd_buf = torch.zeros_like(self._tg_kp_buf)
+            self._tg_dq_buf = torch.zeros_like(self._tg_kp_buf)
+            self._tg_tau_buf = torch.zeros_like(self._tg_kp_buf)
+            self._tg_gains_written = False
+            self._tg_q_lo = self.tiangong.data.soft_joint_pos_limits[..., 0].to(
+                device=device, dtype=torch.float32
+            )
+            self._tg_q_hi = self.tiangong.data.soft_joint_pos_limits[..., 1].to(
+                device=device, dtype=torch.float32
+            )
+            print(
+                f"[{self.name}] TienKung retarget rows="
+                f"{torch.nonzero(self._tiangong_mask).squeeze(-1).tolist()} "
+                f"mapped_joints={self._tg_target_indices} heads={self._tg_head_indices}",
+                flush=True,
+            )
+
         # Action-latency model (SIM_ACT_LATENCY = N control steps, 50Hz -> 20ms each).
         # SONIC balances the real G1, which has ~tens of ms of actuation delay; Isaac's
         # implicit PD is ~instantaneous, so the policy's corrections land too early and it
@@ -123,9 +171,9 @@ class DDSLowCmd29ActionProvider(ActionProvider):
         # PhysX ("Illegal BroadPhaseUpdateData"). The real robot physically can't exceed
         # its limits, so clamping is faithful and prevents the sim from diverging to nan.
         try:
-            _lim = self.env.scene["robot"].data.soft_joint_pos_limits[0]  # [num_joints,2]
-            self._q_lo = _lim[:, 0].to(device=device, dtype=torch.float32)
-            self._q_hi = _lim[:, 1].to(device=device, dtype=torch.float32)
+            _lim = self.env.scene["robot"].data.soft_joint_pos_limits
+            self._q_lo = _lim[..., 0].to(device=device, dtype=torch.float32)
+            self._q_hi = _lim[..., 1].to(device=device, dtype=torch.float32)
         except Exception as e:
             print(f"[{self.name}] joint limit fetch failed ({e}); clamping disabled")
             self._q_lo = self._q_hi = None
@@ -187,6 +235,7 @@ class DDSLowCmd29ActionProvider(ActionProvider):
                     commands = [self.robot_dds.get_robot_command()]
 
                 gains_changed = False
+                tg_gains_changed = False
                 for robot_id, cmd in enumerate(commands):
                     if not cmd or 'motor_cmd' not in cmd:
                         continue
@@ -196,12 +245,17 @@ class DDSLowCmd29ActionProvider(ActionProvider):
                         dev = self.env.device
                         self._positions_buf[robot_id].copy_(
                             torch.tensor(positions[:29], dtype=torch.float32, device=dev))
-                        body_vals = self._positions_buf[robot_id].index_select(
-                            0, self._body_source_idx_t
-                        )
-                        full_action[robot_id].index_copy_(
-                            0, self._body_target_idx_t, body_vals
-                        )
+                        if self.tiangong is not None and bool(self._tiangong_mask[robot_id]):
+                            body_vals = self._positions_buf[robot_id] * self._tg_signs
+                            self._tg_full_action[robot_id, self._tg_target_indices] = body_vals
+                            self._tg_full_action[robot_id, self._tg_head_indices] = 0.0
+                        else:
+                            body_vals = self._positions_buf[robot_id].index_select(
+                                0, self._body_source_idx_t
+                            )
+                            full_action[robot_id].index_copy_(
+                                0, self._body_target_idx_t, body_vals
+                            )
 
                         # --- Faithful lowcmd PD protocol -------------------------------
                         # Push the COMMANDED per-joint gains + dq/tau into the implicit
@@ -217,9 +271,16 @@ class DDSLowCmd29ActionProvider(ActionProvider):
                             # SONIC sends CONSTANT gains; write_joint_stiffness/damping_to_sim
                             # are (relatively) expensive USD writes on the CPU pipeline. Only
                             # push them when they actually change, not every 50 Hz tick.
-                            if (not self._gains_written
-                                    or not torch.equal(new_kp, self._kp_buf[robot_id])
-                                    or not torch.equal(new_kd, self._kd_buf[robot_id])):
+                            if self.tiangong is not None and bool(self._tiangong_mask[robot_id]):
+                                if (not self._tg_gains_written
+                                        or not torch.equal(new_kp, self._tg_kp_buf[robot_id])
+                                        or not torch.equal(new_kd, self._tg_kd_buf[robot_id])):
+                                    self._tg_kp_buf[robot_id].copy_(new_kp)
+                                    self._tg_kd_buf[robot_id].copy_(new_kd)
+                                    tg_gains_changed = True
+                            elif (not self._gains_written
+                                  or not torch.equal(new_kp, self._kp_buf[robot_id])
+                                  or not torch.equal(new_kd, self._kd_buf[robot_id])):
                                 self._kp_buf[robot_id].copy_(new_kp)
                                 self._kd_buf[robot_id].copy_(new_kd)
                                 gains_changed = True
@@ -239,13 +300,17 @@ class DDSLowCmd29ActionProvider(ActionProvider):
                                         print(f"[{self.name}] gain readback failed: {_e}", flush=True)
                                     self._gains_logged = True
                         if dq is not None and len(dq) >= 29:
-                            self._dq_buf[robot_id].copy_(torch.tensor(
-                                dq[:29], dtype=torch.float32, device=dev
-                            ))
+                            _dq = torch.tensor(dq[:29], dtype=torch.float32, device=dev)
+                            if self.tiangong is not None and bool(self._tiangong_mask[robot_id]):
+                                self._tg_dq_buf[robot_id].copy_(_dq * self._tg_signs)
+                            else:
+                                self._dq_buf[robot_id].copy_(_dq)
                         if tau is not None and len(tau) >= 29:
-                            self._tau_buf[robot_id].copy_(torch.tensor(
-                                tau[:29], dtype=torch.float32, device=dev
-                            ))
+                            _tau = torch.tensor(tau[:29], dtype=torch.float32, device=dev)
+                            if self.tiangong is not None and bool(self._tiangong_mask[robot_id]):
+                                self._tg_tau_buf[robot_id].copy_(_tau * self._tg_signs)
+                            else:
+                                self._tau_buf[robot_id].copy_(_tau)
 
                 if gains_changed:
                     robot.write_joint_stiffness_to_sim(
@@ -255,12 +320,36 @@ class DDSLowCmd29ActionProvider(ActionProvider):
                         self._kd_buf, joint_ids=self._body_target_indices
                     )
                     self._gains_written = True
+                if self.tiangong is not None and tg_gains_changed:
+                    self.tiangong.write_joint_stiffness_to_sim(
+                        self._tg_kp_buf, joint_ids=self._tg_target_indices
+                    )
+                    self.tiangong.write_joint_damping_to_sim(
+                        self._tg_kd_buf, joint_ids=self._tg_target_indices
+                    )
+                    self._tg_gains_written = True
                 robot.set_joint_velocity_target(
                     self._dq_buf, joint_ids=self._body_target_indices
                 )
                 robot.set_joint_effort_target(
                     self._tau_buf, joint_ids=self._body_target_indices
                 )
+                if self.tiangong is not None:
+                    self._tg_full_action = torch.clamp(
+                        self._tg_full_action, self._tg_q_lo, self._tg_q_hi
+                    )
+                    if torch.any(warmup_mask & self._tiangong_mask):
+                        _held = warmup_mask & self._tiangong_mask
+                        self._tg_full_action[_held] = (
+                            self.tiangong.data.default_joint_pos[_held]
+                        )
+                    self.tiangong.set_joint_position_target(self._tg_full_action)
+                    self.tiangong.set_joint_velocity_target(
+                        self._tg_dq_buf, joint_ids=self._tg_target_indices
+                    )
+                    self.tiangong.set_joint_effort_target(
+                        self._tg_tau_buf, joint_ids=self._tg_target_indices
+                    )
             if self.dex3_dds is not None:
                 hand_cmds = self.dex3_dds.get_hand_commands()
                 if hand_cmds:
