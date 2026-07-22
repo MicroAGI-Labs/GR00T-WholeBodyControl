@@ -679,15 +679,22 @@ def main():
             except Exception as _e:
                 print(f"[sim] stand_eval init failed (continuing without eval): {_e}", flush=True)
 
-        # --- file-triggered external-force disturbance (eval robustness testing) ---
-        # Echo "fx fy fz [dur_s]" into SIM_PUSH_FILE to apply a one-shot global wrench
-        # on the pelvis (e.g. "0 0 -600 0.5" = a hard downward shove to force a fall).
-        # Fires once per distinct file content; only while the base-hold is released.
-        _push_file = os.environ.get("SIM_PUSH_FILE", "/tmp/sim_push")
-        _push_vec = None
-        _push_until = 0.0
-        _push_sig = None
-        _push_cleared = True
+        # --- targeted external-wrench disturbance (balance robustness testing) ---
+        # perturb_sim.py atomically writes a uniquely identified JSON command.  A
+        # command can select one, several, or all vectorized environments.  Forces
+        # and torques are world-frame pelvis wrenches and use simulated duration.
+        from tools.sim_perturbation import parse_perturbation
+        _perturb_file = os.environ.get(
+            "SIM_PERTURB_FILE", "/tmp/sim_perturbation.json"
+        )
+        _perturb_max_force = float(os.environ.get("SIM_PERTURB_MAX_FORCE_N", "500"))
+        _perturb_max_torque = float(os.environ.get("SIM_PERTURB_MAX_TORQUE_NM", "200"))
+        _perturb_max_duration = float(os.environ.get("SIM_PERTURB_MAX_DURATION_S", "2"))
+        _perturb_command = None
+        _perturb_until = 0.0
+        _perturb_last_id = None
+        _perturb_seen_text = None
+        _perturb_cleared = True
 
         # use torch.inference_mode() and exception suppression
         with contextlib.suppress(KeyboardInterrupt), torch.inference_mode():
@@ -1038,39 +1045,87 @@ def main():
                     if _multi_mode else _base_hold_until > current_time
                 )
 
-                # file-triggered external-force disturbance (skip while base is held)
-                if not _multi_mode and not (_base_hold_until > current_time):
-                    _sim_now = float(env.sim.current_time)
+                # File-triggered targeted disturbance. Commands aimed at held
+                # environments are rejected rather than queued and unexpectedly
+                # applied after release.
+                _sim_now = float(env.sim.current_time)
+                try:
+                    if os.path.exists(_perturb_file):
+                        with open(_perturb_file, encoding="utf-8") as _stream:
+                            _txt = _stream.read().strip()
+                        if _txt and _txt != _perturb_seen_text:
+                            # Mark it seen before parsing so a malformed manual
+                            # write logs once rather than every physics tick.
+                            _perturb_seen_text = _txt
+                            _candidate = parse_perturbation(
+                                _txt, env.num_envs,
+                                max_force_n=_perturb_max_force,
+                                max_torque_nm=_perturb_max_torque,
+                                max_duration_s=_perturb_max_duration,
+                            )
+                            if _candidate.command_id != _perturb_last_id:
+                                _perturb_last_id = _candidate.command_id
+                                if _multi_mode:
+                                    _eligible = tuple(
+                                        robot_id for robot_id in _candidate.robot_ids
+                                        if not bool(env._base_hold_mask[robot_id])
+                                    )
+                                else:
+                                    _eligible = (() if _base_hold_until > current_time
+                                                 else _candidate.robot_ids)
+                                if not _eligible:
+                                    print(
+                                        f"[sim] PERTURBATION rejected id={_candidate.command_id}: "
+                                        "all requested robots are held",
+                                        flush=True,
+                                    )
+                                else:
+                                    _perturb_command = (_candidate, _eligible)
+                                    _perturb_until = _sim_now + _candidate.duration_s
+                                    _perturb_cleared = False
+                                    print(
+                                        f"[sim] PERTURBATION start id={_candidate.command_id} "
+                                        f"robots={list(_eligible)} force_n={_candidate.force_n} "
+                                        f"torque_nm={_candidate.torque_nm} "
+                                        f"duration_sim_s={_candidate.duration_s:.3f}",
+                                        flush=True,
+                                    )
+                except Exception as _e:
+                    print(f"[sim] perturbation command rejected: {_e}", flush=True)
+
+                if _perturb_command is not None and _sim_now < _perturb_until:
                     try:
-                        if os.path.exists(_push_file):
-                            _txt = open(_push_file).read().strip()
-                            if _txt and _txt != _push_sig:
-                                _push_sig = _txt
-                                _p = _txt.split()
-                                _push_vec = (float(_p[0]), float(_p[1]), float(_p[2]))
-                                _dur = float(_p[3]) if len(_p) > 3 else 0.3
-                                _push_until = _sim_now + _dur
-                                _push_cleared = False
-                                print(f"[sim] DISTURBANCE push={_push_vec} N for {_dur:.2f}s", flush=True)
+                        _candidate, _eligible = _perturb_command
+                        _f = torch.zeros((env.num_envs, 1, 3), device=env.device)
+                        _tq = torch.zeros_like(_f)
+                        _ids = torch.tensor(_eligible, device=env.device, dtype=torch.long)
+                        _f[_ids, 0, :] = torch.tensor(
+                            _candidate.force_n, device=env.device, dtype=torch.float32
+                        )
+                        _tq[_ids, 0, :] = torch.tensor(
+                            _candidate.torque_nm, device=env.device, dtype=torch.float32
+                        )
+                        env.scene["robot"].set_external_force_and_torque(
+                            _f, _tq, body_ids=[_bh_base_bid], is_global=True
+                        )
                     except Exception as _e:
-                        print(f"[sim] push read failed: {_e}", flush=True)
-                    if _push_vec is not None and _sim_now < _push_until:
-                        try:
-                            _rp = env.scene["robot"]
-                            _f = torch.tensor([[list(_push_vec)]], device=env.device, dtype=torch.float32)
-                            _tq = torch.zeros((env.num_envs, 1, 3), device=env.device)
-                            _rp.set_external_force_and_torque(_f, _tq, body_ids=[_bh_base_bid], is_global=True)
-                        except Exception as _e:
-                            print(f"[sim] push apply failed: {_e}", flush=True)
-                    elif _push_vec is not None and not _push_cleared:
-                        try:
-                            _rp = env.scene["robot"]
-                            _z = torch.zeros((env.num_envs, 1, 3), device=env.device)
-                            _rp.set_external_force_and_torque(_z, _z, body_ids=[_bh_base_bid], is_global=True)
-                        except Exception:
-                            pass
-                        _push_cleared = True
-                        _push_vec = None
+                        print(f"[sim] perturbation apply failed: {_e}", flush=True)
+                elif _perturb_command is not None and not _perturb_cleared:
+                    try:
+                        _z = torch.zeros((env.num_envs, 1, 3), device=env.device)
+                        env.scene["robot"].set_external_force_and_torque(
+                            _z, _z, body_ids=[_bh_base_bid], is_global=True
+                        )
+                    except Exception:
+                        pass
+                    _candidate, _eligible = _perturb_command
+                    print(
+                        f"[sim] PERTURBATION end id={_candidate.command_id} "
+                        f"robots={list(_eligible)}",
+                        flush=True,
+                    )
+                    _perturb_cleared = True
+                    _perturb_command = None
 
                 # deterministic balance eval -> rt/eval (sim-time throttled, never raises)
                 if stand_eval is not None:

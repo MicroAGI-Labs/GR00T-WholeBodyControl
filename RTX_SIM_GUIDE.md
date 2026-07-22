@@ -511,6 +511,61 @@ and no fall; final tilt was 2.0° and 1.9°. Both controllers also recovered to
 restarting the controllers. Mixed IDLE/WALK isolation and free-standing
 transport-restart tests remain open.
 
+#### Targeted push/pull testing
+
+The vectorized simulator accepts a one-shot world-frame wrench on each G1's
+pelvis. Run the helper on the RTX host; the command file is local to the pod's
+filesystem:
+
+```bash
+# +X push on robot 0: 80 N for 0.15 simulated seconds
+ssh spark@10.5.7.178 \
+  'python3 ~/live-sim/perturb_sim.py --robot 0 --force 80 0 0 --duration 0.15'
+
+# -Y pull on robots 2 and 3
+ssh spark@10.5.7.178 \
+  'python3 ~/live-sim/perturb_sim.py --robot 2 --robot 3 \
+   --force 0 -60 0 --duration 0.15'
+
+# The same wrench on every released robot
+ssh spark@10.5.7.178 \
+  'python3 ~/live-sim/perturb_sim.py --all --force -40 0 0 --duration 0.15'
+```
+
+`--force FX FY FZ` is newtons, optional `--torque TX TY TZ` is newton-metres,
+and duration is simulated time (so 0.15 sim s lasts about 0.75 wall s at RTF
+0.20). The simulator defaults to maximum magnitudes of 500 N and 200 Nm and a
+maximum duration of 2 sim s. Override those only for an intentional destructive
+test with `SIM_PERTURB_MAX_FORCE_N`, `SIM_PERTURB_MAX_TORQUE_NM`, and
+`SIM_PERTURB_MAX_DURATION_S`. Commands aimed at a robot still in reset hold are
+rejected, not queued. `start_flat.sh` removes the command file so a restart
+cannot replay an old shove.
+
+The command file contains a unique ID, targets, force, torque, and duration.
+Atomic replacement and ID de-duplication make repeated identical force trials
+safe; a newer command replaces any wrench still active. Confirm start/end in
+`~/live-sim/sim_run.log` and monitor posture through `rt/eval` or a capture:
+
+```bash
+python3 rtx_pod/g1_dds_diag.py --domain 0 --interface lo \
+  --topic-prefix rt/sim/g1/0 capture 20 push_r0 /tmp/push_r0.csv
+```
+
+For disturbance testing, the primary pass condition is `fallen=false` after a
+recovery window. Stepping and translation are valid balance-recovery behaviour;
+the stand evaluator's distance-based `result` remains useful for describing
+drift but a negative score alone is not a perturbation failure.
+
+Initial supervised RTF 0.20 trials on 2026-07-22 used 0.15 sim-s pelvis forces.
+All 40 N directional trials remained upright. Single forward trials at 80 N,
+120 N, 160 N, and 200 N also remained upright; the 200 N case peaked at 12.8°,
+stepped about 1.4 m, and settled to 2.3°. A 240 N forward trial fell at 5.16 sim
+s, reaching 59.4° evaluator tilt (85.7° raw IMU) and translating 1.54 m. These
+are single trials, not a deterministic force rating: recovery displacement was
+non-monotonic and depends on the instantaneous policy/stance phase. Repeat each
+direction and impulse over multiple fresh resets before making a robustness
+claim.
+
 #### Concurrent RTF sweep (2026-07-21)
 
 The follow-up sweep used the same two-environment Isaac process and two SONIC

@@ -21,6 +21,9 @@ if [ "$SIM_ROBOT_COUNT" -lt 1 ] || [ "$SIM_ROBOT_COUNT" -gt 24 ]; then
 fi
 export SIM_ROBOT_COUNT
 
+# Never replay a disturbance left by an earlier simulator instance.
+rm -f "${SIM_PERTURB_FILE:-/tmp/sim_perturbation.json}"
+
 # A concurrent stack must never start with its floating bases immediately free:
 # controllers may still be reconnecting or filling their observation histories.
 # Default multi-robot launches to the validated observed-pose rigid hold.  Cat-3
