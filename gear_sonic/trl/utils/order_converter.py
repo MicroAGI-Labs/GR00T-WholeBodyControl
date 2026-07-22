@@ -230,7 +230,9 @@ class Tiangong2DexConverter(IsaacLabMuJoCoConverter):
             ("mujoco", "isaaclab"): TIANGONG2DEX_MUJOCO_TO_ISAACLAB_BODY,
         }
 
-    VR_3POINTS_BODY_NAMES = ["waist_pitch_link", "wrist_pitch_l_link", "wrist_pitch_r_link"]
+    # wrist_roll (not wrist_pitch): must match vr_3point_body in the training
+    # yaml (sonic_tiangong2dex.yaml) — the last wrist segment before the hand.
+    VR_3POINTS_BODY_NAMES = ["waist_pitch_link", "wrist_roll_l_link", "wrist_roll_r_link"]
     FOOT_BODY_NAMES = ["ankle_roll_l_link", "ankle_roll_r_link"]
 
 
