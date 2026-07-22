@@ -1,0 +1,117 @@
+<!-- Generated from tiangong3.urdf by gear_sonic/data_process/make_tiangong3_mjcf.py.
+     MESH-FREE (visual/collision stripped before compile; bodies keep mass via
+     inertial). Used by the SOMA retargeter newton.add_mjcf for FK/IK only
+     (retargeter collision_weight=0). Floating base: the URDF root 'pelvis' is
+     re-wrapped as a free body (freejoint floating_base) with the three root
+     children (hip_pitch_l/r, waist_yaw) as its subtree, matching the 2dex MJCF
+     layout. Hinge ranges equal the URDF limit (compiled from URDF; no separate
+     tightening pass needed). 26 bodies (pelvis + 25 DOF), 25 hinges. -->
+<mujoco model="tiangong3">
+  <compiler angle="radian" />
+  <worldbody>
+    <body name="pelvis" pos="0 0 0.9423647" quat="1 0 0 0">
+      <freejoint name="floating_base" />
+      <inertial pos="-0.000924 0.000347 -0.054631" mass="11.528555" fullinertia="0.070798 0.064805 0.050003 -0.00036 -0.001294 9.8e-05" />
+      <body name="hip_pitch_l_link" pos="-0.00010305 0.076815 -0.11847" quat="0.996195 -0.0871543 -5.84587e-05 0.000668198">
+        <inertial pos="0.009185 0.069598 -0.024259" quat="0.850127 0.523369 -0.0526812 -0.0243712" mass="2.37312" diaginertia="0.00506726 0.00389537 0.00347837" />
+        <joint name="hip_pitch_l_joint" pos="0 0 0" axis="0 1 0" range="-3.05433 2.79253" actuatorfrcrange="-235 235" />
+        <body name="hip_roll_l_link" pos="0 0.073992 -0.026966" quat="0.996195 0.0871543 0 0">
+          <inertial pos="-0.001737 -9.9e-05 -0.038553" quat="0.493093 0.509072 0.50841 0.489105" mass="0.539594" diaginertia="0.00168502 0.00140946 0.00104053" />
+          <joint name="hip_roll_l_joint" pos="0 0 0" axis="1 0 0" range="-0.418879 2.61799" actuatorfrcrange="-235 235" />
+          <body name="hip_yaw_l_link" pos="0 0 -0.0785">
+            <inertial pos="0.001492 -0.023508 -0.126309" quat="0.997142 -0.048314 -0.00119644 -0.0580702" mass="5.56215" diaginertia="0.0418929 0.0395442 0.0134839" />
+            <joint name="hip_yaw_l_joint" pos="0 0 0" axis="0 0 1" range="-1.39626 4.45059" actuatorfrcrange="-150 150" />
+            <body name="knee_pitch_l_link" pos="-0.012927 0 -0.30599" quat="0.999958 0 0.00920887 0">
+              <inertial pos="0.024251 0.000717 -0.15523" quat="0.688202 0.0100453 0.0212912 0.725137" mass="2.94534" diaginertia="0.032453 0.0322551 0.00336394" />
+              <joint name="knee_pitch_l_joint" pos="0 0 0" axis="0 1 0" range="-0.0872665 2.53073" actuatorfrcrange="-400 400" />
+              <body name="ankle_pitch_l_link" pos="0.0073681 0 -0.39993">
+                <inertial pos="0 0 0" quat="0 0.707107 0 0.707107" mass="0.142658" diaginertia="4.9e-05 3.2e-05 2.3e-05" />
+                <joint name="ankle_pitch_l_joint" pos="0 0 0" axis="0 1 0" range="-1.18682 0.523599" actuatorfrcrange="-55 55" />
+                <body name="ankle_roll_l_link">
+                  <inertial pos="0.024536 -1.7e-05 -0.033593" quat="0.000973792 0.727447 0.00122134 0.686162" mass="0.888892" diaginertia="0.00514091 0.004839 0.000764092" />
+                  <joint name="ankle_roll_l_joint" pos="0 0 0" axis="1 0 0" range="-0.523599 0.523599" actuatorfrcrange="-55 55" />
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="hip_pitch_r_link" pos="0.00010305 -0.076815 -0.11847" quat="0.996195 0.0871543 5.84587e-05 0.000668198">
+        <inertial pos="0.009185 -0.069598 -0.024259" quat="0.523369 0.850127 0.0243712 0.0526812" mass="2.37312" diaginertia="0.00506726 0.00389537 0.00347837" />
+        <joint name="hip_pitch_r_joint" pos="0 0 0" axis="0 1 0" range="-3.05433 2.79253" actuatorfrcrange="-235 235" />
+        <body name="hip_roll_r_link" pos="0 -0.073992 -0.026966" quat="0.996195 -0.0871543 0 0">
+          <inertial pos="-0.001737 9.9e-05 -0.038553" quat="0.489105 0.50841 0.509072 0.493093" mass="0.539594" diaginertia="0.00168502 0.00140946 0.00104053" />
+          <joint name="hip_roll_r_joint" pos="0 0 0" axis="1 0 0" range="-2.61799 0.418879" actuatorfrcrange="-235 235" />
+          <body name="hip_yaw_r_link" pos="0 0 -0.0785">
+            <inertial pos="0.001492 0.023508 -0.126309" quat="0.997142 0.048314 -0.00119644 0.0580702" mass="5.56215" diaginertia="0.0418929 0.0395442 0.0134839" />
+            <joint name="hip_yaw_r_joint" pos="0 0 0" axis="0 0 1" range="-4.45059 1.39626" actuatorfrcrange="-150 150" />
+            <body name="knee_pitch_r_link" pos="-0.012927 0 -0.30599" quat="0.999835 0 0.018192 0">
+              <inertial pos="0.024251 -0.000717 -0.15523" quat="0.725137 0.0212912 0.0100453 0.688202" mass="2.94534" diaginertia="0.032453 0.0322551 0.00336394" />
+              <joint name="knee_pitch_r_joint" pos="0 0 0" axis="0 1 0" range="-0.0872665 2.53073" actuatorfrcrange="-400 400" />
+              <body name="ankle_pitch_r_link" pos="0.014553 0 -0.39974">
+                <inertial pos="0 0 0" quat="0 0.707107 0 0.707107" mass="0.142658" diaginertia="4.9e-05 3.2e-05 2.3e-05" />
+                <joint name="ankle_pitch_r_joint" pos="0 0 0" axis="0 1 0" range="-1.18682 0.523599" actuatorfrcrange="-55 55" />
+                <body name="ankle_roll_r_link">
+                  <inertial pos="0.024536 1.7e-05 -0.033593" quat="-0.000973792 0.727447 -0.00122134 0.686162" mass="0.888892" diaginertia="0.00514091 0.004839 0.000764092" />
+                  <joint name="ankle_roll_r_joint" pos="0 0 0" axis="1 0 0" range="-0.523599 0.523599" actuatorfrcrange="-55 55" />
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+      <body name="waist_yaw_link" quat="1 0 0 0.00067075">
+        <inertial pos="-0.002204 -0.001068 0.038101" quat="0.608787 -0.063929 -0.10545 0.783691" mass="1.9088" diaginertia="0.00329388 0.00309694 0.00213417" />
+        <joint name="waist_yaw_joint" pos="0 0 0" axis="0 0 1" range="-2.61799 3.22886" actuatorfrcrange="-91 91" />
+        <body name="waist_roll_link" pos="0 0 0.083796">
+          <inertial pos="-0.007616 -0.005361 0.069902" quat="0.496913 0.542577 -0.446994 0.508805" mass="3.99599" diaginertia="0.0166451 0.0163497 0.0089052" />
+          <joint name="waist_roll_joint" pos="0 0 0" axis="1 0 0" range="-0.436332 0.436332" actuatorfrcrange="-150 150" />
+          <body name="waist_pitch_link" pos="0 0 0.078424">
+            <inertial pos="0.00960597 0.00234756 0.17337" quat="0.974897 0.0119067 -0.219479 0.0355392" mass="10.7736" diaginertia="0.193052 0.182336 0.125593" />
+            <joint name="waist_pitch_joint" pos="0 0 0" axis="0 1 0" range="-0.523599 0.872665" actuatorfrcrange="-150 150" />
+            <body name="head_yaw_link" pos="0.00022262 0 0.43727">
+              <inertial pos="0.014806 -0.000947 0.027077" quat="0.43325 0.541781 -0.418042 0.586522" mass="0.968233" diaginertia="0.00250864 0.00194175 0.00166661" />
+              <joint name="head_yaw_joint" pos="0 0 0" axis="0 0 1" range="-1.0472 1.0472" actuatorfrcrange="-6.3 6.3" />
+              <body name="head_pitch_link" pos="0.0689 -5.5575e-05 -0.0008">
+                <inertial pos="0.00518027 0.00913129 -0.00288878" quat="0.646433 0.618741 -0.32446 0.30661" mass="0.187922" diaginertia="0.00019651 0.000190308 5.12471e-05" />
+                <joint name="head_pitch_joint" pos="0 0 0" axis="0 1 0" range="-0.872665 0.261799" actuatorfrcrange="-6.3 6.3" />
+              </body>
+            </body>
+            <body name="shoulder_pitch_l_link" pos="0 0.14552 0.18664" quat="0.999048 0.0436192 0 0">
+              <inertial pos="0.006861 0.060647 -2.7e-05" quat="-0.102177 0.698772 0.102786 0.700509" mass="0.914808" diaginertia="0.001164 0.000926669 0.000748328" />
+              <joint name="shoulder_pitch_l_joint" pos="0 0 0" axis="0 1 0" range="-2.84489 2.84489" actuatorfrcrange="-90 90" />
+              <body name="shoulder_roll_l_link" pos="0 0.0678 0">
+                <inertial pos="-0.000672 0 -0.043313" quat="0.707078 0.00642532 0.00642532 0.707078" mass="0.319153" diaginertia="0.000936 0.000764073 0.000543927" />
+                <joint name="shoulder_roll_l_joint" pos="0 0 0" axis="1 0 0" range="-0.191986 3.33358" actuatorfrcrange="-90 90" />
+                <body name="shoulder_yaw_l_link" pos="0 0 -0.1004">
+                  <inertial pos="0.009141 0.003692 -0.094058" quat="0.996924 0.0324636 -0.0701011 -0.0132387" mass="1.50222" diaginertia="0.00793691 0.00755988 0.00117522" />
+                  <joint name="shoulder_yaw_l_joint" pos="0 0 0" axis="0 0 1" range="-2.84489 2.84489" actuatorfrcrange="-50 50" />
+                  <body name="elbow_pitch_l_link" pos="0.02 0 -0.1596">
+                    <inertial pos="-0.01603 -0.000863 -0.202772" quat="0.923732 -0.0111629 0.0106048 0.38273" mass="0.531558" diaginertia="0.012077 0.0120518 0.000686205" />
+                    <joint name="elbow_pitch_l_joint" pos="0 0 0" axis="0 1 0" range="-2.54818 0.191986" actuatorfrcrange="-50 50" />
+                  </body>
+                </body>
+              </body>
+            </body>
+            <body name="shoulder_pitch_r_link" pos="0 -0.14552 0.18664" quat="0.999048 -0.0436192 0 0">
+              <inertial pos="0.006861 -0.060647 -2.7e-05" quat="0.102177 0.698772 -0.102786 0.700509" mass="0.914808" diaginertia="0.001164 0.000926669 0.000748328" />
+              <joint name="shoulder_pitch_r_joint" pos="0 0 0" axis="0 1 0" range="-2.84489 2.84489" actuatorfrcrange="-90 90" />
+              <body name="shoulder_roll_r_link" pos="0 -0.0678 0">
+                <inertial pos="-0.000672 0 -0.043313" quat="0.707078 0.00642532 0.00642532 0.707078" mass="0.319153" diaginertia="0.000936 0.000764073 0.000543927" />
+                <joint name="shoulder_roll_r_joint" pos="0 0 0" axis="1 0 0" range="-3.33358 0.191986" actuatorfrcrange="-90 90" />
+                <body name="shoulder_yaw_r_link" pos="0 0 -0.1004">
+                  <inertial pos="0.009141 -0.003692 -0.094058" quat="0.996924 -0.0324636 -0.0701011 0.0132387" mass="1.50222" diaginertia="0.00793691 0.00755988 0.00117522" />
+                  <joint name="shoulder_yaw_r_joint" pos="0 0 0" axis="0 0 1" range="-2.84489 2.84489" actuatorfrcrange="-50 50" />
+                  <body name="elbow_pitch_r_link" pos="0.02 0 -0.1596">
+                    <inertial pos="-0.01603 0.000863 -0.202772" quat="0.38273 0.0106048 -0.0111629 0.923732" mass="0.531558" diaginertia="0.012077 0.0120518 0.000686205" />
+                    <joint name="elbow_pitch_r_joint" pos="0 0 0" axis="0 1 0" range="-2.54818 0.191986" actuatorfrcrange="-50 50" />
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
