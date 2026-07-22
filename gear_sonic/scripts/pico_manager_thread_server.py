@@ -809,6 +809,8 @@ class PicoReader:
         self._last_t = None
         self._fps_ema = 0.0
         self._last_stamp_ns = None
+        self._last_frame_monotonic = 0.0
+        self._session_generation = 0
         self._latest = None
         self._lock = threading.Lock()
 
@@ -825,7 +827,7 @@ class PicoReader:
 
     @property
     def disconnected(self) -> bool:
-        return False
+        return self._last_frame_monotonic == 0.0 or time.monotonic() - self._last_frame_monotonic > 0.5
 
     def clear_disconnect(self):
         pass
@@ -844,26 +846,54 @@ class PicoReader:
             stamp_ns = xrt.get_time_stamp_ns()
             prev_stamp_ns = self._last_stamp_ns
             if prev_stamp_ns is not None and stamp_ns == prev_stamp_ns:
-                time.sleep(0.000001)
+                # Avoid busy-spinning between headset frames.  At 90 Hz the
+                # timestamp can legitimately remain unchanged for ~11 ms.
+                time.sleep(0.001)
                 continue
             # Compute device-based dt/fps using timestamp deltas (ns -> s)
             device_dt = ((stamp_ns - prev_stamp_ns) * 1e-9) if prev_stamp_ns is not None else 0.0
+            now_monotonic = time.monotonic()
+            if prev_stamp_ns is not None and (
+                stamp_ns < prev_stamp_ns
+                or device_dt > 0.5
+                or now_monotonic - self._last_frame_monotonic > 0.5
+            ):
+                self._session_generation += 1
+                self._fps_ema = 0.0
+                print(
+                    f"[PicoReader] New tracking session {self._session_generation} "
+                    f"(timestamp discontinuity {device_dt:.3f}s)"
+                )
             if device_dt > 0.0:
                 inst = 1.0 / device_dt
                 self._fps_ema = inst if self._fps_ema == 0.0 else (0.9 * self._fps_ema + 0.1 * inst)
             self._last_stamp_ns = stamp_ns
+            self._last_frame_monotonic = now_monotonic
             t_realtime = time.time()
             t_monotonic = time.monotonic()
             try:
                 body_poses = xrt.get_body_joints_pose()
+                # Capture headset/controllers in the same reader thread as body
+                # data.  These remain read-only preview inputs until their frame
+                # convention has been validated by the operator.
+                device_poses = np.asarray(
+                    [
+                        xrt.get_left_controller_pose(),
+                        xrt.get_right_controller_pose(),
+                        xrt.get_headset_pose(),
+                    ],
+                    dtype=np.float32,
+                )
 
                 sample = {
                     "body_poses_np": np.array(body_poses),
+                    "device_poses_np": device_poses,
                     "timestamp_realtime": t_realtime,
                     "timestamp_monotonic": t_monotonic,
                     "timestamp_ns": stamp_ns,
                     "dt": device_dt,
                     "fps": self._fps_ema,
+                    "session_generation": self._session_generation,
                 }
                 with self._lock:
                     self._latest = sample
@@ -1213,6 +1243,12 @@ class ThreePointPose:
         self._calibration_rwrist_offset = None
         self._calibration_lwrist_rot_offset = None
         self._calibration_rwrist_rot_offset = None
+
+    def invalidate_calibration(self, reason: str) -> None:
+        """Invalidate calibration after an XR tracking-session discontinuity."""
+        self._clear_calibration()
+        self._calibration_pending = False
+        print(f"[{self.log_prefix}] Calibration invalidated: {reason}")
         self._override_robot_q = None
 
     def reset(self) -> None:
@@ -1337,12 +1373,25 @@ class PoseStreamer:
         self.buffer_cleared = True
         self.step = 0
 
-    def run_once(self):
-        """Execute one iteration of the pose streaming loop."""
+    def run_once(self, output_topic: str = "pose"):
+        """Execute one pose iteration and publish it on ``output_topic``.
+
+        ``pose_preview`` is intentionally ignored by the robot controller.  It lets
+        an operator inspect the exact calibrated pose that would be sent after a
+        POSE transition while the controller remains in planner mode.
+        """
         sample = self.reader.get_latest()
 
         if sample is None:
             time.sleep(0.005)
+            return
+
+        # Reject a stale frame before the expensive SciPy/Torch/SMPL and hand
+        # IK work below.  The reader exposes a latest-value snapshot, so the
+        # manager can observe the same sample repeatedly between XRT updates.
+        curr_stamp_ns = int(sample.get("timestamp_ns", 0))
+        if self.prev_stamp_ns is not None and curr_stamp_ns <= self.prev_stamp_ns:
+            time.sleep(0.001)
             return
 
         latest_data = compute_from_body_poses(
@@ -1383,7 +1432,6 @@ class PoseStreamer:
         body_quat_np = (
             latest_data["global_orient_quat"].detach().cpu().numpy()[0].astype(np.float32)
         )
-        curr_stamp_ns = int(sample.get("timestamp_ns", 0))
         step_ns = int(1e9 / max(1, self.target_fps))
         if self.prev_stamp_ns is None:
             self.prev_stamp_ns = curr_stamp_ns
@@ -1391,8 +1439,6 @@ class PoseStreamer:
             self.prev_smpl_joints_np = smpl_joints_np
             self.prev_body_quat_np = body_quat_np
             self.next_target_ns = curr_stamp_ns
-            return
-        if curr_stamp_ns <= self.prev_stamp_ns:
             return
         if self.next_target_ns is None:
             self.next_target_ns = self.prev_stamp_ns + step_ns
@@ -1536,9 +1582,13 @@ class PoseStreamer:
                 "heading_increment": np.array(
                     [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
                 ),
+                "calibrated": np.array([self.three_point.is_calibrated], dtype=bool),
             }
+            device_poses = sample.get("device_poses_np")
+            if device_poses is not None and np.asarray(device_poses).shape == (3, 7):
+                numpy_data["device_poses"] = np.asarray(device_poses, dtype=np.float32)
 
-            packed_message = pack_pose_message(numpy_data, topic="pose")
+            packed_message = pack_pose_message(numpy_data, topic=output_topic)
             self.socket.send(packed_message)
 
             if self.record_dir:
@@ -1777,6 +1827,10 @@ class PlannerStreamer:
             # Avoid sending old commands if XRT timestamp hasn't advanced, in case of headset disconnect
             xrt_timestamp = self.reader.get_timestamp_ns()
             if xrt_timestamp == self.last_xrt_timestamp:
+                sleep_t = self.dt - (time.time() - self.last_send)
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
+                self.last_send = time.time()
                 return
             self.last_xrt_timestamp = xrt_timestamp
 
@@ -1985,12 +2039,24 @@ def run_pico_manager(
     vr3pt_parent_mode = StreamMode.PLANNER
     prev_toggle_dc = False
     prev_toggle_da = False
+    manager_state_period = 1.0 / 20.0
+    next_manager_state_time = 0.0
+    # PUB/SUB has no retained messages. Repeat the active command state at a
+    # low rate so a late SONIC subscriber or a dropped transition message can
+    # recover without another physical button gesture.
+    command_heartbeat_period = 0.5
+    next_command_heartbeat_time = 0.0
+    pending_stop_repeats = 0
+    next_stop_repeat_time = 0.0
+    last_session_generation = None
+    idle_period = 1.0 / max(1, target_fps)
     try:
         prev_ax_pressed = False
         prev_by_pressed = False
         prev_start_combo = False
         prev_left_axis_click = False
         while True:
+            loop_started = time.monotonic()
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
 
@@ -2008,7 +2074,24 @@ def run_pico_manager(
             start_combo = (a_pressed) and (b_pressed) and (x_pressed) and (y_pressed)
 
             new_mode = current_mode
-            if current_mode == StreamMode.OFF:
+            sample = reader.get_latest()
+            session_generation = (
+                int(sample.get("session_generation", 0)) if sample is not None else None
+            )
+            session_changed = False
+            if session_generation is not None:
+                if last_session_generation is None:
+                    last_session_generation = session_generation
+                elif session_generation != last_session_generation:
+                    last_session_generation = session_generation
+                    session_changed = True
+                    three_point.invalidate_calibration("Pico tracking session changed")
+                    pose_streamer.on_mode_exit()
+                    print("[Manager] Tracking session changed; forcing safe OFF")
+
+            if session_changed:
+                new_mode = StreamMode.OFF
+            elif current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
                     new_mode = StreamMode.PLANNER
                     # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
@@ -2097,20 +2180,32 @@ def run_pico_manager(
                     planner_streamer.recalibrate_for_vr3pt()
 
             # Run one iteration of the new mode
-            if new_mode == StreamMode.POSE:
+            if new_mode == StreamMode.OFF:
+                # Read-only raw preview before calibration. This gives the
+                # operator a chance to verify that full-body tracking is live
+                # before the start/calibration gesture.
+                pose_streamer.run_once(output_topic="pose_preview")
+            elif new_mode == StreamMode.POSE:
                 pose_streamer.run_once()
             elif (
                 new_mode == StreamMode.PLANNER
                 or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
                 or new_mode == StreamMode.PLANNER_VR_3PT
             ):
+                # Publish the same calibrated pose payload on a non-command topic
+                # for the read-only web safety preview. The C++ controller only
+                # subscribes to ``pose``, so this cannot select pose control.
+                pose_streamer.run_once(output_topic="pose_preview")
                 planner_streamer.run_once(new_mode)
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
-                    exit()
+                    pending_stop_repeats = 4
+                    next_stop_repeat_time = time.monotonic() + 0.1
+                    three_point.invalidate_calibration("manager entered OFF")
+                    pose_streamer.on_mode_exit()
                 elif (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
@@ -2130,21 +2225,41 @@ def run_pico_manager(
             toggle_da = toggle_da_tmp and not prev_toggle_da
             prev_toggle_dc = toggle_dc_tmp
             prev_toggle_da = toggle_da_tmp
-            socket.send(
-                pack_pose_message(
-                    {
-                        "stream_mode": np.array([current_mode.value], dtype=np.int32),
-                        "toggle_data_collection": np.array([toggle_dc], dtype=bool),
-                        "toggle_data_abort": np.array([toggle_da], dtype=bool),
-                    },
-                    topic="manager_state",
+            now_monotonic = time.monotonic()
+            if pending_stop_repeats > 0 and now_monotonic >= next_stop_repeat_time:
+                socket.send(build_command_message(start=False, stop=True, planner=True))
+                pending_stop_repeats -= 1
+                next_stop_repeat_time = now_monotonic + 0.1
+            if current_mode != StreamMode.OFF and now_monotonic >= next_command_heartbeat_time:
+                planner_selected = current_mode not in (StreamMode.POSE, StreamMode.POSE_PAUSE)
+                socket.send(
+                    build_command_message(start=True, stop=False, planner=planner_selected)
                 )
-            )
+                next_command_heartbeat_time = now_monotonic + command_heartbeat_period
+            if toggle_dc or toggle_da or now_monotonic >= next_manager_state_time:
+                socket.send(
+                    pack_pose_message(
+                        {
+                            "stream_mode": np.array([current_mode.value], dtype=np.int32),
+                            "toggle_data_collection": np.array([toggle_dc], dtype=bool),
+                            "toggle_data_abort": np.array([toggle_da], dtype=bool),
+                        },
+                        topic="manager_state",
+                    )
+                )
+                next_manager_state_time = now_monotonic + manager_state_period
 
             prev_ax_pressed = ax_pressed
             prev_by_pressed = by_pressed
             prev_start_combo = start_combo
             prev_left_axis_click = left_axis_click
+
+            # POSE_PAUSE does not call a streamer, so pace its input polling
+            # here. Other modes are paced by their streamer.
+            if current_mode == StreamMode.POSE_PAUSE:
+                sleep_t = idle_period - (time.monotonic() - loop_started)
+                if sleep_t > 0:
+                    time.sleep(sleep_t)
 
     except KeyboardInterrupt:
         print("\nStopping manager...")

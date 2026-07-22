@@ -96,7 +96,9 @@ class PicoReader:
                         self.STALE_TIMEOUT,
                     )
                     self._disconnected.set()
-                time.sleep(0.000001)
+                # Avoid busy-spinning between headset frames. At 90 Hz the
+                # timestamp can legitimately remain unchanged for ~11 ms.
+                time.sleep(0.001)
                 continue
 
             self._last_new_data_time = time.monotonic()
@@ -489,5 +491,4 @@ class IsaacTeleopReader:
                 last_report = now
 
             time.sleep(self._period)
-
 
