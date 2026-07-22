@@ -162,19 +162,49 @@ manager_env:
         asset:
           assetFileName: "tiangong2dex.xml"
 
-# !!! OPEN VERIFICATION ITEM (not fixed here — needs cluster) !!!
-# The SMPL encoder consumes observation term `joint_pos_multi_future_wrist_for_smpl`,
-# whose default `joints_idx: [23, 24, 25, 26, 27, 28]` hardcodes G1's 6 wrist DOFs
-# (config/manager_env/observations/terms/joint_pos_multi_future_wrist_for_smpl.yaml).
-# sonic_h2.yaml does NOT override it, so it is inherited here too and is WRONG for
-# TienKung's DOF layout. TienKung's distal-arm DOFs (elbow_yaw + wrist_pitch +
-# wrist_roll, both sides) sit at MuJoCo-DOF indices {21,22,23, 28,29,30}
-# (elbow_yaw_l=21, wrist_pitch_l=22, wrist_roll_l=23, elbow_yaw_r=28,
-#  wrist_pitch_r=29, wrist_roll_r=30). Whether this term indexes MuJoCo or IsaacLab
-# DOF order, and the exact 6 joints / their order, must be confirmed on the cluster
-# before enabling the SMPL encoder. Add the override under
-# manager_env.observations.<...>.joint_pos_multi_future_wrist_for_smpl.params.joints_idx
-# once verified.
+  # --- SMPL wrist joints_idx override (fix #7) -----------------------------
+  # The SMPL encoder consumes obs term `joint_pos_multi_future_wrist_for_smpl`
+  # (composed via the unitoken_all_noz tokenizer group). Its consumer
+  # `joint_pos_multi_future_select_joints_for_smpl` (mdp/observations.py ~L1567)
+  # indexes the LAST axis of command.joint_pos_multi_future_for_smpl, i.e. the
+  # robot joint-position vector in ISAACLAB DOF order (the motion lib reindexes
+  # MuJoCo -> IsaacLab at load: motion_lib_base.py ~L1599-1601). So joints_idx is
+  # in IsaacLab DOF order, NOT MuJoCo order.
+  #
+  # The shared term default `joints_idx: [23, 24, 25, 26, 27, 28]` is G1's six
+  # wrist DOFs and is CORRECT for G1 / H2 -- do NOT change the shared term file
+  # (terms/joint_pos_multi_future_wrist_for_smpl.yaml); override per-robot here.
+  # On TienKung those same indices resolve to elbow_pitch_l/r + elbow_yaw_l/r +
+  # wrist_pitch_l/r (two elbow-pitch joints, and MISSING both wrist_roll) -- wrong.
+  #
+  # TienKung IsaacLab DOF-order tail (DOF i = TIANGONG2DEX_ISAACLAB_JOINTS[i+1],
+  # robots/tiangong2dex.py L66-99; pelvis is the root at body 0):
+  #   23 = elbow_pitch_l   24 = elbow_pitch_r
+  #   25 = elbow_yaw_l     26 = elbow_yaw_r
+  #   27 = wrist_pitch_l   28 = wrist_pitch_r
+  #   29 = wrist_roll_l    30 = wrist_roll_r
+  #
+  # Chosen semantic: elbow_yaw + wrist_pitch + wrist_roll, both sides =
+  # [25, 26, 27, 28, 29, 30]. Rationale: G1's three wrist DOFs are the three
+  # distal DOFs that orient the hand; TienKung places forearm pronation/
+  # supination at elbow_yaw (there is no wrist_yaw), so the functional analog of
+  # G1's wrist triplet is elbow_yaw + wrist_pitch + wrist_roll. This also keeps
+  # the 6-element count, so the SMPL-encoder input width matches the G1 baseline.
+  #
+  # NOTE: the previous advisory comment here proposed {21,22,23,28,29,30}. Those
+  # are MuJoCo-DOF indices -- the WRONG index space for this field (it indexes the
+  # already-reindexed IsaacLab-order vector), so that proposal was invalid.
+  #
+  # NOTE (no functional change needed now): the SOMA obs group's twin term
+  # `joint_pos_multi_future_wrist_for_soma.yaml` carries the same G1 indices
+  # [23..28]. TienKung uses the non-SOMA tokenizer (unitoken_all_noz), so that
+  # term is NOT composed here; if a SOMA obs group is ever enabled for
+  # tiangong2dex it needs the identical [25,26,27,28,29,30] override.
+  observations:
+    tokenizer:
+      joint_pos_multi_future_wrist_for_smpl:
+        params:
+          joints_idx: [25, 26, 27, 28, 29, 30]
 
 algo:
   config:
