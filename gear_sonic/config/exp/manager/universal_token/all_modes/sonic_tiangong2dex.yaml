@@ -95,11 +95,26 @@ manager_env:
       # anchor_body default "pelvis" is valid on TienKung (kept).
       # vr_3point_body default: [left_wrist_yaw_link, right_wrist_yaw_link, torso_link]
       vr_3point_body: ["wrist_roll_l_link", "wrist_roll_r_link", "waist_pitch_link"]
-      # NOTE: vr_3point_body_offset / reward_point_body_offset below are kept from
-      # the G1/H2 template. They are offsets in each body's LOCAL frame (hand
-      # forward, chest up). TienKung link frames are oriented differently, so
-      # these offsets are UNVERIFIED and likely need recomputation once the URDF
-      # is loaded in Isaac Lab. TODO(cluster).
+      # vr_3point_body_offset: offsets in each body's LOCAL frame, applied via
+      # quat_apply(body_quat_w, offset) (commands.py ~L2264). Rows match the
+      # vr_3point_body order above: [L hand, R hand, head/HMD].
+      # DERIVED 2026-07-22 from zero-pose forward kinematics of the vendored
+      # URDFs to reproduce the G1 baseline SEMANTICS on TienKung link frames
+      # (script: gear_sonic/data_process/tools/frame_offset_derivation.py).
+      #   G1 baseline was [[0.18,-0.025,0],[0.18,0.025,0]] (hands) + [0,0,0.35]
+      #   (torso->HMD). G1's wrist local +x = toward the hand because its zero
+      #   pose holds the forearm ~horizontal; 0.18 m lands just past G1's middle
+      #   fingertip (grasp/controller point). TienKung's zero pose hangs the arms
+      #   straight DOWN, so the wrist->hand axis is wrist_roll LOCAL -z (verified:
+      #   wrist_roll_{l,r}_link -> {left,right}_tcp_link is exactly local -z).
+      #   0.18 m along -z reaches the fingertip/grasp region (tcp is 0.045 m out +
+      #   ~0.13 m dexterous hand ~= 0.18 m), with -/+0.025 m lateral toward the
+      #   body midline (local -/+y, same sign convention as G1). Head row: put the
+      #   HMD at the robot's head camera — waist_pitch LOCAL +z is world-up and
+      #   camera_head_link sits 0.436 m above waist_pitch (cross-check: G1 0.35 *
+      #   spawn-height ratio 0.97/0.74 = 0.459 m). Sanity (pelvis spawn z=0.97):
+      #   hand points land at world z~0.63 m (hanging), HMD at world z~1.57 m.
+      vr_3point_body_offset: [[0.0, -0.025, -0.178], [0.0, 0.025, -0.178], [0.0, 0.0, 0.436]]
       # 14 tracked bodies (remap of the default G1/Unitree list):
       body_names: [
           "pelvis",
@@ -118,7 +133,16 @@ manager_env:
           "wrist_roll_r_link",
         ]
       reward_point_body: ["waist_pitch_link", "wrist_roll_l_link", "wrist_roll_r_link"]
-      reward_point_body_offset: [[0.0, 0.0, 0.5], [0.0, -0.0, 0.0], [0.0, -0.0, 0.0]]
+      # reward_point_body_offset: LOCAL-frame offsets, rows match reward_point_body
+      # order [waist (upper-body pt), L wrist, R wrist]. DERIVED 2026-07-22 via
+      # zero-pose FK (frame_offset_derivation.py). The inherited H2 template value
+      # [0,0,0.5] above H2's torso_link actually lands at H2's head/neck (0.90 of
+      # the H2 torso->head_yaw rise of 0.554 m), NOT the chest. Reproduced on
+      # TienKung by applying the same 0.90 fraction to waist_pitch->head_yaw
+      # (0.436 m) => 0.394 m up (waist_pitch LOCAL +z = world-up). Wrist rows kept
+      # at zero, as inherited. Sanity (pelvis spawn z=0.97): upper-body point
+      # lands at world z~1.53 m (near head/neck), matching the H2 semantic.
+      reward_point_body_offset: [[0.0, 0.0, 0.394], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
       num_future_frames: 10
       dt_future_ref_frames: 0.1
       smpl_num_future_frames: 10
