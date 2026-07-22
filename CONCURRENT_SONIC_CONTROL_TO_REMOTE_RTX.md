@@ -56,7 +56,7 @@ are the first supported concurrent configuration.
 
 ### Deferred
 
-- Supporting more than seven balancing robots at RTF 0.10 or more than four at
+- Supporting more than eight balancing robots at RTF 0.10 or more than four at
   RTF 0.15.
 - Twelve- or sixteen-controller balance claims; the 24-process check measured
   startup capacity only.
@@ -98,7 +98,8 @@ Measurements and live inspection on 2026-07-21:
 | First unreliable count at RTF 0.15 | five; one clean-repeat fall at 14.06 s |
 | Seven SONIC at RTF 0.10 | about 0.43 CPU cores total, 3.72 GiB RSS, 168 threads |
 | Seven-env 60 s free IDLE result | all success; 0.09 m displacement; 1.8–2.2° final tilt |
-| First failing count at RTF 0.10 | eight; two falls by 10.50 s |
+| Eight SONIC at RTF 0.10, compressed SSH | all success for 60.02 s; 0.09 m displacement; 1.8–2.2° tilt |
+| Uncompressed eight-robot result | intermittent failure at 10.50 s and 36.84 s |
 
 The two-robot path was brought up on 2026-07-21. The live RTX stack has one
 two-environment Isaac process, one in-process multi-robot DDS manager, one
@@ -117,9 +118,11 @@ count. Six was intermittent, seven and eight failed repeatedly, and a pinned
 process initialized. See the measured table in `RTX_SIM_GUIDE.md` rather than
 inferring capacity from process startup alone.
 
-Repeating the upper boundary at RTF 0.10 raised the verified limit to seven.
-All seven completed 60.02 simulated seconds with clean station-keeping; eight
-failed at 10.50 seconds despite healthy near-100 Hz state feeds.
+Repeating the upper boundary at RTF 0.10 first exposed shared-tunnel queueing:
+eight failed at 10.50 s and 36.84 s without SSH compression. Direct pod traffic
+remained 99.6/50.0 Hz while Spark saw 63.1–63.5/29.8–30.0 Hz state/command.
+Enabling SSH compression restored 97.5–97.7/49.0–49.4 Hz, and all eight then
+completed 60.02 simulated seconds with clean station-keeping.
 
 Before multiple controllers:
 
@@ -386,7 +389,7 @@ transport interruption.
 - [ ] Add small checked-in launch/status/stop scripts after manual success.
 - [x] Repeat the 60-second IDLE acceptance run with `SIM_ROBOT_COUNT=4` at RTF 0.15.
 - [x] Bracket the balance limit: four passes; five is unreliable; six through eight fail or are intermittent.
-- [x] Repeat at RTF 0.10: seven passes 60.02 s; eight fails at 10.50 s.
+- [x] Repeat at RTF 0.10: eight passes 60.02 s with compressed SSH.
 - [x] Verify all 24 pinned controllers initialize, then stop because timing is not operational.
 
 Acceptance result: four robots reached 60.02 simulated seconds concurrently at
@@ -436,7 +439,7 @@ Stop increasing concurrency if:
 - GPU or host memory exceeds 80%;
 - the known-good single-robot test stops reproducing.
 
-Do not promote counts above four at RTF 0.15 or above seven at RTF 0.10 as
+Do not promote counts above four at RTF 0.15 or above eight at RTF 0.10 as
 supported without a new full 60-second balance pass. The current 24-process
 result proves initialization only and is explicitly not a control-capacity
 result.
@@ -509,23 +512,32 @@ path works. Validated shell launchers are sufficient for the MVP.
 
 ## 11. Current status and next action
 
-The concurrent body-control path is live with seven pairs at RTF 0.10:
+The concurrent body-control path is live with eight pairs at supervised RTF
+0.20 using the compressed tunnel:
 
-- RTX: one Isaac process with seven environments, one bridge, one camera
+- RTX: one Isaac process with eight environments, one bridge, one camera
   publisher, and no separate IMU adapter;
-- Spark: seven SONIC processes, one bridge, and one autossh tunnel;
-- all seven state feeds measured 99.7–99.8 Hz in the post-run probe;
-- Isaac held RTF 0.100 and the seven controllers used 3.72 GiB aggregate RSS;
-- all seven completed 60.02 simulated seconds with 0.09 m displacement, no
-  fall, and final tilt of 1.8–2.2°;
-- eight is the first failing count at RTF 0.10, with two falls by 10.50 s;
-- four remains the verified RTF 0.15 limit, with five the first unreliable count;
+- Spark: eight SONIC processes, one bridge, and one compressed autossh tunnel;
+- all eight completed 60.02 simulated seconds at RTF 0.10, 0.125, 0.15, 0.175,
+  and 0.20 with matched controller timing;
+- the RTF 0.20 qualification ended with 0.09 m displacement and 1.8–2.2° tilt
+  for all eight;
+- without compression, eight was intermittent and failed at 10.50 s and 36.84 s;
+- a later RTF 0.20 run stayed upright for 492.3 simulated seconds before a
+  synchronized state-delivery discontinuity toppled all eight; Isaac did not
+  slow down;
+- paired Spark/RTX compact monitors and a post-success continuous evaluator now
+  preserve the timing needed to localize future shared failures;
+- live IDLE targets can be changed without restarts, but the wide eight-pose
+  screen (`pitch=-6..+6`, `leg_blend=0..1`) eventually lost every robot between
+  evaluator times 112.84 and 276.20 s; transport stalls confounded that run, so
+  those targets are visualization examples rather than accepted hold poses;
 - 24 controllers can initialize, but their 24–26 Hz state delivery and RTF loss
   make that count unsuitable for control.
 
-The bridge and controllers recover when the tunnel returns, but the discarded
-five-robot run demonstrated that actively balancing robots still fall during a
-multi-second WAN outage. Next, run the mixed IDLE/WALK, selective reset, and
-one-controller restart checks at the intended operating count. Do not add
-sidecars, more bridges, or a manifest framework before those tests expose a
-concrete need.
+The bridge and controllers recover when the tunnel returns. A complete sim-stack
+restart with all eight controllers left running caused every controller to enter
+feed-loss damping and then soft-rearm after LowState returned, without restarting
+SONIC. Active balance still cannot be guaranteed through a long shared outage.
+Next, use the paired monitor evidence before changing transport architecture,
+and run the remaining mixed IDLE/WALK and selective-reset checks at eight robots.

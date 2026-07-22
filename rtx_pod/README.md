@@ -25,9 +25,11 @@ version-controlled and reviewable.
 | `secondary_imu_adapter.py` | Mirrors `rt/lowstate.imu_state` → `rt/secondary_imu` (the deploy requires it). |
 | `gear_sonic_camera_pub.py` | Publishes sim cameras on ZMQ `:5555` in the Orin wire format (keys `ego_view`/`left_wrist`/`right_wrist`). |
 | `zenoh-sim-bridge.json5` | Pod zenoh-bridge-dds config (domain 1, listen `:7447`). |
-| `fire_reset.py` | Publish `rt/reset_pose/cmd` (domain 1): cat-2 teleport-upright+release, cat-3 release-in-place, cat-4 re-arm hold. |
+| `fire_reset.py` | Publish one lifecycle command: cat-2/cat-4 re-arm and cat-3 release. Its expanded DDS participant range also works when eight controllers occupy the SDK's default range. |
+| `set_idle_reference.py` | Atomically change one running namespaced SONIC controller's stationary-IDLE target: `ROBOT_ID PITCH_DEG LEG_BLEND`. |
+| `g1_concurrent_diag.py` | One-participant multi-robot lifecycle, probe, evaluator, and compact long-run monitor. `monitor` records LowState/LowCmd arrival gaps, DDS tick deltas, IMU tilt, and late falls; run it on both Spark (domain 0/`lo`) and RTX (domain 1/`eth0`) to localize transport failures. |
 | `g1_dds_diag.py` | Balance-stack DDS diagnostics CLI over `rt/lowstate`/`rt/lowcmd`/`rt/eval`. Subcommands: `watch` (live tilt/knee/\|gyro\| stand check), `eval` (print the in-sim balance eval stream — termination + result score), `capture` (29-joint measured+commanded + IMU → CSV), `probe` (lowstate inter-arrival gaps, diagnoses 'Lost LowState'), `warm` (hold the zenoh↔DDS route warm). `--domain 0` = Spark/deploy side, `1` = pod sim. |
-| `unitree_sim_isaaclab/tools/stand_eval.py` | **Deterministic in-sim balance eval** → publishes `rt/eval` (std_msgs/String JSON). `termination` 0→1 (1 = a full 60 s sim-time stand = success, or a fall) and `result` −100…100 (100 = perfect upright at start; penalties for distance-from-start [≥2 m ⇒ −99], squat, and out-of-band joints; −100 = fall). Runs inside the sim loop (needs world pose + sim-time, absent from `rt/lowstate`); armed on hold-release, disarmed on cat-4 re-arm. Env-tunable (`EVAL_WINDOW_S`, `EVAL_DIST_MAX_M`, `EVAL_FALL_TILT_DEG`, …); disable with `EVAL=0`. |
+| `unitree_sim_isaaclab/tools/stand_eval.py` | **Deterministic in-sim balance eval** → publishes `rt/eval` (std_msgs/String JSON). `termination` ramps 0→1 over the 60 s qualification, but pose monitoring continues afterward so a late fall replaces success with a latched failure. `result` spans −100…100 (100 = perfect upright at start; −100 = fall). Armed on hold-release and disarmed on cat-4 re-arm; env-tunable (`EVAL_WINDOW_S`, `EVAL_DIST_MAX_M`, `EVAL_FALL_TILT_DEG`, …). |
 
 ## Our edits to the vendored `unitree_sim_isaaclab/` → same relative path on the pod
 
@@ -39,7 +41,7 @@ version-controlled and reviewable.
 | `tasks/common_observations/g1_29dof_state.py` | Main `rt/lowstate.imu_state` = PELVIS IMU (`use_torso_imu=False`), matching MuJoCo/training. |
 | `dds/g1_robot_dds.py` | IMU quaternion order `[w,x,y,z]` to match the real Unitree LowState. |
 | `dds/g1_joint_mapping.py` | Single 29-joint Unitree ordering contract plus name-based Isaac↔Unitree gather/scatter helpers. |
-| `sim_main.py` | (a) Hooks for `tools/stand_eval.py`: instantiate `StandEval` before the loop (`EVAL=1`), `arm()` on hold-release (cat-2/cat-3), `disarm()` on re-arm (cat-4), `update()` each control step. (b) File-triggered external-force disturbance for eval testing: `echo "fx fy fz [dur_s]" > $SIM_PUSH_FILE` (default `/tmp/sim_push`) applies a one-shot global wrench on the pelvis (e.g. `0 0 -900 0.6` = a downward shove to force a fall); fires once per distinct content, only while the base-hold is released. |
+| `sim_main.py` | (a) Hooks for `tools/stand_eval.py`: instantiate `StandEval` before the loop (`EVAL=1`), `arm()` on hold-release (cat-2/cat-3), `disarm()` on re-arm (cat-4), `update()` each control step. (b) File-triggered external-force disturbance for eval testing: `echo "fx fy fz [dur_s]" > $SIM_PUSH_FILE` (default `/tmp/sim_push`) applies a one-shot global wrench on the pelvis. (c) Multi-env reset/hold poses add Isaac's environment origins rather than stacking every robot at world zero, and the WebRTC viewport frames the complete grid. |
 
 > **`rt/eval` must be in BOTH zenoh allow-lists** to reach the Spark: the pod
 > `zenoh-sim-bridge.json5` (domain 1) **and** the Spark-side `zenoh-spark-config.json5`

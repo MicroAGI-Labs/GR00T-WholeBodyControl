@@ -28,13 +28,14 @@ The core design principle:
 ```
 
 The pick/place stack can run near real time, but remote SONIC balance is
-latency-limited. **RTF 0.1 is the recommended clean operating point** with the
-current SSH route and is verified for **seven concurrent robots**. **RTF 0.15 is
-verified for four concurrent robots** and is the recommended higher-throughput
-point when that reduced latency margin is acceptable. A two-robot sweep
-completed 60.02 simulated seconds without a fall at RTF 0.20, but with
-substantial translation in one repeat; both robots fell near 29 seconds at RTF
-0.225. See [`RTX_SIM_LATENCY.md`](RTX_SIM_LATENCY.md) and **§7 Gotchas**.
+latency-limited. With the compressed SSH tunnel, **eight concurrent robots have
+completed 60.02 simulated seconds through RTF 0.20**. Use RTF 0.20 for supervised
+throughput runs and 0.175 when more transport margin matters. A later RTF 0.20
+run stayed upright for 492.3 simulated seconds before all eight failed together
+during a shared state-delivery discontinuity; Isaac held RTF 0.198 throughout,
+so that incident is not evidence of simulator slowdown. At RTF 0.225, two robots
+fell near 29 seconds. See [`RTX_SIM_LATENCY.md`](RTX_SIM_LATENCY.md) and **§7
+Gotchas**.
 
 ---
 
@@ -423,6 +424,62 @@ Wait for `Init Done` in both sessions. Send `]`, then Enter, then `1` to each,
 waiting for planner initialization between keys. Re-arm and release each robot
 through its own lifecycle topic:
 
+Namespaced launches also enable a per-instance live IDLE reference file at
+`/tmp/sonic_idle_reference_<id>.txt`. Change a running controller without a
+restart using:
+
+```bash
+# pitch trim in degrees [-20,20], leg blend [0,1]
+# 0 = measured handoff legs; 1 = SONIC native default leg angles
+python3 rtx_pod/set_idle_reference.py 0 -4 0.25
+python3 rtx_pod/set_idle_reference.py 1  4 0.50
+```
+
+The controller polls the file every 500 ms and slews the new values onto its
+frozen measured-pose reference. It only edits an active stationary-IDLE clip;
+WALK and other planner motions are not modified. Writes are atomic, malformed
+files retain the last valid target, pitch is clamped to ±20°, and leg blend to
+`0..1`. Set `SONIC_IDLE_REFERENCE_FILE` explicitly to use a different path.
+
+For a visually distinct eight-robot comparison while preserving one-variable
+interpretability, use:
+
+```bash
+python3 rtx_pod/set_idle_reference.py 0 -6 0
+python3 rtx_pod/set_idle_reference.py 1 -3 0
+python3 rtx_pod/set_idle_reference.py 2  0 0
+python3 rtx_pod/set_idle_reference.py 3  3 0
+python3 rtx_pod/set_idle_reference.py 4  6 0
+python3 rtx_pod/set_idle_reference.py 5  0 0.35
+python3 rtx_pod/set_idle_reference.py 6  0 0.70
+python3 rtx_pod/set_idle_reference.py 7  0 1.0
+```
+
+In the short 2026-07-22 visual screen all eight initially remained upright after
+the slew. Pelvis heights spanned 0.661–0.729 m and measured base tilt spanned
+1.1–10.9°. The long monitor then showed that this matrix is **not a qualified
+hold set**:
+
+| Robot | Target `(pitch°, leg blend)` | Fall time since release (sim s) |
+|---:|---:|---:|
+| 7 | `(0, 1.00)` | 112.84 |
+| 6 | `(0, 0.70)` | 115.80 |
+| 4 | `(+6, 0)` | 117.94 |
+| 3 | `(+3, 0)` | 198.64 |
+| 2 | `(0, 0)` | 199.50 |
+| 0 | `(-6, 0)` | 209.30 |
+| 5 | `(0, 0.35)` | 275.96 |
+| 1 | `(-3, 0)` | 276.20 |
+
+The targets were introduced late in the run, after the baseline had already
+passed its 60-second qualification, so these are not exposure durations. The
+ordering suggests the full native-leg blends and largest positive pitch consumed
+balance margin first, but the trial is confounded by transport disturbances: a
+shared 0.58–0.61 s RTX state-publication pause preceded robots 6/4, roughly 1 s
+RTX command gaps preceded robots 3/2, and a 27.5 s command-delivery gap surrounded
+the final pair. Use the matrix for supervised visualization only; reset to
+`(0,0)` and requalify before treating any target as stable.
+
 ```bash
 cd "$ROOT"
 for i in 0 1; do
@@ -474,12 +531,12 @@ validation:
 | 0.30 | 4.22 s | One fell at 3.42 s |
 | 0.333 | 14–22 s | Intermittent: one fall at 14.48 s; repeat survived 21.5 s with degraded control |
 
-For this architecture, the measured long-horizon failure onset is bracketed to
-**RTF 0.20–0.225**. RTF 0.20 is the highest demonstrated 60-second no-fall
-setting, but it is not consistently stationary. Keep **RTF 0.10** as the normal
-operating point; use 0.20 only for supervised throughput experiments. Do not
-infer stability from an 18–20 second screen: the RTF 0.225 and 0.25 failures
-occurred just after or well beyond that window.
+For this two-robot sweep, the measured long-horizon failure onset is bracketed
+to **RTF 0.20–0.225**. RTF 0.20 was the highest demonstrated 60-second no-fall
+setting, but it was not consistently stationary. The later compressed
+eight-robot sweep also passed RTF 0.20 and made it the current supervised point;
+use 0.175 for extra margin. Do not infer stability from an 18–20 second screen:
+the RTF 0.225 and 0.25 failures occurred just after or well beyond that window.
 
 #### RTF 0.15 concurrency sweep (2026-07-21)
 
@@ -521,7 +578,31 @@ python3 rtx_pod/g1_concurrent_diag.py --count 4 lifecycle 4 --delay 2
 python3 rtx_pod/g1_concurrent_diag.py --count 4 lifecycle 3 --delay 1
 python3 rtx_pod/g1_concurrent_diag.py --count 4 eval \
   --sim-seconds 60 --wall-timeout 460 --interval 10
+
+# Leave this running for long-duration failure attribution. It writes one compact
+# snapshot every 5 s plus state/command gaps >=150 ms and the first fall transition.
+tmux new-session -d -s sonic_monitor \
+  "cd $ROOT && exec python3 rtx_pod/g1_concurrent_diag.py --count 8 monitor \
+   --interval 5 --gap-ms 150 --out /tmp/g1_concurrent_monitor.jsonl"
+
+# Run the same observer inside the RTX pod, after copying the helper into
+# ~/live-sim. Domain 1 / eth0 is the simulator side of the bridge.
+tmux new-session -d -s g1_monitor_rtx \
+  "cd ~/live-sim && exec venv/bin/python g1_concurrent_diag.py --count 8 \
+   --domain 1 --interface eth0 monitor --interval 5 --gap-ms 150 \
+   --out /tmp/g1_concurrent_monitor_rtx.jsonl"
 ```
+
+The in-sim evaluator continues checking pose after the 60-s qualification
+boundary. `termination=1`/`passed=true` means the qualification window was
+completed; it is not a terminal snapshot. A later fall replaces it with a
+latched `fallen=true` result. The monitor independently derives tilt from each
+LowState IMU, records DDS tick deltas across state gaps, and watches LowCmd in
+the reverse direction. Comparing the Spark and RTX logs localizes a gap: clean
+RTX state plus missing Spark state is the return transport path; clean Spark
+commands plus missing RTX commands is the outbound path; matching RTX state
+and RTF degradation points at Isaac. Do not use the full IDLE telemetry CSV for
+unattended monitoring: eight instances produce tens of gigabytes per day.
 
 An autossh interruption is a shared failure domain. During the discarded
 five-robot run, the SSH child exited and restarted, all five controllers entered
@@ -531,23 +612,67 @@ that an actively balancing robot can survive a multi-second WAN outage.
 
 #### RTF 0.10 concurrency follow-up (2026-07-21)
 
-Reducing RTF from 0.15 to 0.10 raises the verified count from four to **seven**:
+Reducing RTF from 0.15 to 0.10 and compressing the shared tunnel raises the
+verified count from four to **eight**:
 
 | Count | Outcome at RTF 0.10 |
 |---:|---|
 | **7** | **PASS, 60.02 s:** all seven at 0.09 m displacement, 1.8–2.2° tilt, 0.683–0.684 m pelvis height |
-| **8** | **FAIL at 10.50 s:** two fallen and several other robots already degraded |
+| 8, uncompressed SSH | Intermittent FAIL: 10.50 s in one repeat and 36.84 s in the instrumented repeat |
+| **8, compressed SSH** | **PASS, 60.02 s:** all eight at 0.09 m displacement, 1.8–2.2° tilt, 0.680–0.685 m pelvis height |
 
-The accepted seven-robot run held RTF 0.100. Its state feeds averaged
-99.7–99.8 Hz; an eight-second post-run probe saw 141–210 ms maximum gaps, but no
-controller crossed the one-second feed-loss threshold or entered recovery. The
-seven Spark processes used 3.72 GiB aggregate RSS, about 42.5% of one CPU core
-averaged over their lifetimes, and 168 threads. This is a control-margin limit,
-not a memory limit: eight had healthy state rates but still lost balance.
+The instrumented uncompressed eight-robot run proved the loss was in the shared
+transport rather than Isaac or SONIC compute. Pod-side state/command remained at
+99.6/50.0 Hz, but Spark received only 63.1–63.5/29.8–30.0 Hz; command p99 gaps
+were 142–150 ms and maxima reached 0.70 s. Spark GPU utilization was 4% and
+policy inference normally took 0.4–0.6 ms.
 
-Use **seven at RTF 0.10** when robot count matters most. Use **four at RTF 0.15**
-when the 50% faster simulation is more valuable. Counts above those boundaries
-need a new full-duration pass before being treated as supported.
+`sim_tunnel.sh` now enables SSH compression by default. With it, Spark measured
+97.5–97.7 Hz state and 49.0–49.4 Hz commands after the passing run; command p99
+was 39–46 ms. The highly repetitive payload compressed from 14.25 to 0.79
+Mbit/s in the state direction and from 3.34 to 0.24 Mbit/s in the command
+direction in a 10 s sample. Use `SSH_COMPRESSION=no ./sim_tunnel.sh` only to
+reproduce the old bottleneck.
+
+That count sweep predated SSH compression. The compressed-tunnel follow-up kept
+all eight robots and increased RTF with matched `CONTROL_WALL_SCALE`:
+
+| RTF | Eight-robot compressed-tunnel result |
+|---:|---|
+| 0.125 | PASS 60.02 s; 0.09 m displacement, 1.8–2.2° tilt |
+| 0.15 | PASS 60.02 s; 0.09 m displacement, 2.0–2.1° tilt |
+| 0.175 | PASS 60.02 s; 0.01–0.03 m displacement, 1.8–2.3° tilt |
+| **0.20** | **PASS 60.02 s; 0.09 m displacement, 1.8–2.2° tilt for all eight** |
+
+RTF 0.20 is therefore the current demonstrated eight-robot operating point on
+the compressed route. It has one full-duration qualification rather than the
+repeat evidence available at 0.10, so keep 0.175 as the conservative fallback
+if later 0.20 runs show intermittent transport-sensitive failures.
+
+#### RTF 0.20 long-horizon transport incident (2026-07-22)
+
+One eight-robot run passed its 60-second evaluator and then remained upright
+until 492.3 simulated seconds after release (about 41 wall-clock minutes). All
+eight crossed 45° tilt within less than 0.1 simulated seconds of each other.
+The controller telemetry held the last upright quaternion for six samples and
+then jumped from 0.8–3.9° to 87–89° in one sample. That discontinuity is not a
+physically resolved fall trajectory: the controllers missed the intervening
+state.
+
+Isaac continued at an instantaneous and cumulative RTF of approximately 0.198
+across the event. The SSH child, both bridges, and sim process did not restart.
+The evidence therefore rules out accumulated simulator slowdown and independent
+pose instability. It is consistent with a shared state-delivery stall somewhere
+between the RTX DDS publisher and the eight Spark controllers; it does not by
+itself identify Wi-Fi, WARP, SSH, Zenoh, or Spark DDS as the exact layer.
+
+The original evaluator hid this late fall because it latched its 60-second
+success payload. `StandEval` now continues pose checks after qualification, and
+the `monitor` command above runs on both sides of the bridge. Compare their
+timestamped gap/tick records with `sim_run.log` on the next incident. The
+controller processes also demonstrated restart-order resilience in the next
+full sim restart: all eight entered feed-loss damping, detected the restored
+LowState stream, and soft-rearmed without controller restarts.
 
 ### 4a-bis. Watch it: WebRTC 3rd-person viewport (from a WARP laptop, NO tunnel)
 
@@ -561,6 +686,12 @@ A WARP-enrolled laptop reaches the pod IP directly, so:
 
 The camera image-server WebRTC (ports `55555-7` ZMQ + `60001-3`) is a *separate* stream
 (the wrist/head camera feeds), not the interactive viewport.
+
+For multi-environment runs, `sim_main.py` computes an elevated viewport pose
+from `scene.env_origins`, so the stream frames the entire robot grid. Reset and
+base-hold paths add those same origins to Isaac's environment-local default root
+state; omitting that conversion stacks every robot at world `(0,0)` and makes
+eight environments look like one robot.
 
 ### 4b. Clock skew note
 
@@ -763,10 +894,10 @@ Authoritative RTF (measured via `env.sim.current_time` vs wall-clock), single en
 ## 8. Open items
 
 - ✅ **Concurrent IDLE scaling passed** (2026-07-21): four robots completed
-  60.02 simulated seconds at RTF 0.15, and seven completed 60.02 seconds at RTF
+  60.02 simulated seconds at RTF 0.15, and eight completed 60.02 seconds at RTF
   0.10; every accepted robot finished at 0.09 m displacement without a fall.
-  Five is the first unreliable count at RTF 0.15 and eight is the first failure
-  at RTF 0.10. Complete the mixed-mode, selective-reset, and
+  Five is the first unreliable count at RTF 0.15; the next RTF 0.10 boundary
+  above eight is not yet measured. Complete the mixed-mode, selective-reset, and
   one-controller-restart acceptance tests before expanding either supported
   boundary.
 - ✅ **Full VLA loop closed** (2026-07-08): GR00T `bs256/checkpoint-12000` on `:5551` →

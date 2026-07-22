@@ -239,6 +239,17 @@ class G1Deploy {
     // hold; one requests the complete native leg pose.  This changes reference
     // observations only--the learned policy remains the low-level controller.
     double idle_hold_leg_blend_ = 0.0;
+    // Optional live IDLE target file: "<pitch-deg> <leg-blend>".  The measured
+    // handoff pose is retained as an immutable baseline and new targets are
+    // slewed onto the active stationary clip without restarting the deploy.
+    std::string idle_reference_file_;
+    std::array<double, G1_NUM_MOTOR> idle_hold_baseline_q_ = {};
+    std::array<double, 4> idle_hold_baseline_quat_ = {1.0, 0.0, 0.0, 0.0};
+    bool idle_hold_baseline_valid_ = false;
+    bool idle_hold_motion_active_ = false;
+    double idle_target_pitch_bias_rad_ = 0.0;
+    double idle_target_leg_blend_ = 0.0;
+    std::chrono::steady_clock::time_point idle_reference_next_check_ = {};
     std::atomic<bool> next_planner_motion_is_idle_{true};
     
     // Planner command state. Requested WALK -> IDLE changes pass through a
@@ -2349,11 +2360,19 @@ class G1Deploy {
       }
       { const char* e = std::getenv("SONIC_IDLE_LEG_BLEND");
         if (e) idle_hold_leg_blend_ = std::clamp(std::atof(e), 0.0, 1.0); }
+      idle_target_pitch_bias_rad_ = idle_hold_pitch_bias_rad_;
+      idle_target_leg_blend_ = idle_hold_leg_blend_;
+      { const char* e = std::getenv("SONIC_IDLE_REFERENCE_FILE");
+        if (e) idle_reference_file_ = e; }
       std::cout << "[deploy] SONIC_IDLE_HOLD_REFERENCE="
                 << (idle_hold_reference_enabled_ ? "on" : "off")
                 << " (IDLE target = measured pose at transition, pitch bias="
                 << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg, leg blend="
                 << idle_hold_leg_blend_ << ")" << std::endl;
+      if (!idle_reference_file_.empty()) {
+        std::cout << "[idle-hold] live reference file: " << idle_reference_file_
+                  << " (format: <pitch-deg> <leg-blend>)" << std::endl;
+      }
 
       // Initialize planner motion state as shared_ptr
       planner_motion_ = std::make_shared<MotionSequence>();
@@ -3418,6 +3437,50 @@ class G1Deploy {
      * matching the latest measured pose.  Must be called while the planner and
      * current-motion mutexes are held, before planner_motion_ is published.
      */
+    void ApplyLiveIdleReference(double pitch_bias_rad, double leg_blend) {
+      if (!idle_hold_baseline_valid_ || planner_motion_->timesteps <= 0) {
+        return;
+      }
+
+      auto base_quat = idle_hold_baseline_quat_;
+      if (pitch_bias_rad != 0.0) {
+        // Apply the trim in the robot's heading-local pitch axis: q_target =
+        // q_measured * q_pitch.  This changes only the reference seen by the
+        // policy; measured gravity and angular velocity remain untouched.
+        const double c = std::cos(0.5 * pitch_bias_rad);
+        const double s = std::sin(0.5 * pitch_bias_rad);
+        const auto q = base_quat;
+        base_quat = {
+            q[0] * c - q[2] * s,
+            q[1] * c - q[3] * s,
+            q[0] * s + q[2] * c,
+            q[1] * s + q[3] * c,
+        };
+      }
+      for (int frame = 0; frame < planner_motion_->timesteps; ++frame) {
+        for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+             ++hardware_joint) {
+          const int policy_joint = isaaclab_to_mujoco[hardware_joint];
+          const double measured_q = idle_hold_baseline_q_[hardware_joint];
+          // Hardware joints 0..11 are the two six-joint legs.  A partial blend
+          // is deliberately safer than substituting an arbitrary full-body
+          // pose: arms and waist retain the known-good measured reference.
+          const double reference_q = hardware_joint < 12
+              ? measured_q + leg_blend *
+                  (default_angles[hardware_joint] - measured_q)
+              : measured_q;
+          planner_motion_->JointPositions(frame)[policy_joint] =
+              reference_q;
+          planner_motion_->JointVelocities(frame)[policy_joint] = 0.0;
+        }
+        planner_motion_->BodyQuaternions(frame)[0] = base_quat;
+        if (planner_motion_->GetNumBodies() > 0) {
+          planner_motion_->BodyLinVelocities(frame)[0] = {0.0, 0.0, 0.0};
+          planner_motion_->BodyAngVelocities(frame)[0] = {0.0, 0.0, 0.0};
+        }
+      }
+    }
+
     bool FreezeIdleReferenceAtMeasuredPose() {
       if (!idle_hold_reference_enabled_ || planner_motion_->timesteps <= 0 ||
           planner_motion_->GetNumJoints() < G1_NUM_MOTOR ||
@@ -3432,50 +3495,75 @@ class G1Deploy {
         return false;
       }
 
-      auto base_quat = float_to_double<4>(low_state->imu_state().quaternion());
-      if (idle_hold_pitch_bias_rad_ != 0.0) {
-        // Apply the trim in the robot's heading-local pitch axis: q_target =
-        // q_measured * q_pitch.  This changes only the reference seen by the
-        // policy; measured gravity and angular velocity remain untouched.
-        const double c = std::cos(0.5 * idle_hold_pitch_bias_rad_);
-        const double s = std::sin(0.5 * idle_hold_pitch_bias_rad_);
-        const auto q = base_quat;
-        base_quat = {
-            q[0] * c - q[2] * s,
-            q[1] * c - q[3] * s,
-            q[0] * s + q[2] * c,
-            q[1] * s + q[3] * c,
-        };
+      idle_hold_baseline_quat_ =
+          float_to_double<4>(low_state->imu_state().quaternion());
+      for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+           ++hardware_joint) {
+        idle_hold_baseline_q_[hardware_joint] =
+            low_state->motor_state()[hardware_joint].q();
       }
-      for (int frame = 0; frame < planner_motion_->timesteps; ++frame) {
-        for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
-             ++hardware_joint) {
-          const int policy_joint = isaaclab_to_mujoco[hardware_joint];
-          const double measured_q =
-              low_state->motor_state()[hardware_joint].q();
-          // Hardware joints 0..11 are the two six-joint legs.  A partial blend
-          // is deliberately safer than substituting an arbitrary full-body
-          // pose: arms and waist retain the known-good measured reference.
-          const double reference_q = hardware_joint < 12
-              ? measured_q + idle_hold_leg_blend_ *
-                  (default_angles[hardware_joint] - measured_q)
-              : measured_q;
-          planner_motion_->JointPositions(frame)[policy_joint] =
-              reference_q;
-          planner_motion_->JointVelocities(frame)[policy_joint] = 0.0;
-        }
-        planner_motion_->BodyQuaternions(frame)[0] = base_quat;
-        if (planner_motion_->GetNumBodies() > 0) {
-          planner_motion_->BodyLinVelocities(frame)[0] = {0.0, 0.0, 0.0};
-          planner_motion_->BodyAngVelocities(frame)[0] = {0.0, 0.0, 0.0};
-        }
-      }
+      idle_hold_baseline_valid_ = true;
+      idle_hold_motion_active_ = true;
+      ApplyLiveIdleReference(idle_hold_pitch_bias_rad_, idle_hold_leg_blend_);
 
       std::cout << "[idle-hold] froze " << planner_motion_->timesteps
                 << " reference frames at measured standing pose (pitch bias="
                 << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg, leg blend="
                 << idle_hold_leg_blend_ << ")" << std::endl;
       return true;
+    }
+
+    /** Refresh and smoothly apply a live stationary-IDLE reference target.
+     *
+     * Caller holds current_motion_mutex_ and planner_motion_mutex_.  Changes
+     * are ignored outside the frozen IDLE clip, so WALK references are never
+     * rewritten.  File polling is wall-clock limited and malformed files leave
+     * the last valid target untouched.
+     */
+    void MaybeRefreshLiveIdleReference() {
+      if (!idle_hold_reference_enabled_ || !idle_hold_motion_active_ ||
+          !idle_hold_baseline_valid_ || idle_reference_file_.empty() ||
+          !current_motion_ || current_motion_ != planner_motion_) {
+        return;
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= idle_reference_next_check_) {
+        idle_reference_next_check_ = now + std::chrono::milliseconds(500);
+        std::ifstream input(idle_reference_file_);
+        double pitch_degrees = 0.0;
+        double leg_blend = 0.0;
+        if (input >> pitch_degrees >> leg_blend) {
+          pitch_degrees = std::clamp(pitch_degrees, -20.0, 20.0);
+          leg_blend = std::clamp(leg_blend, 0.0, 1.0);
+          const double pitch_radians = pitch_degrees * M_PI / 180.0;
+          if (std::abs(pitch_radians - idle_target_pitch_bias_rad_) > 1e-9 ||
+              std::abs(leg_blend - idle_target_leg_blend_) > 1e-9) {
+            idle_target_pitch_bias_rad_ = pitch_radians;
+            idle_target_leg_blend_ = leg_blend;
+            std::cout << "[idle-hold] live target: pitch=" << pitch_degrees
+                      << " deg, leg blend=" << leg_blend << std::endl;
+          }
+        }
+      }
+
+      // Slew rather than step the reference so a file edit cannot inject an
+      // arbitrarily large discontinuity into the policy observation.
+      const double pitch_step = 0.25 * M_PI / 180.0;
+      const double blend_step = 0.01;
+      const auto approach = [](double current, double target, double step) {
+        return current + std::clamp(target - current, -step, step);
+      };
+      const double next_pitch = approach(
+          idle_hold_pitch_bias_rad_, idle_target_pitch_bias_rad_, pitch_step);
+      const double next_blend = approach(
+          idle_hold_leg_blend_, idle_target_leg_blend_, blend_step);
+      if (next_pitch != idle_hold_pitch_bias_rad_ ||
+          next_blend != idle_hold_leg_blend_) {
+        idle_hold_pitch_bias_rad_ = next_pitch;
+        idle_hold_leg_blend_ = next_blend;
+        ApplyLiveIdleReference(idle_hold_pitch_bias_rad_, idle_hold_leg_blend_);
+      }
     }
 
     /**
@@ -3694,6 +3782,9 @@ class G1Deploy {
           {
             if (next_planner_motion_is_idle_.load(std::memory_order_acquire)) {
               FreezeIdleReferenceAtMeasuredPose();
+            } else {
+              idle_hold_motion_active_ = false;
+              idle_hold_baseline_valid_ = false;
             }
             if(planner_motion_file_)
             {
@@ -3728,6 +3819,8 @@ class G1Deploy {
             }
           }
         }
+
+        MaybeRefreshLiveIdleReference();
           
         // Frame advancement at control frequency (50Hz) for smooth playback
         if (current_motion_->timesteps > 0 && operator_state.play) {

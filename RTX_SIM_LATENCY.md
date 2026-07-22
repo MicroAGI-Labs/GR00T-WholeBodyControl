@@ -2,16 +2,13 @@
 
 **TL;DR** — Running the SONIC low-level controller on the Spark against the Isaac
 sim on the remote RTX6000 pod, the G1 balances **only when the sim runs slower than
-real time**. In the current two-robot, one-tunnel setup, the highest rate at which
-both robots completed the full 60.02 simulated-second evaluator was **RTF 0.20**.
-At **RTF 0.225**, both fell at about 29 simulated seconds. This brackets the observed
-long-horizon failure onset to **RTF 0.20–0.225**. RTF 0.20 is a no-fall ceiling, not a
-clean station-keeping recommendation: one repeat accumulated 0.55 m and 1.84 m of
-translation before settling. **RTF 0.10 remains the recommended operating point
-and has completed a clean 60.02 s run with seven concurrent robots**; eight is
-the first failing count. For faster throughput, **RTF 0.15 has completed a clean
-60.02 s run with four concurrent robots**; five is the first unreliable count at
-that RTF.
+real time**. With the compressed one-tunnel architecture, eight robots completed
+the full 60.02 simulated-second evaluator at every tested point through **RTF
+0.20**. Use 0.20 for supervised throughput and 0.175 as the conservative
+fallback. At **RTF 0.225**, two robots fell at about 29 simulated seconds. A later
+eight-robot RTF 0.20 run fell after 492.3 simulated seconds during a synchronized
+state-delivery discontinuity while Isaac remained at RTF 0.198; that is a shared
+transport-path incident, not a lower measured simulator-throughput ceiling.
 Going faster reliably needs either a lower-latency network path (infra) or a
 delay-robust controller (retrain SONIC). First-order state prediction and
 gain-softening were implemented and tested — neither moved the earlier ceiling.
@@ -56,10 +53,23 @@ memory `sonic-rtf-delay-tolerance-levers`, `sim-resilience-implementation`,
 > and pulled cumulative Isaac RTF toward 0.12, so 24 is a startup-capacity result,
 > not a supported control count.
 
-> **RTF 0.10 follow-up 2026-07-21.** Seven concurrent robots completed 60.02 s
-> with 0.09 m displacement and 1.8–2.2° tilt each. Eight failed at 10.50 s even
-> though all state feeds remained near 100 Hz. The supported count is therefore
-> seven at RTF 0.10 versus four at RTF 0.15.
+> **RTF 0.10 transport follow-up 2026-07-21.** An uncompressed eight-robot run
+> failed at 36.84 s (an earlier repeat failed at 10.50 s). Direct pod probes were
+> healthy at 99.6 Hz state / 50.0 Hz command, while Spark saw only 63.1–63.5 Hz /
+> 29.8–30.0 Hz, command p99 gaps of 142–150 ms, and maxima up to 0.70 s. Enabling
+> SSH compression restored 97.5–97.7 Hz / 49.0–49.4 Hz, reduced command p99 to
+> 39–46 ms, and all eight completed 60.02 s at 0.09 m displacement and 1.8–2.2°
+> tilt. This established eight at RTF 0.10; the later compressed-tunnel sweep
+> superseded the old four-at-0.15 boundary and passed eight through RTF 0.20.
+
+> **Long-horizon monitoring update 2026-07-22.** An eight-robot RTF 0.20 run
+> passed 60 seconds, remained upright for 492.3 simulated seconds (about 41 wall
+> minutes), then all eight crossed 45° within 0.1 simulated seconds. Their Spark
+> telemetry repeated the last upright state and then jumped directly to 87–89°;
+> Isaac's RTF stayed at 0.198 and no process or SSH child restarted. This rules
+> out gradual simulator slowdown and points to a shared state-delivery gap, but
+> does not identify the exact network/bridge layer. Continuous evaluators and
+> compact monitors now run on both sides of the bridge for exact attribution.
 
 ---
 
@@ -193,7 +203,9 @@ gap (that earlier framing was wrong). The dependence is purely loop delay.
 
 ## 5. Result and operating point
 
-**RTF 0.10 is the recommended operating point with the current autossh tunnel:**
+**RTF 0.20 is the current supervised operating point with the compressed autossh
+tunnel; use 0.175 for additional margin.** The earlier maximum-margin recipe was:
+
 - Deploy: `CONTROL_WALL_SCALE=0.1` (must equal sim RTF).
 - Pod sim: `/tmp/sim_slowmo=10` (RTF = 1 / slowmo).
 - Stationary IDLE: `SONIC_IDLE_HOLD_REFERENCE=1`,
@@ -202,8 +214,9 @@ gap (that earlier framing was wrong). The dependence is purely loop delay.
 - Revalidated with synchronized reference/state/command telemetry: 60.02 s unaided
   stand, final displacement 0.03 m, height 0.707 m, tilt 1.3°, result +71.56.
 
-This keeps the G1 upright under SONIC control on the Spark despite the current tunnel
-latency.
+That RTF 0.10 recipe remains useful for maximum delay tolerance. The current
+eight-robot throughput setup instead uses `CONTROL_WALL_SCALE=0.20` and
+`/tmp/sim_slowmo=5`.
 
 For the two-robot bring-up, both controllers still used
 `CONTROL_WALL_SCALE=0.1`, but the warmup and frozen IDLE reference were matched
@@ -216,20 +229,23 @@ The two-robot RTF sweep also completed 60.02 s at RTF 0.20, but with 0.55 m and
 1.84 m displacement in that repeat. At RTF 0.225 both robots fell near 29 s.
 Therefore:
 
-- use **RTF 0.10** for clean, repeatable work and demonstrations;
-- at RTF 0.10, use up to **seven concurrent robots**; this combination passed
-  the full 60.02-second evaluator;
-- use **RTF 0.15** for up to **four concurrent robots** when the 50% throughput
-  increase is worth the smaller latency margin; this combination passed 60.02 s;
-- treat **RTF 0.20** as the highest demonstrated 60 s **no-fall** rate, with poor
-  station-keeping possible;
+- use **RTF 0.10** for the largest established latency margin;
+- with the default compressed `sim_tunnel.sh`, eight concurrent robots passed
+  60.02 s at RTF 0.10, 0.125, 0.15, 0.175, and **0.20** when controller timing
+  matched each RTF;
+- the eight-robot RTF 0.20 pass ended with every robot at 0.09 m displacement,
+  0.682–0.685 m pelvis height, and 1.8–2.2° tilt;
+- use **RTF 0.20** as the current supervised operating point and 0.175 as the
+  conservative fallback until 0.20 has repeat qualification;
 - do not use **RTF 0.225 or above** for unattended balance on the current route.
 
 ### Concurrency limit at RTF 0.15
 
-The count sweep held the architecture fixed: one Isaac process, one bridge per
+This count sweep used the uncompressed-tunnel baseline. It held the rest of the architecture fixed: one Isaac process, one bridge per
 host, one autossh tunnel, and one SONIC process per robot. Four is the highest
-count that completed the full evaluator:
+count that completed the full evaluator in that baseline; the later compressed
+tunnel follow-up passed all eight at RTF 0.15 and supersedes this as the current
+capacity result:
 
 | Count | Longest relevant result |
 |---:|---|
@@ -252,20 +268,66 @@ initialization alone is not a useful concurrency claim.
 
 ### Concurrency limit at RTF 0.10
 
-The lower rate provides enough additional delay margin for seven independent
-controllers:
+The lower rate plus SSH compression provides enough delay margin for eight
+independent controllers:
 
 | Count | Result |
 |---:|---|
 | **7** | **PASS 60.02 s; all at 0.09 m displacement and 1.8–2.2° tilt** |
-| **8** | **FAIL 10.50 s; two fallen and several others degraded** |
+| 8, uncompressed tunnel | Intermittent FAIL: 10.50 s in one repeat; 36.84 s in the instrumented repeat |
+| **8, compressed tunnel** | **PASS 60.02 s; all at 0.09 m displacement and 1.8–2.2° tilt** |
 
-During the seven-robot acceptance run, Isaac held RTF 0.100, the seven state
-feeds averaged 99.7–99.8 Hz, and no controller entered feed-loss recovery. The
-controllers used 3.72 GiB aggregate RSS and about 0.43 CPU core averaged over
-their lifetimes. Eight also had near-100 Hz feeds, so its fall is evidence of
-the narrower aggregate control/transport timing margin rather than missing
-topics or memory exhaustion.
+The instrumented uncompressed run separated the bottleneck cleanly. At the pod,
+all eight state streams were 99.6 Hz with 12–14 ms p99 gaps and all command
+streams were 50.0 Hz with 65–69 ms p99 gaps. Across the shared tunnel, Spark saw
+only 63.1–63.5 Hz state and 29.8–30.0 Hz command, with 142–150 ms command p99 and
+up to 0.70 s maximum gaps. Isaac still held RTF 0.100, Spark GPU utilization was
+about 4%, and policy inference was normally 0.4–0.6 ms: compute was not the
+limit.
+
+`sim_tunnel.sh` now enables SSH compression by default. The repeated DDS samples
+compress well: in a 10 s sample the bridge carried 14.25 Mbit/s state and 3.34
+Mbit/s command payload internally, while the outer SSH connection carried only
+0.79 Mbit/s and 0.24 Mbit/s respectively. The post-pass Spark probe measured
+97.5–97.7 Hz state and 49.0–49.4 Hz command; command p99 was 39–46 ms. Set
+`SSH_COMPRESSION=no` only for an explicit comparison, not for concurrent balance.
+
+### Eight-robot compressed-tunnel RTF sweep
+
+Keeping the now-default SSH compression enabled removed the earlier shared-link
+bottleneck. Eight robots completed the 60.02-second evaluator at every tested
+point through RTF 0.20:
+
+| RTF | Result |
+|---:|---|
+| 0.125 | PASS; all 0.09 m, 1.8–2.2° tilt |
+| 0.15 | PASS; all 0.09 m, 2.0–2.1° tilt |
+| 0.175 | PASS; 0.01–0.03 m, 1.8–2.3° tilt |
+| **0.20** | **PASS; all 0.09 m, 1.8–2.2° tilt, 0.682–0.685 m height** |
+
+The RTF 0.20 qualification used `SIM_SLOWMO=5` and
+`CONTROL_WALL_SCALE=0.20` on every controller. Treat it as the current
+supervised setting; RTF 0.175 retains more measured timing margin.
+
+### Long-horizon failure attribution
+
+The 2026-07-22 incident is qualitatively different from gradual loss of balance:
+
+- stable duration: 492.3 simulated seconds, approximately 41 wall minutes;
+- failure spread: less than 0.1 simulated seconds across all eight robots;
+- last delivered state: 0.8–3.9° tilt, repeated for six controller samples;
+- next delivered state: 87–89° tilt;
+- Isaac: normal 0.198 RTF through the corresponding sim-time interval;
+- transport processes: no SSH, bridge, or sim restart.
+
+The synchronized discontinuity implicates the common return-data path. It does
+not prove a physical-link outage because a short WARP/SSH, Zenoh, or Spark DDS
+stall can leave the SSH process connected. Use paired instances of
+`g1_concurrent_diag.py monitor`: domain 0/`lo` on Spark and domain 1/`eth0` on
+RTX. A clean RTX stream with a Spark gap localizes the event after the simulator;
+matching RTX state/RTF degradation instead implicates Isaac. The monitor logs
+five-second snapshots plus threshold crossings and first-fall transitions;
+unattended runs should not use the multi-gigabyte full controller CSV.
 
 ### Real-robot path is preserved
 All new deploy code is off by default:

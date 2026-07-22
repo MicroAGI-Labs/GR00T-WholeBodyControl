@@ -8,6 +8,7 @@ cd /home/microagi/repos/GR00T-WholeBodyControl/gear_sonic_deploy
 source scripts/setup_env.sh >/dev/null 2>&1
 export CONTROL_WALL_SCALE=${CONTROL_WALL_SCALE:-1.0}     # set to sim RTF; 1.0 on hardware
 export PRED_HORIZON_S=${PRED_HORIZON_S:-0.0}
+instance_id=${SONIC_INSTANCE_ID:-default}
 DDS_INTERFACE=${DDS_INTERFACE:-$(ip -4 route show default | awk 'NR==1 {print $5}')}
 DDS_INTERFACE=${DDS_INTERFACE:-lo}
 # Namespaced controllers are the concurrent Spark simulation path.  Use an
@@ -15,6 +16,9 @@ DDS_INTERFACE=${DDS_INTERFACE:-lo}
 # indices 0..9, which is exhausted by eight controllers plus the local bridge.
 if [[ -n "${SONIC_TOPIC_PREFIX:-}" && -z "${DDS_CONFIG_FILE:-}" ]]; then
   export DDS_CONFIG_FILE="$PWD/dds_sim_spark.json"
+fi
+if [[ -n "${SONIC_TOPIC_PREFIX:-}" ]]; then
+  export SONIC_IDLE_REFERENCE_FILE="${SONIC_IDLE_REFERENCE_FILE:-/tmp/sonic_idle_reference_${instance_id}.txt}"
 fi
 case "$CONTROL_WALL_SCALE" in
   1|1.0|1.00|1.000) ;;
@@ -27,7 +31,6 @@ telemetry_args=()
 if [[ -n "${IDLE_TELEMETRY_LOGFILE:-}" ]]; then
   telemetry_args=(--idle-telemetry-logfile "$IDLE_TELEMETRY_LOGFILE")
 fi
-instance_id=${SONIC_INSTANCE_ID:-default}
 zmq_input_port=${ZMQ_INPUT_PORT:-5556}
 zmq_output_port=${ZMQ_OUTPUT_PORT:-5557}
 zmq_input_topic=${ZMQ_INPUT_TOPIC:-pose_${instance_id}}

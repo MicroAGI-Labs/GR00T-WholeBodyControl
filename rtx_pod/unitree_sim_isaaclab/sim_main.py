@@ -388,6 +388,47 @@ def main():
         )
     env.sim.reset()
     env.reset()
+
+    def default_root_state_world(robot, env_ids=None):
+        """Return Isaac Lab's environment-local default root state in world space."""
+        if env_ids is None:
+            root = robot.data.default_root_state.clone()
+            origins = env.scene.env_origins
+        else:
+            root = robot.data.default_root_state[env_ids].clone()
+            origins = env.scene.env_origins[env_ids]
+        root[:, :3] += origins
+        return root
+
+    # The default viewer pose is intended for one environment.  Center an
+    # elevated overview on the cloned environment grid so a WebRTC client sees
+    # every robot without needing to navigate the viewport manually.
+    if env.num_envs > 1 and not args_cli.no_render:
+        try:
+            origins = env.scene.env_origins.detach().cpu()
+            grid_min = origins.min(dim=0).values
+            grid_max = origins.max(dim=0).values
+            center = (grid_min + grid_max) * 0.5
+            span = max(
+                float(grid_max[0] - grid_min[0]),
+                float(grid_max[1] - grid_min[1]),
+                2.5,
+            )
+            distance = max(7.5, 1.75 * span)
+            eye = (
+                float(center[0]) + distance,
+                float(center[1]) + distance,
+                max(6.0, 1.3 * span),
+            )
+            target = (float(center[0]), float(center[1]), 0.75)
+            env.sim.set_camera_view(eye=eye, target=target)
+            print(
+                f"[sim] multi-robot viewport: eye={eye}, target={target}, "
+                f"grid_min={grid_min.tolist()}, grid_max={grid_max.tolist()}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[sim] failed to configure multi-robot viewport: {e}", flush=True)
     
     # create simplified control configuration
     try:    
@@ -693,7 +734,7 @@ def main():
                             )
                             if reset_category in ("2", "4"):
                                 robot = env.scene["robot"]
-                                root = robot.data.default_root_state[env_id].clone()
+                                root = default_root_state_world(robot, env_id)
                                 joint_q = robot.data.default_joint_pos[env_id].clone()
                                 joint_dq = torch.zeros_like(
                                     robot.data.default_joint_vel[env_id]
@@ -760,7 +801,7 @@ def main():
                                 # controller balances at (captured from MuJoCo).
                                 try:
                                     _rb = env.scene["robot"]
-                                    _r0 = _rb.data.default_root_state.clone()
+                                    _r0 = default_root_state_world(_rb)
                                     _rb.write_root_pose_to_sim(_r0[:, :7])
                                     _rb.write_root_velocity_to_sim(_r0[:, 7:])
                                 except Exception as _e:
@@ -796,7 +837,7 @@ def main():
                                 try:
                                     _rb = env.scene["robot"]
                                     env_cfg.event_manager.trigger("reset_all_self", env)
-                                    _r0 = _rb.data.default_root_state.clone()
+                                    _r0 = default_root_state_world(_rb)
                                     _rb.write_root_pose_to_sim(_r0[:, :7])
                                     _rb.write_root_velocity_to_sim(_r0[:, 7:])
                                 except Exception as _e:
@@ -904,7 +945,7 @@ def main():
                                 env._base_hold_mask, as_tuple=False
                             ).squeeze(-1)
                             _cur = _robot.data.root_state_w[_ids].clone()
-                            _r0 = _robot.data.default_root_state[_ids]
+                            _r0 = default_root_state_world(_robot, _ids)
                             _pose = _cur[:, :7].clone()
                             _pose[:, 0:2] = _r0[:, 0:2]
                             _pose[:, 3:7] = _r0[:, 3:7]
@@ -926,7 +967,7 @@ def main():
                     try:
                         _robot = env.scene["robot"]
                         _cur = _robot.data.root_state_w             # [N,13] world
-                        _r0 = _robot.data.default_root_state
+                        _r0 = default_root_state_world(_robot)
                         if not torch.isfinite(_cur).all():
                             raise ValueError("non-finite root_state (robot exploded); skip wrench")
                         _pos = _cur[:, 0:3]; _quat = _cur[:, 3:7]
@@ -970,7 +1011,7 @@ def main():
                     try:
                         _robot = env.scene["robot"]
                         _cur = _robot.data.root_state_w.clone()   # [N,13]
-                        _r0 = _robot.data.default_root_state
+                        _r0 = default_root_state_world(_robot)
                         _pose = _cur[:, :7].clone()
                         _pose[:, 0:2] = _r0[:, 0:2]               # hold x,y at spawn
                         _pose[:, 3:7] = _r0[:, 3:7]               # force upright orientation

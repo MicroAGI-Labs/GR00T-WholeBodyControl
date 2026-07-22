@@ -11,11 +11,6 @@ set -uo pipefail
 LS="$HOME/live-sim"
 cd "$LS"
 
-# The policy-native crouch is the validated handoff pose for stationary IDLE.
-# A caller can still select the straighter visual pose with
-# SIM_WARMUP_POSE=vertical, or the measured balance equilibrium with
-# SIM_WARMUP_POSE=observed, for A/B tests.
-export SIM_WARMUP_POSE="${SIM_WARMUP_POSE:-sonic}"
 SIM_ROBOT_COUNT="${SIM_ROBOT_COUNT:-1}"
 case "$SIM_ROBOT_COUNT" in
   ''|*[!0-9]*) echo "SIM_ROBOT_COUNT must be an integer" >&2; exit 2 ;;
@@ -25,6 +20,22 @@ if [ "$SIM_ROBOT_COUNT" -lt 1 ] || [ "$SIM_ROBOT_COUNT" -gt 24 ]; then
   exit 2
 fi
 export SIM_ROBOT_COUNT
+
+# A concurrent stack must never start with its floating bases immediately free:
+# controllers may still be reconnecting or filling their observation histories.
+# Default multi-robot launches to the validated observed-pose rigid hold.  Cat-3
+# releases each environment independently once its controller has a fresh LowCmd.
+# Every value remains explicitly overridable for experiments.
+if [ "$SIM_ROBOT_COUNT" -gt 1 ]; then
+  export SIM_BASE_HOLD_S="${SIM_BASE_HOLD_S:-9999}"
+  export SIM_BASE_SOFT="${SIM_BASE_SOFT:-0}"
+  export SIM_WARMUP_JOINTS="${SIM_WARMUP_JOINTS:-1}"
+  export SIM_WARMUP_POSE="${SIM_WARMUP_POSE:-observed}"
+else
+  # The policy-native crouch remains the single-robot default.  A caller can
+  # select `vertical` or the measured `observed` equilibrium for A/B tests.
+  export SIM_WARMUP_POSE="${SIM_WARMUP_POSE:-sonic}"
+fi
 
 # ---- Single-instance guard (SIM_RESILIENCE_PLAN.md Workstream G) -------------
 # Two overlapping bring-ups used to race past the pkill guards into DUPLICATE

@@ -25,6 +25,12 @@ set -u
 POD_SSH="${POD_SSH:-rtx-pod}"     # ~/.ssh/config alias (or user@host)
 DDS_PORT="${DDS_PORT:-7447}"
 CAM_PORT="${CAM_PORT:-5555}"
+SSH_COMPRESSION="${SSH_COMPRESSION:-yes}"
+
+case "$SSH_COMPRESSION" in
+  yes|no) ;;
+  *) echo "[sim_tunnel] SSH_COMPRESSION must be 'yes' or 'no'" >&2; exit 2 ;;
+esac
 
 # autossh tuning:
 #  AUTOSSH_GATETIME=0  -> restart even if a session dies within the first 30 s
@@ -37,10 +43,12 @@ export AUTOSSH_DEBUG="${AUTOSSH_DEBUG:-0}"
 
 echo "[sim_tunnel] supervising DDS :$DDS_PORT and camera :$CAM_PORT to '$POD_SSH'"
 echo "[sim_tunnel] autossh will auto-reconnect on any drop (keepalive ~15 s detect)"
+echo "[sim_tunnel] SSH compression: $SSH_COMPRESSION"
 
 # exec so signals (Ctrl-C / SIGTERM from a supervisor) go straight to autossh,
 # which tears down the child ssh cleanly.
 exec autossh -M 0 -N \
+    -o "Compression=${SSH_COMPRESSION}" \
     -o ServerAliveInterval=5 \
     -o ServerAliveCountMax=3 \
     -o ExitOnForwardFailure=yes \

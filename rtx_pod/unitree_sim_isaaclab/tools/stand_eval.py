@@ -7,10 +7,10 @@ it to the Spark exactly like rt/lowstate (add "rt/eval" to the bridge allow-list
 
 The score is two numbers:
 
-  termination  0..1   1 => the eval is over. It does NOT say pass/fail. It ramps
-                      linearly 0->1 across the SUCCESS_WINDOW_S seconds of *sim
-                      time* the robot is asked to keep standing (reaching 1 == a
-                      full clean stand = success). A fall snaps it to 1 at once.
+  termination  0..1   Ramps linearly 0->1 across SUCCESS_WINDOW_S seconds of
+                      *sim time*. Reaching 1 marks a successful qualification,
+                      but monitoring continues so a later fall is still reported.
+                      A fall snaps it to 1 at once.
 
   result     -100..100   0 is the scale midpoint; +100 = perfect upright stand at
                       the start location; -100 = worst failure (a fall), reserved.
@@ -80,6 +80,7 @@ class StandEval:
         # ---- state ----
         self._armed = False
         self._done = False
+        self._passed = False
         self._t0 = 0.0
         self._p0 = None          # (x, y) start location
         self._z0 = None          # standing height at arm-time (squat reference)
@@ -110,6 +111,7 @@ class StandEval:
         self._t0 = self.sim_time()
         self._armed = True
         self._done = False
+        self._passed = False
         self._final = None
         self._last_pub_t = -1e18
         print(f"[stand_eval:{self.env_id}] ARMED at t={self._t0:.2f}s p0=({pos[0]:.2f},{pos[1]:.2f}) "
@@ -119,6 +121,7 @@ class StandEval:
         """Return to pre-eval hold (start-hold: term 0, result 100)."""
         self._armed = False
         self._done = False
+        self._passed = False
         self._final = None
         print(f"[stand_eval:{self.env_id}] DISARMED (start-hold)", flush=True)
 
@@ -148,6 +151,7 @@ class StandEval:
             self._maybe_pub(t, {
                 "t": 0.0, "termination": 0.0, "result": 100.0,
                 "fallen": False, "standing": False,
+                "passed": False,
                 "dist": 0.0, "height": 0.0, "tilt": 0.0, "reason": "start-hold",
                 **self._pose_fields(pos, quat),
             })
@@ -170,6 +174,7 @@ class StandEval:
             payload = {
                 "t": round(elapsed, 3), "termination": 1.0, "result": -100.0,
                 "fallen": True, "standing": False,
+                "passed": self._passed,
                 "dist": round(self._dist(pos), 3) if pos else -1.0,
                 "height": round(pos[2], 3) if pos else -1.0,
                 "tilt": round(self._tilt_deg(quat), 2) if pos else -1.0,
@@ -208,15 +213,15 @@ class StandEval:
         payload = {
             "t": round(elapsed, 3), "termination": round(termination, 4),
             "result": round(result, 2), "fallen": False, "standing": True,
+            "passed": success,
             "dist": round(dist, 3), "height": round(pos[2], 3),
             "tilt": round(tilt, 2), "reason": "success" if success else "standing",
             **self._pose_fields(pos, quat),
         }
-        if success:
-            self._done = True
-            self._final = payload
+        if success and not self._passed:
+            self._passed = True
             print(f"[stand_eval:{self.env_id}] SUCCESS: {self.window_s:.0f}s stand complete -> "
-                  f"result={result:.1f}", flush=True)
+                  f"result={result:.1f}; continuing fall monitoring", flush=True)
         self._maybe_pub(t, payload)
 
     # -- helpers -------------------------------------------------------------
