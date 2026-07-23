@@ -19,6 +19,7 @@ Run ``python -m gear_sonic.camera.composed_camera --help`` for all options.
 
 from collections import deque
 from dataclasses import dataclass
+import os
 import queue
 import threading
 import time
@@ -531,7 +532,7 @@ class ComposedCameraClientSensor(Sensor, SensorClient):
             self._latest_message = ImageMessageSchema.deserialize(message).asdict()
             self._last_new_message_time = current_time
 
-            if self.idx % 10 == 0:
+            if self.idx % 10 == 0 and os.environ.get("CAMERA_TIMESTAMP_CLOCK") != "sim":
                 for image_key, image_time in self._latest_message["timestamps"].items():
                     image_latency = (time.time() - image_time) * 1000
                     print(f"Image latency for {image_key}: {image_latency:.2f} ms")

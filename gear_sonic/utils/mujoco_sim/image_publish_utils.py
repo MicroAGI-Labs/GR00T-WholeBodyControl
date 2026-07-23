@@ -2,12 +2,35 @@
 
 import multiprocessing as mp
 from multiprocessing import shared_memory
+import os
+import struct
 import time
 from typing import Any, Dict
 
 import numpy as np
 
 from gear_sonic.utils.mujoco_sim.sensor_server import ImageMessageSchema, SensorServer
+
+
+_SIM_CLOCK = struct.Struct("<dd")
+
+
+def _camera_timestamp(wall_time: float) -> float:
+    """Return the MuJoCo capture clock when simulation timestamps are enabled."""
+    if os.environ.get("CAMERA_TIMESTAMP_CLOCK") != "sim":
+        return wall_time
+    path = os.environ.get("SIM_CLOCK_PATH", "/results/cloudwalk-sim-clock.bin")
+    try:
+        with open(path, "rb", buffering=0) as handle:
+            payload = handle.read(_SIM_CLOCK.size)
+        if len(payload) == _SIM_CLOCK.size:
+            episode_time, _active_time = _SIM_CLOCK.unpack(payload)
+            return float(episode_time)
+    except (FileNotFoundError, OSError, struct.error):
+        pass
+    # A wall-clock fallback would put the observation billions of seconds in
+    # the future relative to MuJoCo. Zero makes the frame safely stale instead.
+    return 0.0
 
 
 def get_multiprocessing_info(verbose: bool = True):
@@ -166,10 +189,13 @@ class ImagePublishProcess:
                         from gear_sonic.utils.mujoco_sim.sensor_server import ImageUtils
 
                         image_copies = {name: arr.copy() for name, arr in shared_arrays.items()}
+                        capture_time = _camera_timestamp(current_time)
 
                         message_dict = {
                             "images": image_copies,
-                            "timestamps": {name: current_time for name in image_copies.keys()},
+                            "timestamps": {
+                                name: capture_time for name in image_copies.keys()
+                            },
                         }
 
                         image_msg = ImageMessageSchema(
