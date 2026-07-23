@@ -58,6 +58,7 @@
 #include <algorithm>
 #include <chrono>
 #include <unistd.h>
+#include <fcntl.h>
 #include <cstring>
 #include <functional>
 #include <unordered_map>
@@ -373,6 +374,18 @@ class G1Deploy {
     TimestampedData<LowState_> used_low_state_data_;
     TimestampedData<IMUState_> used_imu_torso_data_;
 
+    // Optional MuJoCo episode clock. In slow/offscreen simulation, the normal
+    // wall-clock recurrent threads otherwise advance against stale LowState
+    // while rendering or VLA inference has physics paused. Each worker keeps
+    // its trained logical dt but executes only when the shared simulator clock
+    // reaches its next deadline.
+    std::string sim_clock_path_;
+    int sim_clock_fd_ = -1;
+    std::mutex sim_clock_fd_mutex_;
+    double control_next_sim_time_ = -1.0;
+    double planner_next_sim_time_ = -1.0;
+    double writer_next_sim_time_ = -1.0;
+
     // State logger
     std::unique_ptr<StateLogger> state_logger_;
     
@@ -573,6 +586,41 @@ class G1Deploy {
           );
         }
       }
+      return true;
+    }
+
+    bool ReadSimulatorClock(double& episode_time, double& active_time) {
+      if (sim_clock_path_.empty()) return false;
+      if (sim_clock_fd_ < 0) {
+        std::lock_guard<std::mutex> lock(sim_clock_fd_mutex_);
+        if (sim_clock_fd_ < 0) sim_clock_fd_ = open(sim_clock_path_.c_str(), O_RDONLY);
+      }
+      if (sim_clock_fd_ < 0) return false;
+      double values[2] = {0.0, -1.0};
+      const ssize_t count = pread(sim_clock_fd_, values, sizeof(values), 0);
+      if (count != static_cast<ssize_t>(sizeof(values)) ||
+          !std::isfinite(values[0]) || !std::isfinite(values[1])) {
+        return false;
+      }
+      episode_time = values[0];
+      active_time = values[1];
+      return true;
+    }
+
+    bool SimulatorTickDue(double logical_period, double& next_time) {
+      double episode_time = 0.0;
+      double active_time = -1.0;
+      // Before the scored task clock starts, retain normal wall behavior so
+      // operator commands and the initialization ramp cannot deadlock.
+      if (!ReadSimulatorClock(episode_time, active_time) || active_time < 0.0) {
+        next_time = -1.0;
+        return true;
+      }
+      if (next_time < 0.0 || episode_time + logical_period < next_time) {
+        next_time = episode_time;
+      }
+      if (episode_time + 1e-9 < next_time) return false;
+      next_time += logical_period;
       return true;
     }
 
@@ -2730,6 +2778,12 @@ class G1Deploy {
       std::cout << "[deploy] CONTROL_WALL_SCALE=" << wall_scale
                 << " (thread periods /= scale; 1.0 = real-time / unchanged)" << std::endl;
 
+      { const char* e = std::getenv("SIM_CLOCK_PATH");
+        if (e && *e) sim_clock_path_ = e; }
+      std::cout << "[deploy] SIM_CLOCK_PATH="
+                << (sim_clock_path_.empty() ? "off" : sim_clock_path_)
+                << " (active MuJoCo clock gates control/planner/writer)" << std::endl;
+
       // Forward state-prediction horizon (s): on receipt, extrapolate LowState/IMU
       // forward by this many seconds (q += dq*T, quaternion integrated by gyro) to
       // cancel the ~40ms round-trip control-loop delay (network + async gaps) that
@@ -2772,6 +2826,10 @@ class G1Deploy {
 
     ~G1Deploy()
     {
+      if (sim_clock_fd_ >= 0) {
+        close(sim_clock_fd_);
+        sim_clock_fd_ = -1;
+      }
       // CUDA resources are now cleaned up by the PolicyEngine and planner classes automatically
     }
 
@@ -2923,6 +2981,7 @@ class G1Deploy {
      * Also publishes Dex3 hand commands at the same cadence.
      */
     void LowCommandWriter() {
+      if (!SimulatorTickDue(publish_dt_, writer_next_sim_time_)) return;
       LowCmd_ dds_low_command;
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
       dds_low_command.mode_machine() = mode_machine_;
@@ -4022,6 +4081,7 @@ class G1Deploy {
      */
     void Planner() {
       if (operator_state.stop) { return; }
+      if (!SimulatorTickDue(planner_dt_, planner_next_sim_time_)) return;
       auto low_state_data = low_state_buffer_.GetDataWithTime();
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
       
@@ -4280,6 +4340,7 @@ class G1Deploy {
      */
     void Control() {
       if (operator_state.stop) { return; }
+      if (!SimulatorTickDue(control_dt_, control_next_sim_time_)) return;
 
       switch (program_state_) {
         case ProgramState::INIT:
