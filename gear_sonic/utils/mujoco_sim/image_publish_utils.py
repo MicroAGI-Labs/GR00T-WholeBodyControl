@@ -7,10 +7,10 @@ import struct
 import time
 from typing import Any, Dict
 
+import cv2
 import numpy as np
 
-from gear_sonic.utils.mujoco_sim.sensor_server import ImageMessageSchema, SensorServer
-
+from gear_sonic.utils.mujoco_sim.sensor_server import SensorServer
 
 _SIM_CLOCK = struct.Struct("<dd")
 
@@ -186,27 +186,32 @@ class ImagePublishProcess:
                     last_data_time = current_time
 
                     try:
-                        from gear_sonic.utils.mujoco_sim.sensor_server import ImageUtils
-
                         image_copies = {name: arr.copy() for name, arr in shared_arrays.items()}
                         capture_time = _camera_timestamp(current_time)
+                        encoded_images = {}
+                        for camera_name, image_copy in image_copies.items():
+                            # MuJoCo returns RGB. Encode a standards-compliant JPEG
+                            # once and send its raw bytes. Camera clients already
+                            # decode byte payloads from BGR back to RGB, and the same
+                            # bytes can be reused by MJPEG and MCAP consumers.
+                            bgr_image = cv2.cvtColor(image_copy, cv2.COLOR_RGB2BGR)
+                            ok, encoded = cv2.imencode(
+                                ".jpg",
+                                bgr_image,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), 80],
+                            )
+                            if not ok:
+                                raise RuntimeError(
+                                    f"Failed to encode {camera_name} as JPEG"
+                                )
+                            encoded_images[camera_name] = encoded.tobytes()
 
-                        message_dict = {
-                            "images": image_copies,
+                        serialized_data = {
+                            "images": encoded_images,
                             "timestamps": {
-                                name: capture_time for name in image_copies.keys()
+                                name: capture_time for name in encoded_images
                             },
                         }
-
-                        image_msg = ImageMessageSchema(
-                            timestamps=message_dict.get("timestamps"),
-                            images=message_dict.get("images", None),
-                        )
-
-                        serialized_data = image_msg.serialize()
-
-                        for camera_name, image_copy in image_copies.items():
-                            serialized_data[f"{camera_name}"] = ImageUtils.encode_image(image_copy)
 
                         sensor_server.send_message(serialized_data)
 

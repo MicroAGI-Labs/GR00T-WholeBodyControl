@@ -235,6 +235,7 @@ class G1Deploy {
     // generated motions remain untouched.
     bool idle_hold_reference_enabled_ = false;
     double idle_hold_pitch_bias_rad_ = 0.0;
+    double idle_hold_root_height_ = -1.0;
     // Blend the 12 leg-joint IDLE references from the measured handoff pose
     // toward SONIC's native standing angles.  Zero preserves the measured-pose
     // hold; one requests the complete native leg pose.  This changes reference
@@ -610,9 +611,13 @@ class G1Deploy {
     bool SimulatorTickDue(double logical_period, double& next_time) {
       double episode_time = 0.0;
       double active_time = -1.0;
-      // Before the scored task clock starts, retain normal wall behavior so
-      // operator commands and the initialization ramp cannot deadlock.
-      if (!ReadSimulatorClock(episode_time, active_time) || active_time < 0.0) {
+      // Retain wall cadence only while MuJoCo physics is frozen at t=0 so the
+      // deploy initialization ramp and operator commands cannot deadlock. As
+      // soon as physics advances, gate on episode time even before scoring:
+      // otherwise 50 Hz wall cadence at 0.5 RTF becomes 100 Hz in simulator
+      // time and advances SONIC's recurrent state twice as fast as the robot.
+      if (!ReadSimulatorClock(episode_time, active_time) ||
+          (active_time < 0.0 && episode_time <= 1e-9)) {
         next_time = -1.0;
         return true;
       }
@@ -2408,6 +2413,8 @@ class G1Deploy {
       }
       { const char* e = std::getenv("SONIC_IDLE_LEG_BLEND");
         if (e) idle_hold_leg_blend_ = std::clamp(std::atof(e), 0.0, 1.0); }
+      { const char* e = std::getenv("SONIC_IDLE_ROOT_HEIGHT");
+        if (e) idle_hold_root_height_ = std::clamp(std::atof(e), 0.5, 1.2); }
       idle_target_pitch_bias_rad_ = idle_hold_pitch_bias_rad_;
       idle_target_leg_blend_ = idle_hold_leg_blend_;
       { const char* e = std::getenv("SONIC_IDLE_REFERENCE_FILE");
@@ -2416,7 +2423,8 @@ class G1Deploy {
                 << (idle_hold_reference_enabled_ ? "on" : "off")
                 << " (IDLE target = measured pose at transition, pitch bias="
                 << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg, leg blend="
-                << idle_hold_leg_blend_ << ")" << std::endl;
+                << idle_hold_leg_blend_ << ", root height="
+                << idle_hold_root_height_ << ")" << std::endl;
       if (!idle_reference_file_.empty()) {
         std::cout << "[idle-hold] live reference file: " << idle_reference_file_
                   << " (format: <pitch-deg> <leg-blend>)" << std::endl;
@@ -3534,6 +3542,9 @@ class G1Deploy {
         }
         planner_motion_->BodyQuaternions(frame)[0] = base_quat;
         if (planner_motion_->GetNumBodies() > 0) {
+          if (idle_hold_root_height_ > 0.0) {
+            planner_motion_->BodyPositions(frame)[0][2] = idle_hold_root_height_;
+          }
           planner_motion_->BodyLinVelocities(frame)[0] = {0.0, 0.0, 0.0};
           planner_motion_->BodyAngVelocities(frame)[0] = {0.0, 0.0, 0.0};
         }
