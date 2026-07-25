@@ -314,12 +314,11 @@ class G1Deploy {
     // budget, braking, and fault state; a joint event never damps another.
     bool joint_limiter_enabled_ = true;
     bool joint_limiter_terminating_ = false;
-    std::string joint_limiter_profile_ = "supported-commissioning";
+    std::string joint_limiter_profile_ = "shared-safety";
     sonic::safety::PerJointMotionLimiter joint_limiter_{
-        sonic::safety::SupportedCommissioningLimits()};
+        sonic::safety::SharedSafetyLimits()};
     std::array<sonic::safety::JointState, G1_NUM_MOTOR>
         joint_limiter_last_logged_state_{};
-    bool joint_limiter_sim_armed_logged_ = false;
 
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
@@ -2294,31 +2293,8 @@ class G1Deploy {
       // each isolated on its own domain (e.g. MuJoCo on domain 0, Isaac on domain 1).
       const char* _dds_domain_env = std::getenv("DDS_DOMAIN");
       int _dds_domain = _dds_domain_env ? std::atoi(_dds_domain_env) : 0;
-      if (const char* enabled_env = std::getenv("SONIC_JOINT_LIMITER")) {
-        const std::string value(enabled_env);
-        joint_limiter_enabled_ =
-            !(value == "0" || value == "false" || value == "off");
-      }
-      joint_limiter_profile_ = disable_crc_check_
-          ? "simulation-qualification" : "supported-commissioning";
-      if (const char* profile_env = std::getenv("SONIC_JOINT_LIMITER_PROFILE")) {
-        joint_limiter_profile_ = profile_env;
-      }
-      if (joint_limiter_profile_ == "simulation-qualification") {
-        if (!disable_crc_check_) {
-          throw std::runtime_error(
-              "simulation-qualification limiter profile requires simulation mode");
-        }
-        joint_limiter_ = sonic::safety::PerJointMotionLimiter(
-            sonic::safety::SimulationQualificationLimits());
-      } else if (joint_limiter_profile_ != "supported-commissioning") {
-        throw std::runtime_error(
-            "Unknown SONIC_JOINT_LIMITER_PROFILE: " + joint_limiter_profile_);
-      }
-      if (!joint_limiter_enabled_ && !disable_crc_check_) {
-        throw std::runtime_error(
-            "SONIC_JOINT_LIMITER may only be disabled in simulation mode");
-      }
+      // Simulation and hardware intentionally use the same compiled limiter.
+      // There is no environment override or CRC-mode-dependent safety profile.
       joint_limiter_last_logged_state_.fill(sonic::safety::JointState::kNormal);
       std::cout << "[JOINT-LIMITER] enabled="
                 << (joint_limiter_enabled_ ? "true" : "false")
@@ -3077,21 +3053,9 @@ class G1Deploy {
           }
           const bool desired_fresh = mc_data.GetAgeMs() >= 0.0 &&
                                      mc_data.GetAgeMs() <= 100.0;
-          bool lifecycle_armed = true;
-          if (disable_crc_check_ && !sim_clock_path_.empty()) {
-            double episode_time = 0.0;
-            double active_time = -1.0;
-            lifecycle_armed = ReadSimulatorClock(episode_time, active_time) &&
-                              episode_time > 1.0e-9;
-            if (lifecycle_armed && !joint_limiter_sim_armed_logged_) {
-              joint_limiter_sim_armed_logged_ = true;
-              std::cout << "[JOINT-LIMITER] simulator measured-state epoch "
-                           "advancing; accepting SONIC targets" << std::endl;
-            }
-          }
           limited = joint_limiter_.Step(
               desired, measured, measured_velocity,
-              desired_fresh && lifecycle_armed && !joint_limiter_terminating_);
+              desired_fresh && !joint_limiter_terminating_);
           for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
             const auto state = limited.state[i];
             const bool actual_motion_braking =

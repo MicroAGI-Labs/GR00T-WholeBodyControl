@@ -90,44 +90,19 @@ inline Limits BaseLimits() {
   return limits;
 }
 
-// Used only for the existing MuJoCo bottle-task qualification. It reproduces
-// the measured compatibility envelope; passing it does not approve any limit
-// for physical hardware.
-inline Limits SimulationQualificationLimits() {
+// The single limiter envelope used by both simulation and hardware. There is
+// deliberately no simulation compatibility profile: simulation must expose
+// any policy or balance failure caused by the deployment safety limits.
+// These conservative values still require mechanically supported commissioning
+// before hardware use; sharing them does not itself approve unsupported motion.
+inline Limits SharedSafetyLimits() {
   Limits limits = BaseLimits();
-  // These limits preserve the legacy policy's observed simulation command
-  // demand while making the output finite and auditable. They are deliberately
-  // broad because tighter envelopes changed the closed-loop balance dynamics.
-  // This compatibility profile is simulation evidence only, never a physical
-  // G1 approval. Hardware uses SupportedCommissioningLimits below.
-  limits.max_instant_velocity.fill(100.0);
-  limits.max_acceleration.fill(20000.0);
-  // Retain the exact window envelope used by the balanced calibration runs;
-  // even increasing selected budgets changed the learned closed-loop response.
-  limits.max_window_velocity.fill(50.0);
-  limits.max_tracking_error = {
-      2., 2., 2., 2., 2., 2.,
-      2., 2., 2., 2., 2., 2.,
-      1., 1., 1.,
-      1., 1., 1., 1., 1., 1., 1.,
-      1., 1., 1., 1., 1., 1., 1.,
-  };
-  limits.measured_velocity_brake.fill(10.0);
-  limits.measured_velocity_fault.fill(20.0);
   limits.brake_target_error = {
       .04, .04, .04, .04, .03, .03, .04, .04, .04, .04, .03, .03,
       .03, .03, .03,
       .03, .03, .03, .03, .02, .02, .02,
       .03, .03, .03, .03, .02, .02, .02,
   };
-  return limits;
-}
-
-// Slow mechanically-supported commissioning profile. It is intentionally not
-// suitable for unsupported biped balance and must never be silently selected
-// for a free-standing task.
-inline Limits SupportedCommissioningLimits() {
-  Limits limits = SimulationQualificationLimits();
   limits.max_instant_velocity = {
       .60, .60, .60, .60, .60, .60, .60, .60, .60, .60, .60, .60,
       .40, .40, .40,
@@ -349,19 +324,16 @@ class PerJointMotionLimiter {
       output.window_limited[joint] = true;
     }
 
-    double next_position = previous_position + delta;
-    const double safe_position =
-        std::clamp(next_position, lower_safe_bound, upper_safe_bound);
-    if (safe_position != next_position) {
+    const double next_position = previous_position + delta;
+    if (next_position < lower_safe_bound || next_position > upper_safe_bound) {
       output.tracking_limited[joint] = true;
-      const double correction = safe_position - next_position;
-      if (std::abs(correction) > limits_.max_instant_velocity[joint] * dt) {
-        LatchFault(joint, JointFaultReason::kEmergencyTrackingCorrection);
-        ++stats.emergency_tracking_corrections;
-      }
-      next_position = safe_position;
-      delta = next_position - previous_position;
-      next_velocity = delta / dt;
+      // The measured-position envelope can move faster than the command
+      // envelope when the physical joint is disturbed or already overspeeding.
+      // Snapping q_out to that moving envelope would itself create an unsafe
+      // command step. Preserve the velocity/acceleration-bounded output and
+      // remove stored spring energy by damping only this joint instead.
+      LatchFault(joint, JointFaultReason::kEmergencyTrackingCorrection);
+      ++stats.emergency_tracking_corrections;
     }
 
     position_[joint] = next_position;
@@ -374,6 +346,8 @@ class PerJointMotionLimiter {
         output.step_limited[joint] || output.acceleration_limited[joint] ||
         output.tracking_limited[joint];
     if (states_[joint] == JointState::kJointFault) {
+      output.local_damping[joint] = true;
+      ++stats.local_damping_ticks;
       ++stats.fault_ticks;
     } else if (braking) {
       states_[joint] = JointState::kBraking;

@@ -12,8 +12,7 @@ namespace {
 using sonic::safety::JointFaultReason;
 using sonic::safety::JointState;
 using sonic::safety::PerJointMotionLimiter;
-using sonic::safety::SimulationQualificationLimits;
-using sonic::safety::SupportedCommissioningLimits;
+using sonic::safety::SharedSafetyLimits;
 using sonic::safety::kJointCount;
 
 void Check(bool condition, const char* expression, int line) {
@@ -27,7 +26,7 @@ void Check(bool condition, const char* expression, int line) {
 std::array<double, kJointCount> Zeros() { return {}; }
 
 void TestSeedsFromMeasuredPosition() {
-  const auto limits = SimulationQualificationLimits();
+  const auto limits = SharedSafetyLimits();
   PerJointMotionLimiter limiter(limits);
   auto measured = Zeros();
   measured[3] = 0.7;
@@ -76,7 +75,7 @@ void TestRandomizedIndependentInvariants(const sonic::safety::Limits& limits) {
 }
 
 void TestOneJointBudgetNeverLimitsAnother() {
-  auto limits = SimulationQualificationLimits();
+  auto limits = SharedSafetyLimits();
   limits.max_window_velocity[0] = 0.01;
   limits.max_window_velocity[1] = 10.0;
   PerJointMotionLimiter limiter(limits);
@@ -92,12 +91,15 @@ void TestOneJointBudgetNeverLimitsAnother() {
   }
   const auto output = limiter.Step(desired, measured, Zeros(), true);
   CHECK(joint_zero_window_limited);
-  CHECK(output.position[1] > output.position[0] + 0.05);
+  CHECK(output.window_motion[0] <=
+        limits.max_window_velocity[0] * limits.window_duration + 1.0e-9);
+  CHECK(output.position[1] > output.position[0] + 0.01);
+  CHECK(output.position[1] > output.position[0] * 10.0);
   CHECK(output.state[1] != JointState::kJointFault);
 }
 
 void TestOverspeedBrakesOnlyAffectedJoint() {
-  const auto limits = SimulationQualificationLimits();
+  const auto limits = SharedSafetyLimits();
   PerJointMotionLimiter limiter(limits);
   auto measured = Zeros();
   auto velocity = Zeros();
@@ -110,6 +112,7 @@ void TestOverspeedBrakesOnlyAffectedJoint() {
     output = limiter.Step(desired, measured, velocity, true);
   }
   CHECK(output.state[26] == JointState::kJointFault);
+  CHECK(output.local_damping[26]);
   CHECK(limiter.fault_reasons()[26] == JointFaultReason::kMeasuredOverspeed);
   for (std::size_t joint = 0; joint < kJointCount; ++joint) {
     if (joint == 26) continue;
@@ -118,8 +121,28 @@ void TestOverspeedBrakesOnlyAffectedJoint() {
   }
 }
 
+void TestTrackingEnvelopeCannotForceCommandJump() {
+  const auto limits = SharedSafetyLimits();
+  PerJointMotionLimiter limiter(limits);
+  auto measured = Zeros();
+  CHECK(limiter.Seed(measured));
+  measured[2] = 0.5;
+  const auto output = limiter.Step(Zeros(), measured, Zeros(), true);
+  CHECK(output.state[2] == JointState::kJointFault);
+  CHECK(output.local_damping[2]);
+  CHECK(limiter.fault_reasons()[2] ==
+        JointFaultReason::kEmergencyTrackingCorrection);
+  CHECK(std::abs(output.velocity[2]) <=
+        limits.max_instant_velocity[2] + 1.0e-9);
+  CHECK(std::abs(output.velocity[2]) <=
+        limits.max_acceleration[2] * limits.writer_dt + 1.0e-9);
+  CHECK(std::abs(output.position[2]) <=
+        limits.max_acceleration[2] * limits.writer_dt * limits.writer_dt +
+            1.0e-9);
+}
+
 void TestInvalidMeasurementUsesLocalDampingOnly() {
-  PerJointMotionLimiter limiter(SimulationQualificationLimits());
+  PerJointMotionLimiter limiter(SharedSafetyLimits());
   auto measured = Zeros();
   CHECK(limiter.Seed(measured));
   measured[7] = std::numeric_limits<double>::quiet_NaN();
@@ -132,7 +155,7 @@ void TestInvalidMeasurementUsesLocalDampingOnly() {
 }
 
 void TestTerminationRejectsTargetsAndMovesTowardMeasuredHold() {
-  PerJointMotionLimiter limiter(SimulationQualificationLimits());
+  PerJointMotionLimiter limiter(SharedSafetyLimits());
   auto measured = Zeros();
   auto desired = Zeros();
   desired[4] = 0.08;
@@ -141,12 +164,18 @@ void TestTerminationRejectsTargetsAndMovesTowardMeasuredHold() {
     limiter.Step(desired, measured, Zeros(), true);
   }
   const auto before = limiter.Step(desired, measured, Zeros(), true);
-  const auto after = limiter.Step(desired, measured, Zeros(), false);
+  auto after = limiter.Step(desired, measured, Zeros(), false);
   CHECK(!after.accepting_desired);
-  CHECK(std::abs(after.position[4] - measured[4]) <=
-        std::abs(before.position[4] - measured[4]));
+  CHECK(std::abs(after.velocity[4]) < std::abs(before.velocity[4]));
   CHECK(after.state[4] == JointState::kBraking ||
         after.state[4] == JointState::kRateLimited);
+  double closest_hold_error = std::abs(after.position[4] - measured[4]);
+  for (int tick = 0; tick < 100; ++tick) {
+    after = limiter.Step(desired, measured, Zeros(), false);
+    closest_hold_error = std::min(
+        closest_hold_error, std::abs(after.position[4] - measured[4]));
+  }
+  CHECK(closest_hold_error < std::abs(before.position[4] - measured[4]));
   CHECK(limiter.stats()[4].lifecycle_hold_ticks > 0);
 }
 
@@ -154,10 +183,10 @@ void TestTerminationRejectsTargetsAndMovesTowardMeasuredHold() {
 
 int main() {
   TestSeedsFromMeasuredPosition();
-  TestRandomizedIndependentInvariants(SimulationQualificationLimits());
-  TestRandomizedIndependentInvariants(SupportedCommissioningLimits());
+  TestRandomizedIndependentInvariants(SharedSafetyLimits());
   TestOneJointBudgetNeverLimitsAnother();
   TestOverspeedBrakesOnlyAffectedJoint();
+  TestTrackingEnvelopeCannotForceCommandJump();
   TestInvalidMeasurementUsesLocalDampingOnly();
   TestTerminationRejectsTargetsAndMovesTowardMeasuredHold();
   std::cout << "per_joint_motion_limiter: all tests passed\n";
