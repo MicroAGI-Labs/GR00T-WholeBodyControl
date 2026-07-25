@@ -66,6 +66,7 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <chrono>
 #include <algorithm>
 #include <numeric>
@@ -317,6 +318,7 @@ class G1Deploy {
     std::string joint_limiter_profile_ = "shared-safety";
     std::string joint_limiter_level_file_;
     double joint_limiter_level_ = 1.0;
+    std::atomic<bool> joint_limiter_active_for_policy_{true};
     double joint_limiter_level_min_ = 1.0;
     double joint_limiter_level_max_ = 1.0;
     std::uint64_t joint_limiter_level_changes_ = 0;
@@ -326,6 +328,28 @@ class G1Deploy {
         sonic::safety::SharedSafetyLimits()};
     std::array<sonic::safety::JointState, G1_NUM_MOTOR>
         joint_limiter_last_logged_state_{};
+    // A limited controller must not see a discontinuous first SONIC target.
+    // Blend from the measured startup pose while the external support remains
+    // engaged, then declare priming ready only after command, measurement, and
+    // every per-joint moving window have converged for a continuous interval.
+    double joint_limiter_handover_duration_s_ = 2.0;
+    double joint_limiter_handover_trigger_rad_ = 0.01;
+    double joint_limiter_prime_desired_error_rad_ = 0.05;
+    double joint_limiter_prime_tracking_error_rad_ = 0.08;
+    double joint_limiter_prime_window_fraction_ = 0.20;
+    double joint_limiter_prime_stable_duration_s_ = 0.50;
+    std::array<double, G1_NUM_MOTOR> joint_limiter_handover_start_q_{};
+    double joint_limiter_handover_elapsed_s_ = 0.0;
+    double joint_limiter_handover_alpha_ = 0.0;
+    bool joint_limiter_handover_started_ = false;
+    bool joint_limiter_handover_complete_logged_ = false;
+    std::uint64_t joint_limiter_prime_stable_ticks_ = 0;
+    std::uint64_t joint_limiter_prime_ready_tick_ = 0;
+    bool joint_limiter_prime_ready_ = false;
+    bool joint_limiter_prime_failed_ = false;
+    double joint_limiter_prime_max_desired_error_rad_ = 0.0;
+    double joint_limiter_prime_max_tracking_error_rad_ = 0.0;
+    double joint_limiter_prime_max_window_fraction_ = 0.0;
 
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
@@ -339,6 +363,8 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
     ProgramState program_state_;
     std::array<double, G1_NUM_MOTOR> last_action;
+    std::mutex last_action_mutex_;
+    std::atomic<bool> continuous_first_policy_target_pending_{false};
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
 
@@ -2303,6 +2329,7 @@ class G1Deploy {
       // Simulation and hardware use the same limiter implementation and full
       // envelope. Simulation may scale that envelope through a live level file;
       // there is no alternate profile or CRC-selected set of limits.
+      ConfigureJointLimiterPriming();
       ConfigureJointLimiterLevelFile();
       joint_limiter_last_logged_state_.fill(sonic::safety::JointState::kNormal);
       std::cout << "[JOINT-LIMITER] enabled="
@@ -2924,6 +2951,188 @@ class G1Deploy {
       }
     }
 
+    void ConfigureJointLimiterPriming() {
+      const auto read_bounded = [](const char* name, double& value,
+                                   double minimum, double maximum) {
+        const char* text = std::getenv(name);
+        if (!(text && *text)) return;
+        const double requested = std::atof(text);
+        if (std::isfinite(requested) && requested >= minimum &&
+            requested <= maximum) {
+          value = requested;
+        } else {
+          std::cerr << "[JOINT-LIMITER-PRIME] ignoring invalid " << name
+                    << '=' << text << std::endl;
+        }
+      };
+      read_bounded("SONIC_JOINT_LIMITER_HANDOVER_S",
+                   joint_limiter_handover_duration_s_, 0.1, 20.0);
+      read_bounded("SONIC_JOINT_LIMITER_HANDOVER_TRIGGER_RAD",
+                   joint_limiter_handover_trigger_rad_, 0.001, 0.5);
+      read_bounded("SONIC_JOINT_LIMITER_PRIME_DESIRED_ERROR_RAD",
+                   joint_limiter_prime_desired_error_rad_, 0.001, 1.0);
+      read_bounded("SONIC_JOINT_LIMITER_PRIME_TRACKING_ERROR_RAD",
+                   joint_limiter_prime_tracking_error_rad_, 0.001, 1.0);
+      read_bounded("SONIC_JOINT_LIMITER_PRIME_WINDOW_FRACTION",
+                   joint_limiter_prime_window_fraction_, 0.0, 1.0);
+      read_bounded("SONIC_JOINT_LIMITER_PRIME_STABLE_S",
+                   joint_limiter_prime_stable_duration_s_, 0.02, 10.0);
+      std::cout << "[JOINT-LIMITER-PRIME] config handover_s="
+                << joint_limiter_handover_duration_s_
+                << " handover_trigger_rad="
+                << joint_limiter_handover_trigger_rad_
+                << " desired_error_rad="
+                << joint_limiter_prime_desired_error_rad_
+                << " tracking_error_rad="
+                << joint_limiter_prime_tracking_error_rad_
+                << " window_fraction="
+                << joint_limiter_prime_window_fraction_
+                << " stable_s=" << joint_limiter_prime_stable_duration_s_
+                << std::endl;
+    }
+
+    void ResetJointLimiterPriming(
+        const std::array<double, G1_NUM_MOTOR>& measured) {
+      joint_limiter_handover_start_q_ = measured;
+      joint_limiter_handover_elapsed_s_ = 0.0;
+      joint_limiter_handover_alpha_ = 0.0;
+      joint_limiter_handover_started_ = false;
+      joint_limiter_handover_complete_logged_ = false;
+      joint_limiter_prime_stable_ticks_ = 0;
+      joint_limiter_prime_ready_tick_ = 0;
+      joint_limiter_prime_ready_ = false;
+      joint_limiter_prime_failed_ = false;
+      joint_limiter_prime_max_desired_error_rad_ = 0.0;
+      joint_limiter_prime_max_tracking_error_rad_ = 0.0;
+      joint_limiter_prime_max_window_fraction_ = 0.0;
+    }
+
+    void ApplyJointLimiterContinuousHandover(
+        std::array<double, G1_NUM_MOTOR>& desired,
+        const std::array<double, G1_NUM_MOTOR>& measured,
+        bool desired_fresh) {
+      if (!desired_fresh || joint_limiter_prime_ready_) return;
+      if (!joint_limiter_handover_started_) {
+        double max_raw_desired_delta = 0.0;
+        for (std::size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+          max_raw_desired_delta = std::max(
+              max_raw_desired_delta, std::abs(desired[i] - measured[i]));
+        }
+        // Fresh measured-position holds are published before the planner has
+        // produced its first real target. Do not consume the handover on that
+        // placeholder stream; wait for a material SONIC command transition.
+        if (max_raw_desired_delta < joint_limiter_handover_trigger_rad_) return;
+        joint_limiter_handover_start_q_ = measured;
+        joint_limiter_handover_elapsed_s_ = 0.0;
+        joint_limiter_handover_alpha_ = 0.0;
+        joint_limiter_handover_started_ = true;
+        std::cout << "[JOINT-LIMITER-PRIME] handover_started; first desired "
+                     "target equals measured position; raw_delta_rad="
+                  << max_raw_desired_delta
+                  << std::endl;
+      }
+
+      joint_limiter_handover_alpha_ = std::clamp(
+          joint_limiter_handover_elapsed_s_ /
+              joint_limiter_handover_duration_s_,
+          0.0, 1.0);
+      for (std::size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+        desired[i] = joint_limiter_handover_start_q_[i] +
+            joint_limiter_handover_alpha_ *
+                (desired[i] - joint_limiter_handover_start_q_[i]);
+      }
+      if (joint_limiter_handover_alpha_ >= 1.0 &&
+          !joint_limiter_handover_complete_logged_) {
+        joint_limiter_handover_complete_logged_ = true;
+        std::cout << "[JOINT-LIMITER-PRIME] handover_complete; using live "
+                     "SONIC desired positions"
+                  << std::endl;
+      }
+      joint_limiter_handover_elapsed_s_ = std::min(
+          joint_limiter_handover_duration_s_,
+          joint_limiter_handover_elapsed_s_ +
+              joint_limiter_.limits().writer_dt);
+    }
+
+    void UpdateJointLimiterPriming(
+        const std::array<double, G1_NUM_MOTOR>& desired,
+        const std::array<double, G1_NUM_MOTOR>& measured,
+        const sonic::safety::Output& limited,
+        bool desired_fresh) {
+      if (joint_limiter_prime_ready_ || !joint_limiter_handover_started_) return;
+      const auto& limits = joint_limiter_.limits();
+      double max_desired_error = 0.0;
+      double max_tracking_error = 0.0;
+      double max_window_fraction = 0.0;
+      bool faulted = false;
+      for (std::size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+        max_desired_error = std::max(
+            max_desired_error, std::abs(limited.position[i] - desired[i]));
+        max_tracking_error = std::max(
+            max_tracking_error, std::abs(measured[i] - limited.position[i]));
+        const double full_window_budget =
+            limits.max_window_velocity[i] * limits.window_duration;
+        if (full_window_budget > 0.0) {
+          max_window_fraction = std::max(
+              max_window_fraction,
+              limited.window_motion[i] / full_window_budget);
+        }
+        faulted |= limited.state[i] ==
+            sonic::safety::JointState::kJointFault;
+      }
+      joint_limiter_prime_max_desired_error_rad_ = max_desired_error;
+      joint_limiter_prime_max_tracking_error_rad_ = max_tracking_error;
+      joint_limiter_prime_max_window_fraction_ = max_window_fraction;
+
+      if (faulted && !joint_limiter_prime_failed_) {
+        joint_limiter_prime_failed_ = true;
+        std::cout << "[JOINT-LIMITER-PRIME] failed joint_fault_before_release "
+                     "alpha="
+                  << joint_limiter_handover_alpha_
+                  << " max_desired_error_rad=" << max_desired_error
+                  << " max_tracking_error_rad=" << max_tracking_error
+                  << " max_window_fraction=" << max_window_fraction
+                  << std::endl;
+      }
+
+      const bool converged = desired_fresh && !faulted &&
+          joint_limiter_handover_alpha_ >= 1.0 &&
+          max_desired_error <= joint_limiter_prime_desired_error_rad_ &&
+          max_tracking_error <= joint_limiter_prime_tracking_error_rad_ &&
+          max_window_fraction <= joint_limiter_prime_window_fraction_;
+      if (converged) {
+        ++joint_limiter_prime_stable_ticks_;
+      } else {
+        joint_limiter_prime_stable_ticks_ = 0;
+      }
+
+      const std::uint64_t tick = joint_limiter_.stats()[0].ticks;
+      if (tick % 250 == 0) {
+        std::cout << "[JOINT-LIMITER-PRIME] status tick=" << tick
+                  << " alpha=" << joint_limiter_handover_alpha_
+                  << " max_desired_error_rad=" << max_desired_error
+                  << " max_tracking_error_rad=" << max_tracking_error
+                  << " max_window_fraction=" << max_window_fraction
+                  << " stable_ticks=" << joint_limiter_prime_stable_ticks_
+                  << " faulted=" << faulted << std::endl;
+      }
+
+      const std::uint64_t required_ticks = static_cast<std::uint64_t>(
+          std::ceil(joint_limiter_prime_stable_duration_s_ /
+                    limits.writer_dt));
+      if (joint_limiter_prime_stable_ticks_ >= required_ticks) {
+        joint_limiter_prime_ready_ = true;
+        joint_limiter_prime_ready_tick_ = tick;
+        std::cout << "[JOINT-LIMITER-PRIME] ready tick=" << tick
+                  << " max_desired_error_rad=" << max_desired_error
+                  << " max_tracking_error_rad=" << max_tracking_error
+                  << " max_window_fraction=" << max_window_fraction
+                  << " stable_s="
+                  << joint_limiter_prime_stable_ticks_ * limits.writer_dt
+                  << std::endl;
+      }
+    }
+
     bool ReadJointLimiterLevel(double& level) const {
       if (joint_limiter_level_file_.empty()) return false;
       std::ifstream input(joint_limiter_level_file_);
@@ -2948,6 +3157,7 @@ class G1Deploy {
       double requested = 1.0;
       if (ReadJointLimiterLevel(requested)) {
         joint_limiter_level_ = requested;
+        joint_limiter_active_for_policy_.store(requested > 0.0);
         if (requested > 0.0) {
           joint_limiter_ = sonic::safety::PerJointMotionLimiter(
               sonic::safety::SafetyLimitsForLevel(requested));
@@ -2979,6 +3189,7 @@ class G1Deploy {
           return;
         }
         joint_limiter_ = std::move(replacement);
+        ResetJointLimiterPriming(measured);
       } else {
         // Level zero is an exact writer bypass. Replace the stateful limiter as
         // well so telemetry after the change cannot be confused with the
@@ -2987,6 +3198,7 @@ class G1Deploy {
             sonic::safety::SharedSafetyLimits());
       }
       joint_limiter_level_ = requested;
+      joint_limiter_active_for_policy_.store(requested > 0.0);
       joint_limiter_level_min_ =
           std::min(joint_limiter_level_min_, requested);
       joint_limiter_level_max_ =
@@ -3139,10 +3351,12 @@ class G1Deploy {
             }
           } else {
             std::array<double, G1_NUM_MOTOR> desired{};
+            std::array<double, G1_NUM_MOTOR> raw_desired{};
             std::array<double, G1_NUM_MOTOR> measured{};
             std::array<double, G1_NUM_MOTOR> measured_velocity{};
             for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
-              desired[i] = mc->q_target.at(i);
+              raw_desired[i] = mc->q_target.at(i);
+              desired[i] = raw_desired[i];
               measured[i] = low_state_data.data->motor_state()[i].q();
               measured_velocity[i] = low_state_data.data->motor_state()[i].dq();
             }
@@ -3155,30 +3369,130 @@ class G1Deploy {
                                "withholding all new body commands" << std::endl;
                   return;
                 }
+                ResetJointLimiterPriming(measured);
                 std::cout << "[JOINT-LIMITER] seeded all 29 joints from measured q; "
                              "moving windows empty" << std::endl;
               }
               const bool desired_fresh = mc_data.GetAgeMs() >= 0.0 &&
                                          mc_data.GetAgeMs() <= 100.0;
+              const bool accept_desired =
+                  desired_fresh && !joint_limiter_terminating_;
+              ApplyJointLimiterContinuousHandover(
+                  desired, measured, accept_desired);
               limited = joint_limiter_.Step(
                   desired, measured, measured_velocity,
-                  desired_fresh && !joint_limiter_terminating_);
+                  accept_desired);
+              {
+                // Feed the policy the action that was actually emitted, not
+                // the unconstrained network request. Otherwise its recurrent
+                // action history assumes motion that the limiter prevented and
+                // the raw SONIC trajectory rapidly becomes discontinuous.
+                std::lock_guard<std::mutex> lock(last_action_mutex_);
+                for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+                     ++hardware_joint) {
+                  const int policy_joint =
+                      isaaclab_to_mujoco[hardware_joint];
+                  last_action[policy_joint] =
+                      (limited.position[hardware_joint] -
+                       default_angles[hardware_joint]) /
+                      g1_action_scale[hardware_joint];
+                }
+              }
+              UpdateJointLimiterPriming(
+                  desired, measured, limited, accept_desired);
+              std::ostringstream transition_batch;
+              bool have_transition_batch = false;
               for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
                 const auto state = limited.state[i];
+                const auto previous_state = joint_limiter_last_logged_state_[i];
                 const bool actual_motion_braking =
                     std::abs(measured_velocity[i]) >
                     joint_limiter_.limits().measured_velocity_brake[i];
-                if (state != joint_limiter_last_logged_state_[i] &&
-                    (actual_motion_braking ||
-                     state == sonic::safety::JointState::kJointFault)) {
-                  std::cout << "[JOINT-LIMITER] joint=" << i
+                // Log each entry into an active limiter state with enough
+                // context to distinguish command shaping, actual-motion
+                // braking, and a latched local joint fault. Normal-state
+                // transitions are intentionally silent to avoid changing
+                // control-loop timing through excessive stdout traffic.
+                if (state != previous_state &&
+                    state != sonic::safety::JointState::kNormal) {
+                  const auto& limits = joint_limiter_.limits();
+                  const auto& stats = joint_limiter_.stats()[i];
+                  const auto fault_reason = joint_limiter_.fault_reasons()[i];
+                  const double elapsed_s =
+                      static_cast<double>(stats.ticks) * limits.writer_dt;
+                  const double window_budget =
+                      limits.max_window_velocity[i] * limits.window_duration;
+                  if (state != sonic::safety::JointState::kJointFault) {
+                    // Fresh/stale target boundaries commonly transition all
+                    // joints together. Batch RATE_LIMITED and BRAKING events
+                    // into one stream write; flushing 29 detailed lines from
+                    // the 500 Hz writer can stall DDS and therefore physics.
+                    if (!have_transition_batch) {
+                      transition_batch
+                          << "[JOINT-LIMITER-TRANSITIONS] tick=" << stats.ticks
+                          << " t_s=" << elapsed_s << " joints=";
+                    } else {
+                      transition_batch << ',';
+                    }
+                    have_transition_batch = true;
+                    transition_batch
+                        << i << "(state="
+                        << sonic::safety::JointStateName(state)
+                        << ";fresh=" << limited.accepting_desired
+                        << ";flags="
+                        << (limited.step_limited[i] ? 'S' : '-')
+                        << (limited.acceleration_limited[i] ? 'A' : '-')
+                        << (limited.window_limited[i] ? 'W' : '-')
+                        << (limited.tracking_limited[i] ? 'T' : '-')
+                        << ";q=" << measured[i]
+                        << ";raw=" << raw_desired[i]
+                        << ";shaped=" << desired[i]
+                        << ";out=" << limited.position[i]
+                        << ";dq=" << measured_velocity[i]
+                        << ";dqout=" << limited.velocity[i]
+                        << ";window=" << limited.window_motion[i]
+                        << '/' << window_budget << ')';
+                  } else {
+                    std::cout << "[JOINT-LIMITER-EVENT] tick=" << stats.ticks
+                            << " t_s=" << elapsed_s
+                            << " joint=" << i
+                            << " from="
+                            << sonic::safety::JointStateName(previous_state)
                             << " state=" << sonic::safety::JointStateName(state)
-                            << " measured_dq=" << measured_velocity[i]
-                            << " q_out=" << limited.position[i]
+                            << " fault_reason="
+                            << sonic::safety::JointFaultReasonName(fault_reason)
+                            << " accepting_desired=" << limited.accepting_desired
+                            << " step_limited=" << limited.step_limited[i]
+                            << " acceleration_limited="
+                            << limited.acceleration_limited[i]
+                            << " window_limited=" << limited.window_limited[i]
+                            << " tracking_limited=" << limited.tracking_limited[i]
+                            << " actual_motion_braking=" << actual_motion_braking
+                            << " q_measured=" << measured[i]
+                            << " q_des_raw=" << raw_desired[i]
                             << " q_des=" << desired[i]
-                            << " (other joints unaffected)" << std::endl;
+                            << " q_out=" << limited.position[i]
+                            << " dq_measured=" << measured_velocity[i]
+                            << " dq_out=" << limited.velocity[i]
+                            << " window_motion=" << limited.window_motion[i]
+                            << " instant_velocity_cap="
+                            << limits.max_instant_velocity[i]
+                            << " acceleration_cap=" << limits.max_acceleration[i]
+                            << " window_budget=" << window_budget
+                            << " tracking_error_cap="
+                            << limits.max_tracking_error[i]
+                            << " measured_velocity_brake="
+                            << limits.measured_velocity_brake[i]
+                            << " measured_velocity_fault="
+                            << limits.measured_velocity_fault[i]
+                            << " local_damping=" << limited.local_damping[i]
+                            << " other_joints_unaffected=true" << std::endl;
+                  }
                 }
                 joint_limiter_last_logged_state_[i] = state;
+              }
+              if (have_transition_batch) {
+                std::cout << transition_batch.str() << std::endl;
               }
             }
           }
@@ -3234,6 +3548,23 @@ class G1Deploy {
                 << ",\"limiting_level_changes\":" << joint_limiter_level_changes_
                 << ",\"bypass_ticks\":" << joint_limiter_bypass_ticks_
                 << ",\"stats_since_level_change\":true"
+                << ",\"handover_duration_s\":"
+                << joint_limiter_handover_duration_s_
+                << ",\"handover_started\":"
+                << (joint_limiter_handover_started_ ? "true" : "false")
+                << ",\"handover_alpha\":" << joint_limiter_handover_alpha_
+                << ",\"prime_ready\":"
+                << (joint_limiter_prime_ready_ ? "true" : "false")
+                << ",\"prime_failed\":"
+                << (joint_limiter_prime_failed_ ? "true" : "false")
+                << ",\"prime_ready_tick\":"
+                << joint_limiter_prime_ready_tick_
+                << ",\"prime_max_desired_error_rad\":"
+                << joint_limiter_prime_max_desired_error_rad_
+                << ",\"prime_max_tracking_error_rad\":"
+                << joint_limiter_prime_max_tracking_error_rad_
+                << ",\"prime_max_window_fraction\":"
+                << joint_limiter_prime_max_window_fraction_
                 << ",\"window_s\":" << joint_limiter_.limits().window_duration
                 << ",\"whole_body_damping_from_joint_faults\":0";
       const auto print_u64 = [&](const char* name, auto getter) {
@@ -3581,12 +3912,17 @@ class G1Deploy {
 
       // Log robot state for analysis and debugging
       if (state_logger_) {
+        std::array<double, G1_NUM_MOTOR> last_action_snapshot{};
+        {
+          std::lock_guard<std::mutex> lock(last_action_mutex_);
+          last_action_snapshot = last_action;
+        }
         // Get ROS timestamp if using ROS2 output interface (0.0 for non-ROS2 interfaces)
         double ros_timestamp = GetRosTimestamp();
         state_logger_->LogFullState(base_quat, base_ang_vel, base_accel, body_torso_quat, body_torso_ang_vel, body_torso_accel,
                                     std::span(body_q),
                                     std::span(body_dq),
-                                    std::span(last_action),
+                                    std::span(last_action_snapshot),
                                     std::span(motor_temperature),
                                     std::span(motor_error),
                                     std::span(motor_torque),
@@ -3774,16 +4110,52 @@ class G1Deploy {
       // Access actions from control policy's internal buffer (already populated by Infer)
       auto& action_buffer = policy_engine_->GetActionBuffer();
       float* floatarr = action_buffer.data();
-      
+
+      const bool make_first_target_continuous =
+          joint_limiter_enabled_ &&
+          joint_limiter_active_for_policy_.load() &&
+          continuous_first_policy_target_pending_.exchange(false);
+      const auto low_state = make_first_target_continuous
+          ? low_state_buffer_.GetDataWithTime().data
+          : nullptr;
+      const bool have_measured_start =
+          low_state && low_state->motor_state().size() >= G1_NUM_MOTOR;
+
       MotorCommand motor_command_tmp;
+      std::array<double, G1_NUM_MOTOR> requested_action{};
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
         const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
-        last_action[i] = static_cast<double>(floatarr[i]);
-        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i] + action_value);
+        requested_action[i] = static_cast<double>(floatarr[i]);
+        motor_command_tmp.q_target.at(i) = have_measured_start
+            ? low_state->motor_state()[i].q()
+            : static_cast<float>(default_angles[i] + action_value);
         motor_command_tmp.tau_ff.at(i) = 0.0;
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
+      }
+      {
+        std::lock_guard<std::mutex> lock(last_action_mutex_);
+        if (have_measured_start) {
+          // last_action is stored in policy (IsaacLab) order. Seed the
+          // recurrent/history observation with the action corresponding to
+          // the measured pose, exactly matching the first emitted q_des.
+          for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+               ++hardware_joint) {
+            const int policy_joint = isaaclab_to_mujoco[hardware_joint];
+            last_action[policy_joint] =
+                (low_state->motor_state()[hardware_joint].q() -
+                 default_angles[hardware_joint]) /
+                g1_action_scale[hardware_joint];
+          }
+        } else {
+          last_action = requested_action;
+        }
+      }
+      if (have_measured_start) {
+        std::cout << "[SONIC-CONTINUOUS-START] first policy q_des equals "
+                     "measured startup pose; applied-action history seeded"
+                  << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
@@ -4689,6 +5061,24 @@ class G1Deploy {
                           << "Robot will use zero tokens until tokens start streaming." << std::endl;
               }
               warn_count++;
+            }
+            if (joint_limiter_enabled_ &&
+                joint_limiter_active_for_policy_.load()) {
+              const auto low_state = low_state_buffer_.GetDataWithTime().data;
+              if (low_state &&
+                  low_state->motor_state().size() >= G1_NUM_MOTOR) {
+                std::lock_guard<std::mutex> lock(last_action_mutex_);
+                for (int hardware_joint = 0;
+                     hardware_joint < G1_NUM_MOTOR; ++hardware_joint) {
+                  const int policy_joint =
+                      isaaclab_to_mujoco[hardware_joint];
+                  last_action[policy_joint] =
+                      (low_state->motor_state()[hardware_joint].q() -
+                       default_angles[hardware_joint]) /
+                      g1_action_scale[hardware_joint];
+                }
+              }
+              continuous_first_policy_target_pending_.store(true);
             }
             std::cout << "[Control] DEBUG: operator_state.start=true, transitioning to CONTROL state" << std::endl;
             program_state_ = ProgramState::CONTROL;
