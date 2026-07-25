@@ -12,6 +12,7 @@ namespace {
 using sonic::safety::JointFaultReason;
 using sonic::safety::JointState;
 using sonic::safety::PerJointMotionLimiter;
+using sonic::safety::SafetyLimitsForLevel;
 using sonic::safety::SharedSafetyLimits;
 using sonic::safety::kJointCount;
 
@@ -40,6 +41,27 @@ void TestSeedsFromMeasuredPosition() {
   CHECK(std::abs(output.position[3] - measured[3]) <=
         maximum_first_step + 1.0e-9);
   CHECK(output.position[3] != desired[3]);
+}
+
+void TestLimitingLevelScalesDynamicCeilings() {
+  const auto full = SafetyLimitsForLevel(1.0);
+  const auto half = SafetyLimitsForLevel(0.5);
+  for (std::size_t joint = 0; joint < kJointCount; ++joint) {
+    CHECK(half.min_position[joint] == full.min_position[joint]);
+    CHECK(half.max_position[joint] == full.max_position[joint]);
+    CHECK(std::abs(half.max_instant_velocity[joint] -
+                   2.0 * full.max_instant_velocity[joint]) < 1.0e-12);
+    CHECK(std::abs(half.max_acceleration[joint] -
+                   2.0 * full.max_acceleration[joint]) < 1.0e-12);
+    CHECK(std::abs(half.max_window_velocity[joint] -
+                   2.0 * full.max_window_velocity[joint]) < 1.0e-12);
+    CHECK(std::abs(half.max_tracking_error[joint] -
+                   2.0 * full.max_tracking_error[joint]) < 1.0e-12);
+    CHECK(std::abs(half.measured_velocity_brake[joint] -
+                   2.0 * full.measured_velocity_brake[joint]) < 1.0e-12);
+    CHECK(std::abs(half.measured_velocity_fault[joint] -
+                   2.0 * full.measured_velocity_fault[joint]) < 1.0e-12);
+  }
 }
 
 void TestRandomizedIndependentInvariants(const sonic::safety::Limits& limits) {
@@ -182,6 +204,7 @@ void TestTerminationRejectsTargetsAndMovesTowardMeasuredHold() {
 }  // namespace
 
 int main() {
+  TestLimitingLevelScalesDynamicCeilings();
   TestSeedsFromMeasuredPosition();
   TestRandomizedIndependentInvariants(SharedSafetyLimits());
   TestOneJointBudgetNeverLimitsAnother();

@@ -315,6 +315,13 @@ class G1Deploy {
     bool joint_limiter_enabled_ = true;
     bool joint_limiter_terminating_ = false;
     std::string joint_limiter_profile_ = "shared-safety";
+    std::string joint_limiter_level_file_;
+    double joint_limiter_level_ = 1.0;
+    double joint_limiter_level_min_ = 1.0;
+    double joint_limiter_level_max_ = 1.0;
+    std::uint64_t joint_limiter_level_changes_ = 0;
+    std::uint64_t joint_limiter_bypass_ticks_ = 0;
+    int joint_limiter_level_refresh_ticks_ = 0;
     sonic::safety::PerJointMotionLimiter joint_limiter_{
         sonic::safety::SharedSafetyLimits()};
     std::array<sonic::safety::JointState, G1_NUM_MOTOR>
@@ -2293,12 +2300,15 @@ class G1Deploy {
       // each isolated on its own domain (e.g. MuJoCo on domain 0, Isaac on domain 1).
       const char* _dds_domain_env = std::getenv("DDS_DOMAIN");
       int _dds_domain = _dds_domain_env ? std::atoi(_dds_domain_env) : 0;
-      // Simulation and hardware intentionally use the same compiled limiter.
-      // There is no environment override or CRC-mode-dependent safety profile.
+      // Simulation and hardware use the same limiter implementation and full
+      // envelope. Simulation may scale that envelope through a live level file;
+      // there is no alternate profile or CRC-selected set of limits.
+      ConfigureJointLimiterLevelFile();
       joint_limiter_last_logged_state_.fill(sonic::safety::JointState::kNormal);
       std::cout << "[JOINT-LIMITER] enabled="
                 << (joint_limiter_enabled_ ? "true" : "false")
                 << " profile=" << joint_limiter_profile_
+                << " limiting_level=" << joint_limiter_level_
                 << " window_s=" << joint_limiter_.limits().window_duration
                 << " writer_dt_s=" << joint_limiter_.limits().writer_dt
                 << std::endl;
@@ -2904,6 +2914,86 @@ class G1Deploy {
       }
     }
 
+    bool ReadJointLimiterLevel(double& level) const {
+      if (joint_limiter_level_file_.empty()) return false;
+      std::ifstream input(joint_limiter_level_file_);
+      double requested = 0.0;
+      if (!(input >> requested) || !std::isfinite(requested) ||
+          requested < 0.0 || requested > 1.0) {
+        return false;
+      }
+      level = requested;
+      return true;
+    }
+
+    void ConfigureJointLimiterLevelFile() {
+      const char* path = std::getenv("SONIC_JOINT_LIMITER_LEVEL_FILE");
+      if (!(path && *path)) return;
+      if (!disable_crc_check_) {
+        std::cerr << "[JOINT-LIMITER] ignoring simulation-only live level file "
+                  << "outside --disable-crc-check mode" << std::endl;
+        return;
+      }
+      joint_limiter_level_file_ = path;
+      double requested = 1.0;
+      if (ReadJointLimiterLevel(requested)) {
+        joint_limiter_level_ = requested;
+        if (requested > 0.0) {
+          joint_limiter_ = sonic::safety::PerJointMotionLimiter(
+              sonic::safety::SafetyLimitsForLevel(requested));
+        }
+      }
+      joint_limiter_level_min_ = joint_limiter_level_;
+      joint_limiter_level_max_ = joint_limiter_level_;
+      std::cout << "[JOINT-LIMITER] simulation live level file="
+                << joint_limiter_level_file_ << std::endl;
+    }
+
+    void MaybeRefreshJointLimiterLevel(
+        const std::array<double, G1_NUM_MOTOR>& measured) {
+      if (joint_limiter_level_file_.empty()) return;
+      if (++joint_limiter_level_refresh_ticks_ < 50) return;
+      joint_limiter_level_refresh_ticks_ = 0;
+      double requested = joint_limiter_level_;
+      if (!ReadJointLimiterLevel(requested) ||
+          std::abs(requested - joint_limiter_level_) < 1.0e-12) {
+        return;
+      }
+
+      if (requested > 0.0) {
+        sonic::safety::PerJointMotionLimiter replacement(
+            sonic::safety::SafetyLimitsForLevel(requested));
+        if (!replacement.Seed(measured)) {
+          std::cerr << "[JOINT-LIMITER] rejected live limiting level change; "
+                       "measured-state reseed failed" << std::endl;
+          return;
+        }
+        joint_limiter_ = std::move(replacement);
+      } else {
+        // Level zero is an exact writer bypass. Replace the stateful limiter as
+        // well so telemetry after the change cannot be confused with the
+        // previous limited segment.
+        joint_limiter_ = sonic::safety::PerJointMotionLimiter(
+            sonic::safety::SharedSafetyLimits());
+      }
+      joint_limiter_level_ = requested;
+      joint_limiter_level_min_ =
+          std::min(joint_limiter_level_min_, requested);
+      joint_limiter_level_max_ =
+          std::max(joint_limiter_level_max_, requested);
+      ++joint_limiter_level_changes_;
+      joint_limiter_last_logged_state_.fill(
+          sonic::safety::JointState::kNormal);
+      std::cout << "[JOINT-LIMITER] live limiting_level=" << requested
+                << " (" << requested * 100.0 << "%; ";
+      if (requested > 0.0) {
+        std::cout << "joints reseeded, windows and fault state cleared";
+      } else {
+        std::cout << "exact bypass, limiter state cleared";
+      }
+      std::cout << ')' << std::endl;
+    }
+
     /// Live-refresh pred_horizon_s_ from PRED_HORIZON_FILE (default /tmp/pred_horizon)
     /// ~every 0.5s so the prediction horizon can be swept without restarting the
     /// deploy. Missing/invalid file leaves the current (env-seeded) value untouched.
@@ -3022,6 +3112,8 @@ class G1Deploy {
       const std::shared_ptr<const MotorCommand> mc = mc_data.data;
       if (mc) {
         sonic::safety::Output limited;
+        bool limiting_active =
+            joint_limiter_enabled_ && joint_limiter_level_ > 0.0;
         if (joint_limiter_enabled_) {
           const auto low_state_data = low_state_buffer_.GetDataWithTime();
           if (!low_state_data.data ||
@@ -3032,58 +3124,66 @@ class G1Deploy {
                            "all new body commands" << std::endl;
               missing_state_logged = true;
             }
-            return;
-          }
-          std::array<double, G1_NUM_MOTOR> desired{};
-          std::array<double, G1_NUM_MOTOR> measured{};
-          std::array<double, G1_NUM_MOTOR> measured_velocity{};
-          for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
-            desired[i] = mc->q_target.at(i);
-            measured[i] = low_state_data.data->motor_state()[i].q();
-            measured_velocity[i] = low_state_data.data->motor_state()[i].dq();
-          }
-          if (!joint_limiter_.seeded()) {
-            if (!joint_limiter_.Seed(measured)) {
-              std::cerr << "[JOINT-LIMITER] measured-state seed rejected; "
-                           "withholding all new body commands" << std::endl;
+            if (limiting_active) {
               return;
             }
-            std::cout << "[JOINT-LIMITER] seeded all 29 joints from measured q; "
-                         "moving windows empty" << std::endl;
-          }
-          const bool desired_fresh = mc_data.GetAgeMs() >= 0.0 &&
-                                     mc_data.GetAgeMs() <= 100.0;
-          limited = joint_limiter_.Step(
-              desired, measured, measured_velocity,
-              desired_fresh && !joint_limiter_terminating_);
-          for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
-            const auto state = limited.state[i];
-            const bool actual_motion_braking =
-                std::abs(measured_velocity[i]) >
-                joint_limiter_.limits().measured_velocity_brake[i];
-            if (state != joint_limiter_last_logged_state_[i] &&
-                (actual_motion_braking ||
-                 state == sonic::safety::JointState::kJointFault)) {
-              std::cout << "[JOINT-LIMITER] joint=" << i
-                        << " state=" << sonic::safety::JointStateName(state)
-                        << " measured_dq=" << measured_velocity[i]
-                        << " q_out=" << limited.position[i]
-                        << " q_des=" << desired[i]
-                        << " (other joints unaffected)" << std::endl;
+          } else {
+            std::array<double, G1_NUM_MOTOR> desired{};
+            std::array<double, G1_NUM_MOTOR> measured{};
+            std::array<double, G1_NUM_MOTOR> measured_velocity{};
+            for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+              desired[i] = mc->q_target.at(i);
+              measured[i] = low_state_data.data->motor_state()[i].q();
+              measured_velocity[i] = low_state_data.data->motor_state()[i].dq();
             }
-            joint_limiter_last_logged_state_[i] = state;
+            MaybeRefreshJointLimiterLevel(measured);
+            limiting_active = joint_limiter_level_ > 0.0;
+            if (limiting_active) {
+              if (!joint_limiter_.seeded()) {
+                if (!joint_limiter_.Seed(measured)) {
+                  std::cerr << "[JOINT-LIMITER] measured-state seed rejected; "
+                               "withholding all new body commands" << std::endl;
+                  return;
+                }
+                std::cout << "[JOINT-LIMITER] seeded all 29 joints from measured q; "
+                             "moving windows empty" << std::endl;
+              }
+              const bool desired_fresh = mc_data.GetAgeMs() >= 0.0 &&
+                                         mc_data.GetAgeMs() <= 100.0;
+              limited = joint_limiter_.Step(
+                  desired, measured, measured_velocity,
+                  desired_fresh && !joint_limiter_terminating_);
+              for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+                const auto state = limited.state[i];
+                const bool actual_motion_braking =
+                    std::abs(measured_velocity[i]) >
+                    joint_limiter_.limits().measured_velocity_brake[i];
+                if (state != joint_limiter_last_logged_state_[i] &&
+                    (actual_motion_braking ||
+                     state == sonic::safety::JointState::kJointFault)) {
+                  std::cout << "[JOINT-LIMITER] joint=" << i
+                            << " state=" << sonic::safety::JointStateName(state)
+                            << " measured_dq=" << measured_velocity[i]
+                            << " q_out=" << limited.position[i]
+                            << " q_des=" << desired[i]
+                            << " (other joints unaffected)" << std::endl;
+                }
+                joint_limiter_last_logged_state_[i] = state;
+              }
+            }
           }
+          if (!limiting_active) ++joint_limiter_bypass_ticks_;
         }
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
           dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
           const bool local_damping =
-              joint_limiter_enabled_ && limited.local_damping[i];
+              limiting_active && limited.local_damping[i];
           dds_low_command.motor_cmd().at(i).tau() =
-              joint_limiter_enabled_ ? 0.0 : mc->tau_ff.at(i);
-          dds_low_command.motor_cmd().at(i).q() = joint_limiter_enabled_
+              limiting_active ? 0.0 : mc->tau_ff.at(i);
+          dds_low_command.motor_cmd().at(i).q() = limiting_active
               ? limited.position[i] : mc->q_target.at(i);
           dds_low_command.motor_cmd().at(i).dq() =
-              joint_limiter_enabled_ ? 0.0 : mc->dq_target.at(i);
+              limiting_active ? 0.0 : mc->dq_target.at(i);
           dds_low_command.motor_cmd().at(i).kp() = local_damping
               ? 0.0 : mc->kp.at(i) * gain_kp_scale_;
           dds_low_command.motor_cmd().at(i).kd() = local_damping
@@ -3118,6 +3218,12 @@ class G1Deploy {
       std::cout << "[JOINT-LIMITER-SUMMARY] {\"enabled\":"
                 << (joint_limiter_enabled_ ? "true" : "false")
                 << ",\"profile\":\"" << joint_limiter_profile_ << "\""
+                << ",\"limiting_level\":" << joint_limiter_level_
+                << ",\"limiting_level_min\":" << joint_limiter_level_min_
+                << ",\"limiting_level_max\":" << joint_limiter_level_max_
+                << ",\"limiting_level_changes\":" << joint_limiter_level_changes_
+                << ",\"bypass_ticks\":" << joint_limiter_bypass_ticks_
+                << ",\"stats_since_level_change\":true"
                 << ",\"window_s\":" << joint_limiter_.limits().window_duration
                 << ",\"whole_body_damping_from_joint_faults\":0";
       const auto print_u64 = [&](const char* name, auto getter) {
@@ -3199,7 +3305,8 @@ class G1Deploy {
           planner_thread_ptr_.reset();
         }
       }
-      if (joint_limiter_enabled_ && joint_limiter_.seeded()) {
+      if (joint_limiter_enabled_ && joint_limiter_level_ > 0.0 &&
+          joint_limiter_.seeded()) {
         for (int tick = 0; tick < 100; ++tick) {
           WriteLowCommand(true);
           std::this_thread::sleep_for(std::chrono::milliseconds(2));

@@ -132,6 +132,29 @@ inline Limits SharedSafetyLimits() {
   return limits;
 }
 
+// Scale the amount of limiting without maintaining separate simulation and
+// hardware profiles. A level of 1.0 is the full shared envelope. For levels in
+// (0, 1), dynamic ceilings grow reciprocally (0.5 means twice the velocity,
+// acceleration, window, tracking, and measured-motion ceilings). Level 0 is an
+// exact controller bypass and is handled by the command writer, not this
+// function. Mechanical position limits are never interpolated.
+inline Limits SafetyLimitsForLevel(double level) {
+  Limits limits = SharedSafetyLimits();
+  const double bounded_level = std::clamp(level, 1.0e-6, 1.0);
+  const double scale = 1.0 / bounded_level;
+  const auto scale_array = [scale](auto& values) {
+    for (double& value : values) value *= scale;
+  };
+  scale_array(limits.max_instant_velocity);
+  scale_array(limits.max_acceleration);
+  scale_array(limits.max_window_velocity);
+  scale_array(limits.max_tracking_error);
+  scale_array(limits.measured_velocity_brake);
+  scale_array(limits.measured_velocity_fault);
+  scale_array(limits.brake_target_error);
+  return limits;
+}
+
 class PerJointMotionLimiter {
  public:
   explicit PerJointMotionLimiter(Limits limits) : limits_(std::move(limits)) {
