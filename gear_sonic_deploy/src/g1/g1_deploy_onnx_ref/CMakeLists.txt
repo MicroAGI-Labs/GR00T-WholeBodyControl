@@ -221,6 +221,10 @@ target_link_libraries(
   ${EXECUTABLE_NAME} PRIVATE ${PROJECT_NAME}
   ${EXE_LIBS}
 )
+# Safety validation depends on IEEE NaN/Inf semantics. The project-wide
+# -ffast-math setting would otherwise allow the compiler to remove finite
+# checks in the final command writer.
+target_compile_options(${EXECUTABLE_NAME} PRIVATE -fno-fast-math)
 
 # Setting our output directory and C++ standard
 set_target_properties(
@@ -274,3 +278,19 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              CXX_EXTENSIONS OFF)
+
+# Header-only command-safety properties. This target intentionally links no
+# robot, DDS, CUDA, or TensorRT libraries, so it can run in a network-isolated
+# build environment.
+add_executable(command_safety_limiter_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_test.cpp)
+target_include_directories(command_safety_limiter_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(command_safety_limiter_test PRIVATE -fno-fast-math)
+set_target_properties(command_safety_limiter_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+enable_testing()
+add_test(NAME command_safety_limiter COMMAND command_safety_limiter_test)

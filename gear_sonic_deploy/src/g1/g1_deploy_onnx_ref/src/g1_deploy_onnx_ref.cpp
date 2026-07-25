@@ -51,6 +51,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <stdexcept>
 #include <pthread.h>
 #include <sched.h>
 #include <array>
@@ -140,6 +141,7 @@
 // Error monitor
 #include "../include/error_monitor.hpp"
 #include "../include/walk_to_idle_transition.hpp"
+#include "../include/per_joint_motion_limiter.hpp"
 
 #include "audio_thread/audio_thread.hpp"
 
@@ -307,6 +309,17 @@ class G1Deploy {
 
     // Motor error monitor (tracks fault state transitions)
     ErrorMonitor error_monitor_;
+
+    // Final 500 Hz position-command envelope. Each joint owns independent
+    // budget, braking, and fault state; a joint event never damps another.
+    bool joint_limiter_enabled_ = true;
+    bool joint_limiter_terminating_ = false;
+    std::string joint_limiter_profile_ = "supported-commissioning";
+    sonic::safety::PerJointMotionLimiter joint_limiter_{
+        sonic::safety::SupportedCommissioningLimits()};
+    std::array<sonic::safety::JointState, G1_NUM_MOTOR>
+        joint_limiter_last_logged_state_{};
+    bool joint_limiter_sim_armed_logged_ = false;
 
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
@@ -2281,6 +2294,38 @@ class G1Deploy {
       // each isolated on its own domain (e.g. MuJoCo on domain 0, Isaac on domain 1).
       const char* _dds_domain_env = std::getenv("DDS_DOMAIN");
       int _dds_domain = _dds_domain_env ? std::atoi(_dds_domain_env) : 0;
+      if (const char* enabled_env = std::getenv("SONIC_JOINT_LIMITER")) {
+        const std::string value(enabled_env);
+        joint_limiter_enabled_ =
+            !(value == "0" || value == "false" || value == "off");
+      }
+      joint_limiter_profile_ = disable_crc_check_
+          ? "simulation-qualification" : "supported-commissioning";
+      if (const char* profile_env = std::getenv("SONIC_JOINT_LIMITER_PROFILE")) {
+        joint_limiter_profile_ = profile_env;
+      }
+      if (joint_limiter_profile_ == "simulation-qualification") {
+        if (!disable_crc_check_) {
+          throw std::runtime_error(
+              "simulation-qualification limiter profile requires simulation mode");
+        }
+        joint_limiter_ = sonic::safety::PerJointMotionLimiter(
+            sonic::safety::SimulationQualificationLimits());
+      } else if (joint_limiter_profile_ != "supported-commissioning") {
+        throw std::runtime_error(
+            "Unknown SONIC_JOINT_LIMITER_PROFILE: " + joint_limiter_profile_);
+      }
+      if (!joint_limiter_enabled_ && !disable_crc_check_) {
+        throw std::runtime_error(
+            "SONIC_JOINT_LIMITER may only be disabled in simulation mode");
+      }
+      joint_limiter_last_logged_state_.fill(sonic::safety::JointState::kNormal);
+      std::cout << "[JOINT-LIMITER] enabled="
+                << (joint_limiter_enabled_ ? "true" : "false")
+                << " profile=" << joint_limiter_profile_
+                << " window_s=" << joint_limiter_.limits().window_duration
+                << " writer_dt_s=" << joint_limiter_.limits().writer_dt
+                << std::endl;
       const char* _dds_config_env = std::getenv("DDS_CONFIG_FILE");
       if (_dds_config_env && *_dds_config_env) {
         std::cout << "[deploy] DDS config file = " << _dds_config_env << std::endl;
@@ -2988,22 +3033,97 @@ class G1Deploy {
      * into a LowCmd_ DDS message with CRC, and publishes via DDS.
      * Also publishes Dex3 hand commands at the same cadence.
      */
-    void LowCommandWriter() {
-      if (!SimulatorTickDue(publish_dt_, writer_next_sim_time_)) return;
+    void LowCommandWriter() { WriteLowCommand(false); }
+
+    void WriteLowCommand(bool force) {
+      if (!force && !SimulatorTickDue(publish_dt_, writer_next_sim_time_)) return;
       LowCmd_ dds_low_command;
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
       dds_low_command.mode_machine() = mode_machine_;
 
       MaybeRefreshGainScale();
-      const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
+      const auto mc_data = motor_command_buffer_.GetDataWithTime();
+      const std::shared_ptr<const MotorCommand> mc = mc_data.data;
       if (mc) {
+        sonic::safety::Output limited;
+        if (joint_limiter_enabled_) {
+          const auto low_state_data = low_state_buffer_.GetDataWithTime();
+          if (!low_state_data.data ||
+              low_state_data.data->motor_state().size() < G1_NUM_MOTOR) {
+            static bool missing_state_logged = false;
+            if (!missing_state_logged) {
+              std::cerr << "[JOINT-LIMITER] no complete LowState; withholding "
+                           "all new body commands" << std::endl;
+              missing_state_logged = true;
+            }
+            return;
+          }
+          std::array<double, G1_NUM_MOTOR> desired{};
+          std::array<double, G1_NUM_MOTOR> measured{};
+          std::array<double, G1_NUM_MOTOR> measured_velocity{};
+          for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+            desired[i] = mc->q_target.at(i);
+            measured[i] = low_state_data.data->motor_state()[i].q();
+            measured_velocity[i] = low_state_data.data->motor_state()[i].dq();
+          }
+          if (!joint_limiter_.seeded()) {
+            if (!joint_limiter_.Seed(measured)) {
+              std::cerr << "[JOINT-LIMITER] measured-state seed rejected; "
+                           "withholding all new body commands" << std::endl;
+              return;
+            }
+            std::cout << "[JOINT-LIMITER] seeded all 29 joints from measured q; "
+                         "moving windows empty" << std::endl;
+          }
+          const bool desired_fresh = mc_data.GetAgeMs() >= 0.0 &&
+                                     mc_data.GetAgeMs() <= 100.0;
+          bool lifecycle_armed = true;
+          if (disable_crc_check_ && !sim_clock_path_.empty()) {
+            double episode_time = 0.0;
+            double active_time = -1.0;
+            lifecycle_armed = ReadSimulatorClock(episode_time, active_time) &&
+                              episode_time > 1.0e-9;
+            if (lifecycle_armed && !joint_limiter_sim_armed_logged_) {
+              joint_limiter_sim_armed_logged_ = true;
+              std::cout << "[JOINT-LIMITER] simulator measured-state epoch "
+                           "advancing; accepting SONIC targets" << std::endl;
+            }
+          }
+          limited = joint_limiter_.Step(
+              desired, measured, measured_velocity,
+              desired_fresh && lifecycle_armed && !joint_limiter_terminating_);
+          for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+            const auto state = limited.state[i];
+            const bool actual_motion_braking =
+                std::abs(measured_velocity[i]) >
+                joint_limiter_.limits().measured_velocity_brake[i];
+            if (state != joint_limiter_last_logged_state_[i] &&
+                (actual_motion_braking ||
+                 state == sonic::safety::JointState::kJointFault)) {
+              std::cout << "[JOINT-LIMITER] joint=" << i
+                        << " state=" << sonic::safety::JointStateName(state)
+                        << " measured_dq=" << measured_velocity[i]
+                        << " q_out=" << limited.position[i]
+                        << " q_des=" << desired[i]
+                        << " (other joints unaffected)" << std::endl;
+            }
+            joint_limiter_last_logged_state_[i] = state;
+          }
+        }
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
           dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
-          dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
-          dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);
-          dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);
-          dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i) * gain_kp_scale_;
-          dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i) * gain_kd_scale_;
+          const bool local_damping =
+              joint_limiter_enabled_ && limited.local_damping[i];
+          dds_low_command.motor_cmd().at(i).tau() =
+              joint_limiter_enabled_ ? 0.0 : mc->tau_ff.at(i);
+          dds_low_command.motor_cmd().at(i).q() = joint_limiter_enabled_
+              ? limited.position[i] : mc->q_target.at(i);
+          dds_low_command.motor_cmd().at(i).dq() =
+              joint_limiter_enabled_ ? 0.0 : mc->dq_target.at(i);
+          dds_low_command.motor_cmd().at(i).kp() = local_damping
+              ? 0.0 : mc->kp.at(i) * gain_kp_scale_;
+          dds_low_command.motor_cmd().at(i).kd() = local_damping
+              ? 8.0 : mc->kd.at(i) * gain_kd_scale_;
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
@@ -3028,8 +3148,79 @@ class G1Deploy {
       dex3_hands_.writeOnce();
     }
 
-    /// Gracefully stop all threads and send a damping-only command.
+    void PrintJointLimiterSummary() const {
+      const auto& stats = joint_limiter_.stats();
+      const auto& faults = joint_limiter_.fault_reasons();
+      std::cout << "[JOINT-LIMITER-SUMMARY] {\"enabled\":"
+                << (joint_limiter_enabled_ ? "true" : "false")
+                << ",\"profile\":\"" << joint_limiter_profile_ << "\""
+                << ",\"window_s\":" << joint_limiter_.limits().window_duration
+                << ",\"whole_body_damping_from_joint_faults\":0";
+      const auto print_u64 = [&](const char* name, auto getter) {
+        std::cout << ",\"" << name << "\":[";
+        for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+          if (i) std::cout << ',';
+          std::cout << getter(stats[i]);
+        }
+        std::cout << ']';
+      };
+      const auto print_double = [&](const char* name, auto getter) {
+        std::cout << ",\"" << name << "\":[";
+        for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+          if (i) std::cout << ',';
+          std::cout << getter(stats[i]);
+        }
+        std::cout << ']';
+      };
+      print_u64("rate_limited_ticks", [](const auto& s) { return s.rate_limited_ticks; });
+      print_u64("braking_ticks", [](const auto& s) { return s.braking_ticks; });
+      print_u64("lifecycle_hold_ticks",
+                [](const auto& s) { return s.lifecycle_hold_ticks; });
+      print_u64("fault_events", [](const auto& s) { return s.fault_events; });
+      print_u64("local_damping_ticks",
+                [](const auto& s) { return s.local_damping_ticks; });
+      print_u64("ticks", [](const auto& s) { return s.ticks; });
+      print_u64("max_rate_limited_run_ticks",
+                [](const auto& s) { return s.max_rate_limited_run; });
+      print_u64("emergency_tracking_corrections",
+                [](const auto& s) { return s.emergency_tracking_corrections; });
+      print_double("max_command_velocity_rad_s",
+                   [](const auto& s) { return s.max_command_velocity; });
+      print_double("max_command_acceleration_rad_s2",
+                   [](const auto& s) { return s.max_command_acceleration; });
+      print_double("max_window_motion_rad",
+                   [](const auto& s) { return s.max_window_motion; });
+      print_double("max_measured_velocity_rad_s",
+                   [](const auto& s) { return s.max_measured_velocity; });
+      print_double("max_tracking_error_rad",
+                   [](const auto& s) { return s.max_tracking_error; });
+      const auto print_limit = [&](const char* name, const auto& values) {
+        std::cout << ",\"" << name << "\":[";
+        for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+          if (i) std::cout << ',';
+          std::cout << values[i];
+        }
+        std::cout << ']';
+      };
+      const auto& limits = joint_limiter_.limits();
+      print_limit("instant_velocity_caps_rad_s", limits.max_instant_velocity);
+      print_limit("acceleration_caps_rad_s2", limits.max_acceleration);
+      print_limit("window_velocity_caps_rad_s", limits.max_window_velocity);
+      print_limit("tracking_error_caps_rad", limits.max_tracking_error);
+      print_limit("measured_velocity_brake_rad_s", limits.measured_velocity_brake);
+      print_limit("measured_velocity_fault_rad_s", limits.measured_velocity_fault);
+      std::cout << ",\"fault_reasons\":[";
+      for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+        if (i) std::cout << ',';
+        std::cout << '\"' << sonic::safety::JointFaultReasonName(faults[i]) << '\"';
+      }
+      std::cout << "]}" << std::endl;
+    }
+
+    /// Stop accepting SONIC targets and independently settle each joint toward
+    /// its measured-position hold. No joint event triggers whole-body damping.
     void Stop() {
+      joint_limiter_terminating_ = true;
       operator_state.stop = true;
 
       if (control_thread_ptr_) {
@@ -3044,8 +3235,15 @@ class G1Deploy {
           planner_thread_ptr_.reset();
         }
       }
-      CreateDampingCommand();
-      LowCommandWriter();
+      if (joint_limiter_enabled_ && joint_limiter_.seeded()) {
+        for (int tick = 0; tick < 100; ++tick) {
+          WriteLowCommand(true);
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+      } else {
+        WriteLowCommand(true);
+      }
+      PrintJointLimiterSummary();
       std::cout << "Stop" << std::endl;
     }
 
@@ -3086,13 +3284,20 @@ class G1Deploy {
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
       }
+      if (joint_limiter_enabled_) {
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          motor_command_tmp.q_target.at(i) = ls->motor_state()[i].q();
+        }
+      }
       time_ += control_dt_;
       if (time_ < duration_) {
-        for (int i = 0; i < G1_NUM_MOTOR; i++) {
-          double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
-          double current_pos = ls->motor_state()[i].q();
-          motor_command_tmp.q_target.at(i) =
-              static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
+        if (!joint_limiter_enabled_) {
+          for (int i = 0; i < G1_NUM_MOTOR; i++) {
+            double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
+            double current_pos = ls->motor_state()[i].q();
+            motor_command_tmp.q_target.at(i) = static_cast<float>(
+                current_pos * (1.0 - ratio) + default_angles[i] * ratio);
+          }
         }
         dex3_hands_.close(true);
         dex3_hands_.close(false);
@@ -3100,7 +3305,11 @@ class G1Deploy {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
         dex3_hands_.open(true);
         dex3_hands_.open(false);
-        std::cout << "Init Done" << std::endl;
+        std::cout << "Init Done";
+        if (joint_limiter_enabled_) {
+          std::cout << " (measured-position seed; empty per-joint windows)";
+        }
+        std::cout << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
