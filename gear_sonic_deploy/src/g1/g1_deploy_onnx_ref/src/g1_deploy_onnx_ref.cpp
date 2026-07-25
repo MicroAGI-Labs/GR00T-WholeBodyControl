@@ -2624,6 +2624,16 @@ class G1Deploy {
       if (!planner_path.empty()) {
         PlannerConfig planner_config;
         planner_config.model_path = planner_path;
+        if (const char* seed_text = std::getenv("SONIC_EPISODE_SEED")) {
+          char* end = nullptr;
+          const long seed = std::strtol(seed_text, &end, 10);
+          if (end == seed_text || *end != '\0' || seed < 0 ||
+              seed >= (1L << 31)) {
+            throw std::runtime_error(
+                "SONIC_EPISODE_SEED must be an integer in [0, 2^31)");
+          }
+          planner_config.initial_random_seed = static_cast<int>(seed);
+        }
         if (planner_path.find("V0") != std::string::npos)
         {
           planner_config.version = 0;
