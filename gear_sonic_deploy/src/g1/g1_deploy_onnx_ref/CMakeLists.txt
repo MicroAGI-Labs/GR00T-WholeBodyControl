@@ -264,6 +264,9 @@ FetchContent_MakeAvailable(googletest)
 find_package(GTest REQUIRED)
 
 file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
+list(REMOVE_ITEM TEST_SRCS
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_test.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_benchmark.cpp)
 
 add_executable(run_tests ${TEST_SRCS})
 target_link_directories(run_tests PRIVATE ${CUDA_LINK_DIRS})
@@ -294,3 +297,15 @@ set_target_properties(command_safety_limiter_test PROPERTIES
   CXX_EXTENSIONS OFF)
 enable_testing()
 add_test(NAME command_safety_limiter COMMAND command_safety_limiter_test)
+
+add_executable(command_safety_limiter_benchmark
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_benchmark.cpp)
+target_include_directories(command_safety_limiter_benchmark PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(command_safety_limiter_benchmark PRIVATE
+  -O3 -fno-fast-math)
+set_target_properties(command_safety_limiter_benchmark PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
