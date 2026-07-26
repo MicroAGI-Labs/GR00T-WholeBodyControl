@@ -50,17 +50,17 @@ void TestLimitingLevelScalesDynamicCeilings() {
     CHECK(half.min_position[joint] == full.min_position[joint]);
     CHECK(half.max_position[joint] == full.max_position[joint]);
     CHECK(std::abs(half.max_instant_velocity[joint] -
-                   2.0 * full.max_instant_velocity[joint]) < 1.0e-12);
+                   64.0 * full.max_instant_velocity[joint]) < 1.0e-12);
     CHECK(std::abs(half.max_acceleration[joint] -
-                   2.0 * full.max_acceleration[joint]) < 1.0e-12);
+                   64.0 * full.max_acceleration[joint]) < 1.0e-12);
     CHECK(std::abs(half.max_window_velocity[joint] -
-                   2.0 * full.max_window_velocity[joint]) < 1.0e-12);
+                   64.0 * full.max_window_velocity[joint]) < 1.0e-12);
     CHECK(std::abs(half.max_tracking_error[joint] -
-                   2.0 * full.max_tracking_error[joint]) < 1.0e-12);
+                   64.0 * full.max_tracking_error[joint]) < 1.0e-12);
     CHECK(std::abs(half.measured_velocity_brake[joint] -
-                   2.0 * full.measured_velocity_brake[joint]) < 1.0e-12);
+                   64.0 * full.measured_velocity_brake[joint]) < 1.0e-12);
     CHECK(std::abs(half.measured_velocity_fault[joint] -
-                   2.0 * full.measured_velocity_fault[joint]) < 1.0e-12);
+                   64.0 * full.measured_velocity_fault[joint]) < 1.0e-12);
   }
 }
 

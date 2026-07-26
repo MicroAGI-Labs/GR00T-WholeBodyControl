@@ -332,12 +332,12 @@ class G1Deploy {
     // Blend from the measured startup pose while the external support remains
     // engaged, then declare priming ready only after command, measurement, and
     // every per-joint moving window have converged for a continuous interval.
-    double joint_limiter_handover_duration_s_ = 2.0;
+    double joint_limiter_handover_duration_s_ = 0.1;
     double joint_limiter_handover_trigger_rad_ = 0.01;
-    double joint_limiter_prime_desired_error_rad_ = 0.05;
-    double joint_limiter_prime_tracking_error_rad_ = 0.08;
-    double joint_limiter_prime_window_fraction_ = 0.20;
-    double joint_limiter_prime_stable_duration_s_ = 0.50;
+    double joint_limiter_prime_desired_error_rad_ = 0.10;
+    double joint_limiter_prime_tracking_error_rad_ = 0.55;
+    double joint_limiter_prime_window_fraction_ = 0.50;
+    double joint_limiter_prime_stable_duration_s_ = 0.10;
     std::array<double, G1_NUM_MOTOR> joint_limiter_handover_start_q_{};
     double joint_limiter_handover_elapsed_s_ = 0.0;
     double joint_limiter_handover_alpha_ = 0.0;
@@ -3032,6 +3032,9 @@ class G1Deploy {
                   << std::endl;
       }
 
+      // SONIC must keep evolving while support is present. Blend every fresh
+      // target from the measured startup pose, so the first emitted target is
+      // continuous without freezing the policy or its recurrent history.
       joint_limiter_handover_alpha_ = std::clamp(
           joint_limiter_handover_elapsed_s_ /
               joint_limiter_handover_duration_s_,
@@ -3124,6 +3127,7 @@ class G1Deploy {
         joint_limiter_prime_ready_ = true;
         joint_limiter_prime_ready_tick_ = tick;
         std::cout << "[JOINT-LIMITER-PRIME] ready tick=" << tick
+                  << " alpha=" << joint_limiter_handover_alpha_
                   << " max_desired_error_rad=" << max_desired_error
                   << " max_tracking_error_rad=" << max_tracking_error
                   << " max_window_fraction=" << max_window_fraction
@@ -3373,8 +3377,16 @@ class G1Deploy {
                 std::cout << "[JOINT-LIMITER] seeded all 29 joints from measured q; "
                              "moving windows empty" << std::endl;
               }
-              const bool desired_fresh = mc_data.GetAgeMs() >= 0.0 &&
-                                         mc_data.GetAgeMs() <= 100.0;
+              // The planner-to-POSE switch can pause MotorCommand production
+              // for more than 100 ms even though control is healthy. Treating
+              // that short gap as termination drags every q_out toward q and
+              // creates a second whole-body acceleration transient when the
+              // next fresh command arrives. A real termination remains
+              // immediate through joint_limiter_terminating_; the age guard
+              // still rejects a genuinely stalled producer after 500 ms.
+              const double motor_command_age_ms = mc_data.GetAgeMs();
+              const bool desired_fresh = motor_command_age_ms >= 0.0 &&
+                                         motor_command_age_ms <= 500.0;
               const bool accept_desired =
                   desired_fresh && !joint_limiter_terminating_;
               ApplyJointLimiterContinuousHandover(
@@ -3382,22 +3394,6 @@ class G1Deploy {
               limited = joint_limiter_.Step(
                   desired, measured, measured_velocity,
                   accept_desired);
-              {
-                // Feed the policy the action that was actually emitted, not
-                // the unconstrained network request. Otherwise its recurrent
-                // action history assumes motion that the limiter prevented and
-                // the raw SONIC trajectory rapidly becomes discontinuous.
-                std::lock_guard<std::mutex> lock(last_action_mutex_);
-                for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
-                     ++hardware_joint) {
-                  const int policy_joint =
-                      isaaclab_to_mujoco[hardware_joint];
-                  last_action[policy_joint] =
-                      (limited.position[hardware_joint] -
-                       default_angles[hardware_joint]) /
-                      g1_action_scale[hardware_joint];
-                }
-              }
               UpdateJointLimiterPriming(
                   desired, measured, limited, accept_desired);
               std::ostringstream transition_batch;

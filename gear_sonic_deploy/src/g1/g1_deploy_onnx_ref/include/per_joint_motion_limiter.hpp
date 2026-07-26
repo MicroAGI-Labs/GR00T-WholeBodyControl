@@ -134,14 +134,17 @@ inline Limits SharedSafetyLimits() {
 
 // Scale the amount of limiting without maintaining separate simulation and
 // hardware profiles. A level of 1.0 is the full shared envelope. For levels in
-// (0, 1), dynamic ceilings grow reciprocally (0.5 means twice the velocity,
-// acceleration, window, tracking, and measured-motion ceilings). Level 0 is an
-// exact controller bypass and is handled by the command writer, not this
-// function. Mechanical position limits are never interpolated.
+// (0, 1), use a sixth-power response before reciprocally scaling dynamic
+// ceilings. This keeps the low end of the runtime slider genuinely mild (0.5
+// means sixty-four times the velocity, acceleration, window, tracking, and
+// measured-motion ceilings) while preserving the exact shared envelope at
+// 1.0. Level 0 is an exact controller bypass; the command writer handles it,
+// not this function. Mechanical position limits are never interpolated.
 inline Limits SafetyLimitsForLevel(double level) {
   Limits limits = SharedSafetyLimits();
   const double bounded_level = std::clamp(level, 1.0e-6, 1.0);
-  const double scale = 1.0 / bounded_level;
+  const double squared_level = bounded_level * bounded_level;
+  const double scale = 1.0 / (squared_level * squared_level * squared_level);
   const auto scale_array = [scale](auto& values) {
     for (double& value : values) value *= scale;
   };
