@@ -32,6 +32,21 @@ int main() {
   auto invalid = policy;
   invalid[0] = std::numeric_limits<double>::quiet_NaN();
   assert(Near(PolicyToInspire(invalid)[0], 1.0));
+  invalid = policy;
+  invalid[5] = std::numeric_limits<double>::quiet_NaN();
+  assert(Near(PolicyToInspire(invalid)[5], 1.0));
+
+  std::array<double, 7> little_only{};
+  little_only[0] = 1.0;
+  const auto little_direct = PolicyToInspire(little_only);
+  assert(Near(little_direct[0], 0.0));
+  assert(Near(little_direct[5], 1.0));
+
+  std::array<double, 7> thumb_rotation_only{};
+  thumb_rotation_only[5] = 1.0;
+  const auto thumb_rotation_direct = PolicyToInspire(thumb_rotation_only);
+  assert(Near(thumb_rotation_direct[0], 1.0));
+  assert(Near(thumb_rotation_direct[5], 0.0));
 
   const auto round_trip = InspireToPolicy(inspire);
   assert(Near(round_trip[0], 0.0));
