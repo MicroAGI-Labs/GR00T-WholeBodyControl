@@ -10,16 +10,9 @@ class Robot:
         self.UNITREE_LEGGED_CONST = config["UNITREE_LEGGED_CONST"]
         self.MOTOR_KP = config["MOTOR_KP"]
         self.MOTOR_KD = config["MOTOR_KD"]
-        if "HAND_MOTOR_KP" in config:
-            self.HAND_MOTOR_KP = config["HAND_MOTOR_KP"]
-        if "HAND_MOTOR_KD" in config:
-            self.HAND_MOTOR_KD = config["HAND_MOTOR_KD"]
-
         self.WeakMotorJointIndex = config["WeakMotorJointIndex"]
         self.NUM_MOTORS = config["NUM_MOTORS"]
         self.NUM_JOINTS = config["NUM_JOINTS"]
-        self.NUM_HAND_MOTORS = config.get("NUM_HAND_MOTORS", 0)  # only 43dof has hand
-        self.NUM_HAND_JOINTS = config.get("NUM_HAND_JOINTS", 0)
         self.DEFAULT_DOF_ANGLES = config["DEFAULT_DOF_ANGLES"]
         self.DEFAULT_MOTOR_ANGLES = config["DEFAULT_MOTOR_ANGLES"]
         self.USE_SENSOR = config["USE_SENSOR"]

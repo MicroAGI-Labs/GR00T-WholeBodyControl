@@ -16,7 +16,7 @@ TEST_F(SonicDdsTopicTest, EmptyPrefixPreservesPhysicalRobotTopics) {
   EXPECT_EQ(SonicDdsTopic(HG_STATE_TOPIC), "rt/lowstate");
   EXPECT_EQ(SonicDdsTopic(HG_CMD_TOPIC), "rt/lowcmd");
   EXPECT_EQ(SonicDdsTopic(HG_IMU_TORSO), "rt/secondary_imu");
-  EXPECT_EQ(SonicDdsTopic("rt/dex3/left/cmd"), "rt/dex3/left/cmd");
+  EXPECT_EQ(SonicDdsTopic("rt/inspire/cmd"), "rt/inspire/cmd");
 }
 
 TEST_F(SonicDdsTopicTest, PrefixIsolatesEveryUnitreeTopic) {
@@ -24,8 +24,8 @@ TEST_F(SonicDdsTopicTest, PrefixIsolatesEveryUnitreeTopic) {
   EXPECT_EQ(SonicDdsTopic(HG_STATE_TOPIC), "rt/sim/g1/1/lowstate");
   EXPECT_EQ(SonicDdsTopic(HG_CMD_TOPIC), "rt/sim/g1/1/lowcmd");
   EXPECT_EQ(SonicDdsTopic(HG_IMU_TORSO), "rt/sim/g1/1/secondary_imu");
-  EXPECT_EQ(SonicDdsTopic("rt/dex3/right/state"),
-            "rt/sim/g1/1/dex3/right/state");
+  EXPECT_EQ(SonicDdsTopic("rt/inspire/state"),
+            "rt/sim/g1/1/inspire/state");
 }
 
 TEST_F(SonicDdsTopicTest, TrailingSlashesAreNormalized) {

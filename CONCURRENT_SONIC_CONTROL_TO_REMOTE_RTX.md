@@ -165,7 +165,7 @@ transport layer:
 - retest the `SIM_ROBOT_COUNT=1` compatibility path;
 - add a minimal checked-in two-controller launch/status/stop wrapper after the
   manual sequence is stable;
-- route per-environment Dex3 in a later milestone; hands are explicitly
+- route per-environment RH56E2 in a later milestone; hands are explicitly
   disabled for the concurrent body-control MVP.
 
 ---
@@ -210,10 +210,8 @@ SONIC_TOPIC_PREFIX=rt/sim/g1/i
 | secondary IMU | `rt/secondary_imu` | `rt/sim/g1/i/secondary_imu` |
 | reset/re-arm | `rt/reset_pose/cmd` | `rt/sim/g1/i/reset_pose/cmd` |
 | evaluation | `rt/eval` | `rt/sim/g1/i/eval` |
-| left Dex3 command | `rt/dex3/left/cmd` | `rt/sim/g1/i/dex3/left/cmd` |
-| left Dex3 state | `rt/dex3/left/state` | `rt/sim/g1/i/dex3/left/state` |
-| right Dex3 command | `rt/dex3/right/cmd` | `rt/sim/g1/i/dex3/right/cmd` |
-| right Dex3 state | `rt/dex3/right/state` | `rt/sim/g1/i/dex3/right/state` |
+| bilateral RH56E2 command | `rt/inspire/cmd` | `rt/sim/g1/i/inspire/cmd` |
+| bilateral RH56E2 state | `rt/inspire/state` | `rt/sim/g1/i/inspire/state` |
 
 Use one topic helper in each language. SONIC, simulator endpoints, diagnostics,
 and reset tools must share the rule.
@@ -302,7 +300,7 @@ Exit: after a complete restart, one robot balances for 60 simulated seconds.
 
 - [x] Fix fractional sleeps and unconditional CPU-0 affinity.
 - [x] Add the shared topic helper and `SONIC_TOPIC_PREFIX`.
-- [x] Prefix LowState, LowCmd, secondary IMU, and Dex3.
+- [x] Prefix LowState, LowCmd, secondary IMU, and RH56E2 Inspire DDS.
 - [x] Add `SONIC_SKIP_MOTION_SWITCHER=1` for simulation.
 - [x] Add `SONIC_INSTANCE_ID` for labels.
 - [x] Use unique ZMQ ports and telemetry/log paths in concurrent launches.
@@ -327,7 +325,7 @@ or port collisions.
 - [x] Publish every state row in canonical Unitree 29-joint order.
 - [x] Create one in-process namespaced DDS endpoint per environment.
 - [x] Publish secondary IMU directly from each endpoint.
-- [x] Keep Dex3 disabled in concurrent mode until it is per-environment.
+- [x] Keep RH56E2 disabled in concurrent mode until it is per-environment.
 - [x] Keep the existing single-robot code path as the `N=1` default.
 
 Tests:
@@ -467,12 +465,12 @@ Likely existing files:
 
 - `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/src/g1_deploy_onnx_ref.cpp`
 - `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/robot_parameters.hpp`
-- `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/dex3_hands.hpp`
+- `gear_sonic_deploy/src/g1/g1_deploy_onnx_ref/include/inspire_rh56e2_hands.hpp`
 - `rtx_pod/unitree_sim_isaaclab/sim_main.py`
 - `rtx_pod/unitree_sim_isaaclab/action_provider/action_provider_lowcmd29.py`
 - `rtx_pod/unitree_sim_isaaclab/tasks/common_observations/g1_29dof_state.py`
 - `rtx_pod/unitree_sim_isaaclab/dds/g1_robot_dds.py`
-- deployed upstream simulator Dex3/reset DDS files
+- deployed upstream simulator hand/reset DDS files
 - `rtx_pod/unitree_sim_isaaclab/tools/stand_eval.py`
 - flat task environment configuration
 - `rtx_pod/start_flat.sh`

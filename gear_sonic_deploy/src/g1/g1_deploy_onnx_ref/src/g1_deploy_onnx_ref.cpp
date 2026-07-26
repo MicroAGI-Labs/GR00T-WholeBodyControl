@@ -137,8 +137,8 @@
 // Control policy
 #include "../include/control_policy.hpp"
 
-// Dex3 hands
-#include "../include/dex3_hands.hpp"
+// Inspire RH56E2 hands
+#include "../include/inspire_rh56e2_hands.hpp"
 
 // Error monitor
 #include "../include/error_monitor.hpp"
@@ -163,7 +163,7 @@ using namespace unitree_hg::msg::dds_;
  *  - PolicyEngine (TensorRT control policy)
  *  - EncoderEngine (optional TensorRT observation encoder)
  *  - LocalMotionPlannerBase (optional TensorRT locomotion planner)
- *  - Dex3Hands (optional Dex3 hand controller)
+ *  - InspireRh56e2Hands
  *  - StateLogger (ring buffer + CSV persistence)
  *  - OutputInterface(s) (ZMQ / ROS2 state publishers)
  *  - MotionDataReader (pre-loaded reference motions)
@@ -306,8 +306,7 @@ class G1Deploy {
     // =========================================================================
     std::unique_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
     
-    // Dex3 hands manager
-    Dex3Hands dex3_hands_;
+    InspireRh56e2Hands hands_;
 
     // Motor error monitor (tracks fault state transitions)
     ErrorMonitor error_monitor_;
@@ -422,7 +421,7 @@ class G1Deploy {
     // =========================================================================
     std::array<double, 3> initial_vr_3point_compliance_ = {0.5, 0.5, 0.0};
     
-    // Initial max close ratio for Dex3 hands (set from command line)
+    // Initial max close ratio for the RH56E2 hands (set from command line)
     // Default 1.0 allows full closure, use --max-close-ratio to limit
     // Keyboard controls (J/K) always available for runtime adjustment
     double initial_max_close_ratio_ = 1.0;
@@ -2374,8 +2373,9 @@ class G1Deploy {
                 << (_topic_prefix_env && *_topic_prefix_env ? _topic_prefix_env : "<physical-default>")
                 << std::endl;
 
-      // Initialize Dex3 hands (ChannelFactory already initialized above)
-      dex3_hands_.initialize("");
+      // RH56E2 is the only supported hand configuration.
+      hands_.initialize("");
+      std::cout << "[deploy] hand_model=inspire-rh56e2" << std::endl;
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2800,7 +2800,7 @@ class G1Deploy {
         input_interface_->SetVR3PointCompliance(initial_vr_3point_compliance_);
         // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
         input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
-        dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        hands_.SetMaxCloseRatio(initial_max_close_ratio_);
         std::cout << "[INFO] Initial VR 3-point compliance: ["
                   << initial_vr_3point_compliance_[0] << ", "
                   << initial_vr_3point_compliance_[1] << ", "
@@ -3357,7 +3357,7 @@ class G1Deploy {
      *
      * Reads the latest MotorCommand from motor_command_buffer_, packs it
      * into a LowCmd_ DDS message with CRC, and publishes via DDS.
-     * Also publishes Dex3 hand commands at the same cadence.
+     * Also publishes RH56E2 hand commands at the same cadence.
      */
     void LowCommandWriter() { WriteLowCommand(false); }
 
@@ -3647,8 +3647,8 @@ class G1Deploy {
         }
       }
 
-      // Publish Dex3 hand commands at the same publish cadence
-      dex3_hands_.writeOnce();
+      // Publish the RH56E2 command at the same writer cadence.
+      hands_.writeOnce();
     }
 
     void PrintJointLimiterSummary() const {
@@ -3891,7 +3891,7 @@ class G1Deploy {
      *        default standing angles over `duration_` seconds (linear interpolation).
      *
      * Called at 50 Hz until the ramp completes, at which point the state machine
-     * transitions to WAIT_FOR_CONTROL and the Dex3 hands open.
+     * transitions to WAIT_FOR_CONTROL and the hands open.
      * @return True once LowState data is available; false if not yet ready.
      */
     bool InitControl() {
@@ -3923,12 +3923,13 @@ class G1Deploy {
                 current_pos * (1.0 - ratio) + default_angles[i] * ratio);
           }
         }
-        dex3_hands_.close(true);
-        dex3_hands_.close(false);
+        // Keep the 30 N RH56E2 open throughout body initialization.
+        hands_.open(true);
+        hands_.open(false);
       } else {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
-        dex3_hands_.open(true);
-        dex3_hands_.open(false);
+        hands_.open(true);
+        hands_.open(false);
         std::cout << "Init Done";
         if (joint_limiter_enabled_) {
           std::cout << " (measured-position seed; empty per-joint windows)";
@@ -4100,13 +4101,14 @@ class G1Deploy {
       std::array<double, 3> body_torso_ang_vel = float_to_double<3>(imu_torso->gyroscope());
       std::array<double, 3> body_torso_accel = float_to_double<3>(imu_torso->accelerometer());
 
-      // Collect hand states from Dex3 hands
+      // Collect state in the policy's seven-channel convention. The RH56E2
+      // backend converts Unitree Inspire normalized feedback into this form.
       std::array<double, 7> left_hand_q = {0.0};
       std::array<double, 7> left_hand_dq = {0.0};
       std::array<double, 7> right_hand_q = {0.0};
       std::array<double, 7> right_hand_dq = {0.0};
       
-      auto left_hand_state_ptr = dex3_hands_.getState(true);
+      auto left_hand_state_ptr = hands_.getState(true);
       if (left_hand_state_ptr) {
         for (int i = 0; i < 7; ++i) {
           left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
@@ -4114,7 +4116,7 @@ class G1Deploy {
         }
       }
       
-      auto right_hand_state_ptr = dex3_hands_.getState(false);
+      auto right_hand_state_ptr = hands_.getState(false);
       if (right_hand_state_ptr) {
         for (int i = 0; i < 7; ++i) {
           right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
@@ -5217,7 +5219,7 @@ class G1Deploy {
      *    3. GatherObservations — fill the policy observation vector.
      *    4. LogPostState — append encoder token to the latest log entry.
      *    5. CreatePolicyCommand — run TensorRT policy, produce MotorCommand.
-     *    6. Update Dex3 hands (max-close ratio + joint targets).
+     *    6. Update the RH56E2 hands (max-close ratio + joint targets).
      *    7. Publish state to all output interfaces (ZMQ / ROS2).
      *    8. Handle motion recording (streamed + planner).
      *    9. CurrentFrameAdvancement — advance playback cursor, blend planner.
@@ -5441,12 +5443,12 @@ class G1Deploy {
           WriteIdleTelemetryRow(current_motion_copy, current_frame_copy);
           auto motor_command_end_time = std::chrono::steady_clock::now();
 
-          // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
-          dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
+          // Apply the policy-space close limit to the RH56E2 backend.
+          hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
           
           // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
+          hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
           
           // Update last hand actions for logging (use buffered data)
           for (int i = 0; i < 7; ++i) {
@@ -5563,7 +5565,7 @@ class G1Deploy {
             }
             
             // Print hand max close ratio (keyboard-controlled via X/C keys)
-            std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            std::cout << " | HandCloseRatio: " << hands_.GetMaxCloseRatio();
             
             std::cout << std::endl;
           }

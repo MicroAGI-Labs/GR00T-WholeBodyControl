@@ -1,8 +1,8 @@
 """Bridge between Unitree SDK2 DDS topics and the MuJoCo simulation.
 
-Subscribes to low-level motor commands (body + hands) and publishes
-simulated sensor state (joint pos/vel, IMU, odometry) back over DDS,
-so the WBC policy sees the sim as a real robot.
+Subscribes to low-level body motor commands and publishes simulated body
+sensor state over DDS. RH56E2 hand DDS is owned by the hand-specific plant
+adapter because its six-actuator normalized contract is not LowCmd.
 """
 
 import sys
@@ -14,18 +14,16 @@ import scipy.spatial.transform
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
 from unitree_sdk2py.idl.default import (
     unitree_go_msg_dds__WirelessController_,
-    unitree_hg_msg_dds__HandCmd_ as HandCmd_default,
-    unitree_hg_msg_dds__HandState_ as HandState_default,
 )
 from unitree_sdk2py.idl.unitree_go.msg.dds_ import WirelessController_
-from unitree_sdk2py.idl.unitree_hg.msg.dds_ import HandCmd_, HandState_, OdoState_
+from unitree_sdk2py.idl.unitree_hg.msg.dds_ import OdoState_
 
 
 class UnitreeSdk2Bridge:
     """
     This class is responsible for bridging the Unitree SDK2 with the Groot environment.
     It is responsible for sending and receiving messages to and from the Unitree SDK2.
-    Both the body and hand are supported.
+    RH56E2 hand transport is deliberately separate from this body bridge.
     """
 
     def __init__(self, config):
@@ -56,7 +54,6 @@ class UnitreeSdk2Bridge:
             raise ValueError(f"Invalid robot type '{robot_type}'. Expected 'g1', 'h1', or 'go2'.")
 
         self.num_body_motor = config["NUM_MOTORS"]
-        self.num_hand_motor = config.get("NUM_HAND_MOTORS", 0)
         self.use_sensor = config["USE_SENSOR"]
 
         self.have_imu_ = False
@@ -79,31 +76,14 @@ class UnitreeSdk2Bridge:
         self.torso_imu_puber = ChannelPublisher("rt/secondary_imu", IMUState_)
         self.torso_imu_puber.Init()
 
-        self.left_hand_state = HandState_default()
-        self.left_hand_state_puber = ChannelPublisher("rt/dex3/left/state", HandState_)
-        self.left_hand_state_puber.Init()
-        self.right_hand_state = HandState_default()
-        self.right_hand_state_puber = ChannelPublisher("rt/dex3/right/state", HandState_)
-        self.right_hand_state_puber.Init()
-
         # Locks MUST be created before the subscriber handlers are registered: the
         # handlers acquire them, and if a command arrives between Subscriber.Init() and
         # the lock creation (which happens whenever a deploy is already publishing at
         # bridge startup), the handler thread dies with 'no attribute low_cmd_lock' and
         # the bridge silently stops applying lowcmd -> robot gets no control and falls.
         self.low_cmd_lock = threading.Lock()
-        self.left_hand_cmd_lock = threading.Lock()
-        self.right_hand_cmd_lock = threading.Lock()
-
         self.low_cmd_suber = ChannelSubscriber("rt/lowcmd", LowCmd_)
         self.low_cmd_suber.Init(self.LowCmdHandler, 1)
-
-        self.left_hand_cmd = HandCmd_default()
-        self.left_hand_cmd_suber = ChannelSubscriber("rt/dex3/left/cmd", HandCmd_)
-        self.left_hand_cmd_suber.Init(self.LeftHandCmdHandler, 1)
-        self.right_hand_cmd = HandCmd_default()
-        self.right_hand_cmd_suber = ChannelSubscriber("rt/dex3/right/cmd", HandCmd_)
-        self.right_hand_cmd_suber.Init(self.RightHandCmdHandler, 1)
 
         self.wireless_controller = unitree_go_msg_dds__WirelessController_()
         self.wireless_controller_puber = ChannelPublisher(
@@ -138,12 +118,6 @@ class UnitreeSdk2Bridge:
         with self.low_cmd_lock:
             self.low_cmd_received = False
             self.new_low_cmd = False
-        with self.left_hand_cmd_lock:
-            self.left_hand_cmd_received = False
-            self.new_left_hand_cmd = False
-        with self.right_hand_cmd_lock:
-            self.right_hand_cmd_received = False
-            self.new_right_hand_cmd = False
 
     def LowCmdHandler(self, msg):
         with self.low_cmd_lock:
@@ -151,26 +125,9 @@ class UnitreeSdk2Bridge:
             self.low_cmd_received = True
             self.new_low_cmd = True
 
-    def LeftHandCmdHandler(self, msg):
-        with self.left_hand_cmd_lock:
-            self.left_hand_cmd = msg
-            self.left_hand_cmd_received = True
-            self.new_left_hand_cmd = True
-
-    def RightHandCmdHandler(self, msg):
-        with self.right_hand_cmd_lock:
-            self.right_hand_cmd = msg
-            self.right_hand_cmd_received = True
-            self.new_right_hand_cmd = True
-
     def cmd_received(self):
         with self.low_cmd_lock:
-            low_cmd_received = self.low_cmd_received
-        with self.left_hand_cmd_lock:
-            left_hand_cmd_received = self.left_hand_cmd_received
-        with self.right_hand_cmd_lock:
-            right_hand_cmd_received = self.right_hand_cmd_received
-        return low_cmd_received or left_hand_cmd_received or right_hand_cmd_received
+            return self.low_cmd_received
 
     def PublishLowState(self, obs: Dict[str, any]):
         # publish body state
@@ -212,33 +169,15 @@ class UnitreeSdk2Bridge:
 
         self.torso_imu_puber.Write(self.torso_imu_state)
 
-        # publish hand state
-        for i in range(self.num_hand_motor):
-            self.left_hand_state.motor_state[i].q = obs["left_hand_q"][i]
-            self.left_hand_state.motor_state[i].dq = obs["left_hand_dq"][i]
-        self.left_hand_state_puber.Write(self.left_hand_state)
-
-        for i in range(self.num_hand_motor):
-            self.right_hand_state.motor_state[i].q = obs["right_hand_q"][i]
-            self.right_hand_state.motor_state[i].dq = obs["right_hand_dq"][i]
-        self.right_hand_state_puber.Write(self.right_hand_state)
-
     def GetAction(self) -> Tuple[np.ndarray, bool, bool]:
         with self.low_cmd_lock:
             body_q = [self.low_cmd.motor_cmd[i].q for i in range(self.num_body_motor)]
-        with self.left_hand_cmd_lock:
-            left_hand_q = [self.left_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
-        with self.right_hand_cmd_lock:
-            right_hand_q = [self.right_hand_cmd.motor_cmd[i].q for i in range(self.num_hand_motor)]
-        with self.low_cmd_lock and self.left_hand_cmd_lock and self.right_hand_cmd_lock:
-            is_new_action = self.new_low_cmd and self.new_left_hand_cmd and self.new_right_hand_cmd
+            is_new_action = self.new_low_cmd
             if is_new_action:
                 self.new_low_cmd = False
-                self.new_left_hand_cmd = False
-                self.new_right_hand_cmd = False
 
         return (
-            np.concatenate([body_q[:-7], left_hand_q, body_q[-7:], right_hand_q]),
+            np.asarray(body_q),
             self.cmd_received(),
             is_new_action,
         )

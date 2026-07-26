@@ -35,7 +35,7 @@
  *
  * ## Optional Fields (all versions)
  *
- *   - `left_hand_joints`, `right_hand_joints` – 7-DOF Dex3 joint values.
+ *   - `left_hand_joints`, `right_hand_joints` – RH56E2 close fractions plus unused slot.
  *   - `vr_position` (9 doubles) – enables VR 3-point tracking mode.
  *   - `vr_orientation` (12 doubles) – defaults used if absent.
  *   - `vr_compliance` (3 doubles) – **IGNORED** (compliance is keyboard-controlled).

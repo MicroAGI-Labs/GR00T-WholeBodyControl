@@ -266,7 +266,8 @@ find_package(GTest REQUIRED)
 file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
 list(REMOVE_ITEM TEST_SRCS
   ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_test.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_benchmark.cpp)
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_benchmark.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/rh56e2_mapping_test.cpp)
 
 add_executable(run_tests ${TEST_SRCS})
 target_link_directories(run_tests PRIVATE ${CUDA_LINK_DIRS})
@@ -297,6 +298,17 @@ set_target_properties(command_safety_limiter_test PROPERTIES
   CXX_EXTENSIONS OFF)
 enable_testing()
 add_test(NAME command_safety_limiter COMMAND command_safety_limiter_test)
+
+add_executable(rh56e2_mapping_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/rh56e2_mapping_test.cpp)
+target_include_directories(rh56e2_mapping_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(rh56e2_mapping_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+add_test(NAME rh56e2_mapping COMMAND rh56e2_mapping_test)
 
 add_executable(command_safety_limiter_benchmark
   ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_benchmark.cpp)

@@ -531,6 +531,7 @@ echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
+echo -e "  Hand Model:         ${GREEN}inspire-rh56e2${NC}"
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "  Extra Args:         ${GREEN}$EXTRA_ARGS${NC}"
 fi
@@ -621,6 +622,7 @@ XML
       domain: 0,
       allow: [
         "rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/eval",
+        "rt/inspire/cmd", "rt/inspire/state",
         "rt/api/motion_switcher/request", "rt/api/motion_switcher/response",
         "^rt/sim/g1/[0-9]+/(lowstate|lowcmd|secondary_imu|reset_pose/cmd|eval)$"
       ],
