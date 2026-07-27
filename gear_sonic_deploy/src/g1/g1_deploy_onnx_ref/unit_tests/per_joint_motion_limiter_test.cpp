@@ -48,7 +48,8 @@ void CheckInvariants(const Limits& limits, const Output& output,
           limits.max_window_velocity[joint] * limits.window_duration +
               tolerance);
     CHECK(output.window_delta_v[joint] <=
-          limits.max_window_acceleration[joint] * limits.window_duration +
+          limits.max_window_acceleration[joint] *
+                  limits.delta_v_window_duration +
               tolerance);
     CHECK(output.position[joint] >= limits.min_position[joint] - tolerance);
     CHECK(output.position[joint] <= limits.max_position[joint] + tolerance);
@@ -77,6 +78,125 @@ void TestSeedsContinuousStateFromMeasuredPosition() {
         limits.max_jerk[3] * limits.writer_dt + 1.0e-12);
 }
 
+void TestMeasuredRelativeTargetCapDoesNotJumpOutput() {
+  auto limits = SharedSafetyLimits();
+  limits.max_target_offset.fill(1.0);
+  limits.max_target_offset[0] = 0.05;
+  limits.max_tracking_error.fill(1.0);
+  limits.max_instant_velocity.fill(100.0);
+  limits.max_acceleration.fill(2.0);
+  limits.peak_acceleration.fill(2.0);
+  limits.sustained_acceleration.fill(2.0);
+  limits.braking_acceleration.fill(2.0);
+  limits.max_jerk.fill(1.0e9);
+  limits.max_window_velocity.fill(100.0);
+  limits.max_window_acceleration.fill(10100.0);
+  PerJointMotionLimiter limiter(limits);
+  auto measured = Zeros();
+  auto desired = Zeros();
+  desired[0] = 1.0;
+  CHECK(limiter.Seed(measured));
+
+  auto output = limiter.Step(desired, measured, Zeros(), true, true, 0.02);
+  CHECK(std::abs(output.target_position[0] - 0.05) < 1.0e-12);
+  CHECK(HasReason(output.reasons[0], LimitReason::kTrackingDistance));
+  CHECK(std::abs(output.acceleration[0] - 2.0) < 1.0e-12);
+  CHECK(std::abs(output.velocity[0] - 0.004) < 1.0e-12);
+  CHECK(std::abs(output.position[0] - 0.000008) < 1.0e-12);
+
+  // The accepted goal follows the measured-position envelope on every writer
+  // tick, while the emitted q/v/a state remains continuous.
+  measured[0] = 0.02;
+  output = limiter.Step(desired, measured, Zeros(), true, false, 0.02);
+  CHECK(std::abs(output.target_position[0] - 0.07) < 1.0e-12);
+  CHECK(output.position[0] > 0.000008);
+  CHECK(output.position[0] < output.target_position[0]);
+}
+
+void TestNewTargetsPreserveReferenceVelocityAndAcceleration() {
+  auto limits = SharedSafetyLimits();
+  limits.max_target_offset.fill(1.0);
+  limits.max_tracking_error.fill(1.0);
+  limits.max_instant_velocity.fill(100.0);
+  limits.max_acceleration.fill(4.0);
+  limits.peak_acceleration.fill(4.0);
+  limits.sustained_acceleration.fill(4.0);
+  limits.braking_acceleration.fill(4.0);
+  limits.max_jerk.fill(100.0);
+  limits.max_window_velocity.fill(100.0);
+  limits.max_window_acceleration.fill(10100.0);
+  PerJointMotionLimiter limiter(limits);
+  auto measured = Zeros();
+  auto measured_velocity = Zeros();
+  auto desired = Zeros();
+  desired[1] = 0.5;
+  CHECK(limiter.Seed(measured));
+
+  Output output;
+  for (int tick = 0; tick < 10; ++tick) {
+    output = limiter.Step(desired, measured, measured_velocity, true,
+                          tick == 0, 0.02);
+  }
+  const double velocity_before_update = output.velocity[1];
+  const double acceleration_before_update = output.acceleration[1];
+  CHECK(velocity_before_update > 0.0);
+  CHECK(acceleration_before_update > 0.0);
+
+  desired[1] = -0.5;
+  output = limiter.Step(desired, measured, measured_velocity, true, true, 0.02);
+  CHECK(output.velocity[1] != 0.0);
+  CHECK(std::abs(output.velocity[1] - velocity_before_update) <=
+        limits.max_acceleration[1] * limits.writer_dt + 1.0e-12);
+  CHECK(std::abs(output.acceleration[1] - acceleration_before_update) <=
+        limits.max_jerk[1] * limits.writer_dt + 1.0e-12);
+}
+
+void TestFullLimiterBurstAndSustainedAcceleration() {
+  const auto limits = SafetyLimitsForLevel(1.0);
+  auto measured = Zeros();
+  auto desired = Zeros();
+
+  PerJointMotionLimiter small_motion(limits);
+  CHECK(small_motion.Seed(measured));
+  desired[0] = 0.01;
+  const auto small = small_motion.Step(
+      desired, measured, Zeros(), true, true, 0.02);
+  CHECK(small.drive_acceleration_limit[0] >
+        limits.sustained_acceleration[0]);
+  CHECK(small.drive_acceleration_limit[0] <=
+        limits.peak_acceleration[0] + 1.0e-9);
+
+  PerJointMotionLimiter large_motion(limits);
+  CHECK(large_motion.Seed(measured));
+  desired[0] = 0.10;
+  const auto large = large_motion.Step(
+      desired, measured, Zeros(), true, true, 0.02);
+  CHECK(std::abs(large.drive_acceleration_limit[0] - 200.0) < 1.0e-9);
+  CHECK(std::abs(large.acceleration[0] - 200.0) < 1.0e-9);
+  CHECK(HasReason(large.reasons[0], LimitReason::kCommandVelocity));
+  CHECK(HasReason(large.reasons[0], LimitReason::kSustainedAcceleration));
+  CHECK(!HasReason(large.reasons[0], LimitReason::kPeakAcceleration));
+}
+
+void TestEmptyDriveBudgetTransitionsToBrakingWithoutFault() {
+  const auto limits = SafetyLimitsForLevel(1.0);
+  PerJointMotionLimiter limiter(limits);
+  auto measured = Zeros();
+  auto desired = Zeros();
+  desired[8] = 0.10;
+  CHECK(limiter.Seed(measured));
+  for (int tick = 0; tick < 500; ++tick) {
+    const auto output = limiter.Step(
+        desired, measured, Zeros(), true, tick % 10 == 0, 0.02);
+    CHECK(output.state[8] != JointState::kJointFault);
+    CHECK(std::abs(output.velocity[8]) <= 2.0 + 1.0e-9);
+    CHECK(output.window_delta_v[8] <=
+          limits.max_window_acceleration[8] *
+                  limits.delta_v_window_duration +
+              1.0e-9);
+  }
+}
+
 void TestRepeatedWriterReadsDoNotCreateTargetImpulses() {
   auto limits = SharedSafetyLimits();
   limits.max_tracking_error.fill(1.0);
@@ -93,6 +213,13 @@ void TestRepeatedWriterReadsDoNotCreateTargetImpulses() {
     const auto output = limiter.Step(desired, measured, measured_velocity, true,
                                      new_target, 0.02);
     CheckInvariants(limits, output, measured, previous_acceleration);
+    if (output.position[0] < previous_position - 1.0e-12) {
+      std::cerr << "monotonic tick=" << tick << " previous="
+                << previous_position << " q=" << output.position[0]
+                << " v=" << output.velocity[0]
+                << " a=" << output.acceleration[0]
+                << " reasons=" << output.reasons[0] << '\n';
+    }
     CHECK(output.position[0] >= previous_position - 1.0e-12);
     previous_position = output.position[0];
     previous_acceleration = output.acceleration;
@@ -202,30 +329,39 @@ void TestNoTargetOvershootOnStepAndReversal() {
 void TestLimitingLevelScalesEveryDynamicCeiling() {
   const auto full = SafetyLimitsForLevel(1.0);
   const auto half = SafetyLimitsForLevel(0.5);
+  const auto forty = SafetyLimitsForLevel(0.4);
   for (std::size_t joint = 0; joint < kJointCount; ++joint) {
     CHECK(half.min_position[joint] == full.min_position[joint]);
     CHECK(half.max_position[joint] == full.max_position[joint]);
-    const auto scaled = [](double half_value, double full_value) {
-      return std::abs(half_value - 64.0 * full_value) < 1.0e-10;
+    const auto scaled = [](double value, double base, double scale) {
+      return std::abs(value - scale * base) <
+          1.0e-9 * std::max(1.0, std::abs(value));
     };
     CHECK(scaled(half.max_instant_velocity[joint],
-                 full.max_instant_velocity[joint]));
-    CHECK(scaled(half.max_acceleration[joint], full.max_acceleration[joint]));
-    CHECK(scaled(half.max_jerk[joint], full.max_jerk[joint]));
-    CHECK(scaled(half.max_window_velocity[joint],
-                 full.max_window_velocity[joint]));
-    CHECK(scaled(half.max_window_acceleration[joint],
-                 full.max_window_acceleration[joint]));
+                 full.max_instant_velocity[joint], 32.0));
+    CHECK(scaled(forty.max_instant_velocity[joint],
+                 full.max_instant_velocity[joint], 97.65625));
+    CHECK(scaled(half.max_acceleration[joint],
+                 full.max_acceleration[joint], 32.0));
+    CHECK(scaled(half.max_target_offset[joint],
+                 full.max_target_offset[joint], 32.0));
     CHECK(scaled(half.max_tracking_error[joint],
-                 full.max_tracking_error[joint]));
-    CHECK(scaled(half.measured_velocity_brake[joint],
-                 full.measured_velocity_brake[joint]));
-    CHECK(scaled(half.measured_velocity_fault[joint],
-                 full.measured_velocity_fault[joint]));
-    CHECK(scaled(half.measured_acceleration_brake[joint],
-                 full.measured_acceleration_brake[joint]));
-    CHECK(scaled(half.measured_acceleration_fault[joint],
-                 full.measured_acceleration_fault[joint]));
+                 full.max_tracking_error[joint], 32.0));
+    CHECK(std::abs(full.max_tracking_error[joint] -
+                   2.0 * full.max_target_offset[joint]) < 1.0e-12);
+    if (joint < 12) {
+      CHECK(std::abs(full.max_instant_velocity[joint] - 2.0) < 1.0e-12);
+      CHECK(std::abs(full.peak_acceleration[joint] - 1500.0) < 1.0e-12);
+      CHECK(std::abs(full.sustained_acceleration[joint] - 200.0) < 1.0e-12);
+      CHECK(std::abs(full.braking_acceleration[joint] - 1000.0) < 1.0e-12);
+      CHECK(std::abs(full.max_window_acceleration[joint] - 300.0) <
+            1.0e-12);
+    } else {
+      CHECK(std::abs(full.max_instant_velocity[joint] - 2.0) < 1.0e-12);
+      CHECK(std::abs(full.peak_acceleration[joint] - 500.0) < 1.0e-12);
+      CHECK(std::abs(full.sustained_acceleration[joint] - 50.0) < 1.0e-12);
+      CHECK(std::abs(full.braking_acceleration[joint] - 300.0) < 1.0e-12);
+    }
   }
 }
 
@@ -463,6 +599,13 @@ void TestTerminationRejectsTargetsAndConvergesToHold() {
     if (output.state[4] == JointState::kJointFault) break;
   }
   CHECK(output.state[4] != JointState::kJointFault);
+  if (!(std::abs(output.position[4] - measured[4]) < 0.01)) {
+    std::cerr << "termination q=" << output.position[4]
+              << " measured=" << measured[4]
+              << " v=" << output.velocity[4]
+              << " a=" << output.acceleration[4]
+              << " reasons=" << output.reasons[4] << '\n';
+  }
   CHECK(std::abs(output.position[4] - measured[4]) < 0.01);
   CHECK(limiter.stats()[4].lifecycle_hold_ticks > 0);
 }
@@ -522,6 +665,10 @@ void TestRandomizedMillionTickInvariants() {
 
 int main() {
   TestSeedsContinuousStateFromMeasuredPosition();
+  TestMeasuredRelativeTargetCapDoesNotJumpOutput();
+  TestNewTargetsPreserveReferenceVelocityAndAcceleration();
+  TestFullLimiterBurstAndSustainedAcceleration();
+  TestEmptyDriveBudgetTransitionsToBrakingWithoutFault();
   TestRepeatedWriterReadsDoNotCreateTargetImpulses();
   TestTargetCadencesAndTrajectories();
   TestNoTargetOvershootOnStepAndReversal();

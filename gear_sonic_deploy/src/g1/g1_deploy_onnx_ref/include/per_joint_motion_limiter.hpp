@@ -34,18 +34,29 @@ enum class JointFaultReason {
 
 enum class LimitReason : std::uint32_t {
   kNone = 0,
-  kMechanicalPosition = 1u << 0,
-  kTrackingDistance = 1u << 1,
-  kInstantVelocity = 1u << 2,
-  kInstantAcceleration = 1u << 3,
-  kInstantJerk = 1u << 4,
-  kPositionWindow = 1u << 5,
-  kDeltaVWindow = 1u << 6,
-  kMeasuredVelocity = 1u << 7,
-  kMeasuredAcceleration = 1u << 8,
-  kStaleTarget = 1u << 9,
-  kTermination = 1u << 10,
-  kTargetStopping = 1u << 11,
+  kTargetOffset = 1u << 0,
+  kMechanicalPosition = 1u << 1,
+  kCommandVelocity = 1u << 2,
+  kPeakAcceleration = 1u << 3,
+  kSustainedAcceleration = 1u << 4,
+  kBrakingAcceleration = 1u << 5,
+  kStoppingDistance = 1u << 6,
+  kPositionWindow = 1u << 7,
+  kDeltaVWindow = 1u << 8,
+  kTrackingEnvelope = 1u << 9,
+  kMeasuredVelocity = 1u << 10,
+  kMeasuredAcceleration = 1u << 11,
+  kStaleTarget = 1u << 12,
+  kTermination = 1u << 13,
+  kJointFault = 1u << 14,
+  kAccelerationSlew = 1u << 15,
+
+  // Compatibility names retained for existing diagnostics and tests.
+  kTrackingDistance = kTargetOffset,
+  kInstantVelocity = kCommandVelocity,
+  kInstantAcceleration = kSustainedAcceleration,
+  kInstantJerk = kAccelerationSlew,
+  kTargetStopping = kStoppingDistance,
 };
 
 constexpr std::uint32_t ReasonBit(LimitReason reason) {
@@ -60,10 +71,19 @@ struct Limits {
   std::array<double, kJointCount> min_position{};
   std::array<double, kJointCount> max_position{};
   std::array<double, kJointCount> max_instant_velocity{};
+  std::array<double, kJointCount> peak_acceleration{};
+  std::array<double, kJointCount> sustained_acceleration{};
+  std::array<double, kJointCount> braking_acceleration{};
+  std::array<double, kJointCount> burst_distance{};
+  std::array<double, kJointCount> burst_velocity{};
   std::array<double, kJointCount> max_acceleration{};
   std::array<double, kJointCount> max_jerk{};
   std::array<double, kJointCount> max_window_velocity{};
   std::array<double, kJointCount> max_window_acceleration{};
+  // Maximum accepted SONIC target displacement from the current measured
+  // joint position. This caps the goal presented to the 500 Hz reference
+  // governor; it never causes an instantaneous change in the emitted command.
+  std::array<double, kJointCount> max_target_offset{};
   std::array<double, kJointCount> max_tracking_error{};
   std::array<double, kJointCount> measured_velocity_brake{};
   std::array<double, kJointCount> measured_velocity_fault{};
@@ -72,6 +92,7 @@ struct Limits {
   std::array<double, kJointCount> brake_target_error{};
   double writer_dt = 0.002;
   double window_duration = 0.100;
+  double delta_v_window_duration = 0.020;
   double normal_window_fraction = 0.75;
   double nominal_target_interval = 0.020;
   double min_target_interval = 0.005;
@@ -94,9 +115,13 @@ struct JointStats {
   std::uint64_t max_command_limited_run = 0;
   std::uint64_t current_command_limited_run = 0;
   std::uint64_t mechanical_limit_ticks = 0;
+  std::uint64_t target_offset_ticks = 0;
   std::uint64_t tracking_limit_ticks = 0;
   std::uint64_t velocity_limit_ticks = 0;
   std::uint64_t acceleration_limit_ticks = 0;
+  std::uint64_t peak_acceleration_limit_ticks = 0;
+  std::uint64_t sustained_acceleration_limit_ticks = 0;
+  std::uint64_t braking_acceleration_limit_ticks = 0;
   std::uint64_t jerk_limit_ticks = 0;
   std::uint64_t position_window_limit_ticks = 0;
   std::uint64_t delta_v_window_limit_ticks = 0;
@@ -135,6 +160,14 @@ struct Output {
   std::array<double, kJointCount> window_motion{};
   std::array<double, kJointCount> window_delta_v{};
   std::array<double, kJointCount> measured_acceleration{};
+  std::array<double, kJointCount> raw_target{};
+  std::array<double, kJointCount> target_position{};
+  std::array<double, kJointCount> requested_velocity{};
+  std::array<double, kJointCount> permitted_velocity{};
+  std::array<double, kJointCount> requested_acceleration{};
+  std::array<double, kJointCount> drive_acceleration_limit{};
+  std::array<double, kJointCount> burst_distance_factor{};
+  std::array<double, kJointCount> burst_velocity_factor{};
   std::array<JointState, kJointCount> state{};
   std::array<std::uint32_t, kJointCount> reasons{};
   std::array<bool, kJointCount> local_damping{};
@@ -198,52 +231,118 @@ inline Limits SharedSafetyLimits() {
       1., 1., 1., 1., .8, .7, .7,
       1., 1., 1., 1., .8, .7, .7,
   };
+  limits.peak_acceleration = limits.max_acceleration;
+  limits.sustained_acceleration = limits.max_acceleration;
+  limits.braking_acceleration = limits.max_acceleration;
+  limits.burst_distance.fill(0.03);
+  limits.burst_velocity.fill(0.30);
   limits.max_tracking_error = {
       .10, .10, .10, .10, .08, .08, .10, .10, .10, .10, .08, .08,
       .08, .08, .08,
       .12, .12, .12, .12, .10, .10, .10,
       .12, .12, .12, .12, .10, .10, .10,
   };
+  limits.max_target_offset = limits.max_tracking_error;
+  // A measured-relative target cap and a measured-relative q_out envelope are
+  // different constraints.  The continuous reference needs room to brake if
+  // the measured joint moves opposite it; making both envelopes identical can
+  // make the acceleration intersection infeasible at the target-cap boundary.
+  // The outer envelope is still finite and per-joint, while the inner target
+  // cap remains the stored-energy limit presented to the governor.
+  for (std::size_t joint = 0; joint < kJointCount; ++joint)
+    limits.max_tracking_error[joint] = 2.0 * limits.max_target_offset[joint];
+  // Experimental full-limiting reference-governor profile for the twelve leg
+  // joints. These are simulator qualification values, not approved hardware
+  // limits. Lower limiter percentages relax them through the shared curve.
+  for (std::size_t joint = 0; joint < 12; ++joint) {
+    limits.max_instant_velocity[joint] = 2.0;
+    limits.peak_acceleration[joint] = 1500.0;
+    limits.sustained_acceleration[joint] = 200.0;
+    limits.braking_acceleration[joint] = 1000.0;
+    limits.max_acceleration[joint] = 1500.0;
+    limits.burst_distance[joint] = 0.03;
+    limits.burst_velocity[joint] = 0.30;
+  }
+  // The original waist/arm acceleration ceilings predated the continuous
+  // reference governor and were too small for it to converge during the
+  // supported handoff (at 40%, only 4.4--9.4 rad/s^2). Keep these joints on
+  // independent, explicitly lower profiles than the legs, but give the
+  // governor enough authority to follow the policy rather than accumulating a
+  // large measured-to-command tracking error while support is active.
+  for (std::size_t joint = 12; joint < kJointCount; ++joint) {
+    limits.max_instant_velocity[joint] = 2.0;
+    limits.peak_acceleration[joint] = 500.0;
+    limits.sustained_acceleration[joint] = 50.0;
+    limits.braking_acceleration[joint] = 300.0;
+    limits.max_acceleration[joint] = 500.0;
+  }
   limits.measured_velocity_brake.fill(0.7);
   limits.measured_velocity_fault.fill(1.2);
   limits.measured_acceleration_brake.fill(12.0);
   limits.measured_acceleration_fault.fill(20.0);
+  for (std::size_t joint = 0; joint < 12; ++joint) {
+    limits.measured_velocity_brake[joint] = 2.2;
+    limits.measured_velocity_fault[joint] = 3.0;
+    limits.measured_acceleration_brake[joint] = 1000.0;
+    limits.measured_acceleration_fault[joint] = 1600.0;
+  }
+  for (std::size_t joint = 12; joint < kJointCount; ++joint) {
+    limits.measured_acceleration_brake[joint] = 100.0;
+    limits.measured_acceleration_fault[joint] = 160.0;
+  }
   for (std::size_t joint = 0; joint < kJointCount; ++joint) {
     // The rolling delta-v window is the sustained-acceleration constraint. A
     // comparatively high instantaneous jerk ceiling keeps the 500 Hz follower
     // responsive to genuine 50 Hz balance targets while still making every
     // emitted acceleration transition explicit and bounded.
-    limits.max_jerk[joint] = 2500.0 * limits.max_acceleration[joint];
+    limits.max_jerk[joint] = 1250000.0;
     // One normal-window acceleration budget plus enough reserve to remove the
     // maximum permitted velocity. This makes the reserve physically useful.
+    // The 20 ms delta-v budget contains a normal drive allowance plus a full
+    // velocity-change reserve for braking. Drive can never consume the reserve.
     limits.max_window_acceleration[joint] =
         limits.max_acceleration[joint] +
-        limits.max_instant_velocity[joint] / limits.window_duration;
+        2.0 * limits.max_instant_velocity[joint] /
+            limits.delta_v_window_duration;
   }
+  for (std::size_t joint = 0; joint < 12; ++joint)
+    limits.max_window_acceleration[joint] = 300.0;
   return limits;
 }
 
 // Level zero is handled as an exact writer bypass. All non-mechanical dynamic
-// limits use the same response curve in simulation and deployment.
+// limits use the same inverse-fifth-power response curve in simulation and
+// deployment: 100% is the configured full limiter and 40% permits 97.65625x
+// each ceiling. The steep response is intentional: balance performance drops
+// sharply when a low percentage still phase-limits the 50 Hz SONIC reference.
+// The proposed experimental values remain anchored exactly at 100%.
 inline Limits SafetyLimitsForLevel(double level) {
   Limits limits = SharedSafetyLimits();
   const double bounded_level = std::clamp(level, 1.0e-6, 1.0);
   const double squared_level = bounded_level * bounded_level;
-  const double scale = 1.0 / (squared_level * squared_level * squared_level);
+  const double scale =
+      1.0 / (squared_level * squared_level * bounded_level);
   const auto scale_array = [scale](auto& values) {
     for (double& value : values) value *= scale;
   };
   scale_array(limits.max_instant_velocity);
+  scale_array(limits.peak_acceleration);
+  scale_array(limits.sustained_acceleration);
+  scale_array(limits.braking_acceleration);
+  scale_array(limits.burst_distance);
+  scale_array(limits.burst_velocity);
   scale_array(limits.max_acceleration);
   scale_array(limits.max_jerk);
   scale_array(limits.max_window_velocity);
   scale_array(limits.max_window_acceleration);
+  scale_array(limits.max_target_offset);
   scale_array(limits.max_tracking_error);
   scale_array(limits.measured_velocity_brake);
   scale_array(limits.measured_velocity_fault);
   scale_array(limits.measured_acceleration_brake);
   scale_array(limits.measured_acceleration_fault);
   scale_array(limits.brake_target_error);
+
   return limits;
 }
 
@@ -254,6 +353,10 @@ class PerJointMotionLimiter {
         std::llround(limits_.window_duration / limits_.writer_dt));
     window_samples_ =
         std::clamp<std::size_t>(position_samples, 1, kMaxWindowSamples);
+    const auto delta_v_samples = static_cast<std::size_t>(
+        std::llround(limits_.delta_v_window_duration / limits_.writer_dt));
+    delta_v_window_samples_ =
+        std::clamp<std::size_t>(delta_v_samples, 1, kMaxWindowSamples);
     const auto measured_samples = static_cast<std::size_t>(
         std::llround(limits_.measured_acceleration_window / limits_.writer_dt));
     measured_velocity_samples_ = std::clamp<std::size_t>(
@@ -268,7 +371,6 @@ class PerJointMotionLimiter {
     states_.fill(JointState::kFollowing);
     fault_reasons_.fill(JointFaultReason::kNone);
     target_interval_ = limits_.nominal_target_interval;
-    tracking_time_ = target_interval_;
   }
 
   bool Seed(const std::array<double, kJointCount>& measured) {
@@ -297,12 +399,12 @@ class PerJointMotionLimiter {
     stats_.fill(JointStats{});
     target_stats_ = TargetStats{};
     window_cursor_ = 0;
+    delta_v_window_cursor_ = 0;
     measured_velocity_cursor_ = 0;
     measured_velocity_population_ = 0;
     target_interval_ = limits_.nominal_target_interval;
     target_elapsed_ = 0.0;
     target_endpoint_reported_ = false;
-    tracking_time_ = target_interval_;
     seeded_ = true;
     return true;
   }
@@ -348,25 +450,21 @@ class PerJointMotionLimiter {
     output.target_endpoint_sample = accept_desired && !new_target &&
         !target_endpoint_reported_ &&
         target_elapsed_ + limits_.writer_dt >= target_interval_ - kTolerance;
-    tracking_time_ = std::max(
-        limits_.writer_dt, target_interval_ - target_elapsed_);
-    const bool target_is_terminal =
-        !accept_desired || target_elapsed_ >= target_interval_;
-
     for (std::size_t joint = 0; joint < kJointCount; ++joint) {
       window_sum_[joint] -= window_history_[joint][window_cursor_];
       delta_v_window_sum_[joint] -=
-          delta_v_window_history_[joint][window_cursor_];
+          delta_v_window_history_[joint][delta_v_window_cursor_];
       window_history_[joint][window_cursor_] = 0.0;
-      delta_v_window_history_[joint][window_cursor_] = 0.0;
+      delta_v_window_history_[joint][delta_v_window_cursor_] = 0.0;
       window_sum_[joint] = std::max(0.0, window_sum_[joint]);
       delta_v_window_sum_[joint] =
           std::max(0.0, delta_v_window_sum_[joint]);
       StepJoint(joint, desired[joint], measured[joint],
-                measured_velocity[joint], accept_desired, new_target,
-                target_is_terminal, output);
+                measured_velocity[joint], accept_desired, new_target, output);
     }
     window_cursor_ = (window_cursor_ + 1) % window_samples_;
+    delta_v_window_cursor_ =
+        (delta_v_window_cursor_ + 1) % delta_v_window_samples_;
     measured_velocity_cursor_ =
         (measured_velocity_cursor_ + 1) % measured_velocity_samples_;
     measured_velocity_population_ =
@@ -393,6 +491,9 @@ class PerJointMotionLimiter {
     return fault_reasons_;
   }
   [[nodiscard]] std::size_t window_samples() const { return window_samples_; }
+  [[nodiscard]] std::size_t delta_v_window_samples() const {
+    return delta_v_window_samples_;
+  }
   [[nodiscard]] std::size_t measured_velocity_samples() const {
     return measured_velocity_samples_;
   }
@@ -403,6 +504,14 @@ class PerJointMotionLimiter {
 
  private:
   static constexpr double kTolerance = 1.0e-12;
+  static constexpr double kConstraintTolerance = 1.0e-8;
+
+  static double SmoothTaper(double value, double threshold) {
+    if (!(threshold > 0.0)) return 0.0;
+    const double x = std::clamp(value / threshold, 0.0, 1.0);
+    const double smoothstep = x * x * (3.0 - 2.0 * x);
+    return 1.0 - smoothstep;
+  }
 
   void AddReason(Output& output, std::size_t joint, LimitReason reason) {
     output.reasons[joint] |= ReasonBit(reason);
@@ -481,14 +590,24 @@ class PerJointMotionLimiter {
 
   void CountReasons(std::size_t joint, std::uint32_t reasons) {
     auto& stats = stats_[joint];
+    if (HasReason(reasons, LimitReason::kTargetOffset))
+      ++stats.target_offset_ticks;
     if (HasReason(reasons, LimitReason::kMechanicalPosition))
       ++stats.mechanical_limit_ticks;
-    if (HasReason(reasons, LimitReason::kTrackingDistance))
+    if (HasReason(reasons, LimitReason::kTrackingEnvelope))
       ++stats.tracking_limit_ticks;
     if (HasReason(reasons, LimitReason::kInstantVelocity))
       ++stats.velocity_limit_ticks;
-    if (HasReason(reasons, LimitReason::kInstantAcceleration))
+    if (HasReason(reasons, LimitReason::kPeakAcceleration) ||
+        HasReason(reasons, LimitReason::kSustainedAcceleration) ||
+        HasReason(reasons, LimitReason::kBrakingAcceleration))
       ++stats.acceleration_limit_ticks;
+    if (HasReason(reasons, LimitReason::kPeakAcceleration))
+      ++stats.peak_acceleration_limit_ticks;
+    if (HasReason(reasons, LimitReason::kSustainedAcceleration))
+      ++stats.sustained_acceleration_limit_ticks;
+    if (HasReason(reasons, LimitReason::kBrakingAcceleration))
+      ++stats.braking_acceleration_limit_ticks;
     if (HasReason(reasons, LimitReason::kInstantJerk))
       ++stats.jerk_limit_ticks;
     if (HasReason(reasons, LimitReason::kPositionWindow))
@@ -509,13 +628,14 @@ class PerJointMotionLimiter {
 
   void StepJoint(std::size_t joint, double desired, double measured,
                  double measured_velocity, bool accept_desired, bool new_target,
-                 bool target_is_terminal, Output& output) {
+                 Output& output) {
     auto& stats = stats_[joint];
     ++stats.ticks;
     const double dt = limits_.writer_dt;
     const double previous_position = position_[joint];
     const double previous_velocity = velocity_[joint];
     const double previous_acceleration = acceleration_[joint];
+    output.raw_target[joint] = desired;
 
     if (!std::isfinite(measured)) {
       LatchFault(joint, JointFaultReason::kInvalidMeasuredPosition);
@@ -610,32 +730,58 @@ class PerJointMotionLimiter {
       output.tracking_limited[joint] = true;
     }
     target = mechanically_bounded;
+    // First cap the new SONIC goal relative to the measured joint state. This
+    // is the per-joint instantaneous-target limit: target_ may jump at 50 Hz,
+    // but position_/velocity_/acceleration_ remain continuous at 500 Hz.
+    const double lower_target_bound = std::max(
+        limits_.min_position[joint],
+        measured - limits_.max_target_offset[joint]);
+    const double upper_target_bound = std::min(
+        limits_.max_position[joint],
+        measured + limits_.max_target_offset[joint]);
+    const double target_bounded =
+        std::clamp(target, lower_target_bound, upper_target_bound);
+    if (std::abs(target_bounded - target) > kTolerance) {
+      AddReason(output, joint, LimitReason::kTargetOffset);
+      output.tracking_limited[joint] = true;
+    }
+    target = target_bounded;
+    output.target_position[joint] = target;
+
+    // The emitted reference has its own measured-relative hard envelope. Keep
+    // this distinct from the target cap so both stored command energy and the
+    // accepted SONIC goal remain explicit configuration choices.
     const double lower_safe_bound = std::max(
         limits_.min_position[joint],
         measured - limits_.max_tracking_error[joint]);
     const double upper_safe_bound = std::min(
         limits_.max_position[joint],
         measured + limits_.max_tracking_error[joint]);
-    const double tracking_bounded =
-        std::clamp(target, lower_safe_bound, upper_safe_bound);
-    if (std::abs(tracking_bounded - target) > kTolerance) {
-      AddReason(output, joint, LimitReason::kTrackingDistance);
-      output.tracking_limited[joint] = true;
-    }
-    target = tracking_bounded;
 
     const double error = target - previous_position;
     const double max_velocity = limits_.max_instant_velocity[joint];
+    const double peak_acceleration = limits_.peak_acceleration[joint];
+    const double sustained_acceleration =
+        limits_.sustained_acceleration[joint];
+    const double braking_acceleration = limits_.braking_acceleration[joint];
     const double max_acceleration = limits_.max_acceleration[joint];
     const double max_jerk = limits_.max_jerk[joint];
-    double velocity_goal = error / tracking_time_;
-    const double bounded_velocity_goal =
-        std::clamp(velocity_goal, -max_velocity, max_velocity);
-    if (std::abs(bounded_velocity_goal - velocity_goal) > kTolerance) {
-      AddReason(output, joint, LimitReason::kInstantVelocity);
-      output.step_limited[joint] = true;
-    }
-    velocity_goal = bounded_velocity_goal;
+    const double distance_factor =
+        SmoothTaper(std::abs(error), limits_.burst_distance[joint]);
+    const double velocity_factor =
+        SmoothTaper(std::abs(previous_velocity), limits_.burst_velocity[joint]);
+    const double drive_acceleration_limit = sustained_acceleration +
+        (peak_acceleration - sustained_acceleration) * distance_factor *
+            velocity_factor;
+    output.burst_distance_factor[joint] = distance_factor;
+    output.burst_velocity_factor[joint] = velocity_factor;
+    output.drive_acceleration_limit[joint] = drive_acceleration_limit;
+
+    // SONIC's held 50 Hz sample is a causal goal, never an endpoint deadline.
+    // The unconstrained request is recorded for telemetry; q_out remains a
+    // continuous 500 Hz state and approaches it through the governor below.
+    const double requested_velocity = error / dt;
+    output.requested_velocity[joint] = requested_velocity;
 
     const double full_position_budget =
         limits_.max_window_velocity[joint] * limits_.window_duration;
@@ -646,9 +792,10 @@ class PerJointMotionLimiter {
     const double normal_position_remaining =
         std::max(0.0, normal_position_budget - window_sum_[joint]);
     const double full_delta_v_budget =
-        limits_.max_window_acceleration[joint] * limits_.window_duration;
+        limits_.max_window_acceleration[joint] *
+        limits_.delta_v_window_duration;
     const double braking_delta_v_reserve =
-        std::min(max_velocity, full_delta_v_budget);
+        std::min(2.0 * max_velocity, full_delta_v_budget);
     const double normal_delta_v_budget =
         std::max(0.0, full_delta_v_budget - braking_delta_v_reserve);
     const double full_delta_v_remaining =
@@ -656,8 +803,53 @@ class PerJointMotionLimiter {
     const double normal_delta_v_remaining =
         std::max(0.0, normal_delta_v_budget - delta_v_window_sum_[joint]);
 
-    bool target_stopping = false;
-    if (std::abs(previous_velocity) > kTolerance) {
+    // Restrict speed to one from which the reference can stop at the target.
+    // The continuous bound is followed by a conservative jerk-aware viability
+    // check below, including a one-writer-tick reaction margin.
+    double stopping_room = std::abs(error);
+    if (error > 0.0)
+      stopping_room = std::min(stopping_room,
+                               upper_safe_bound - previous_position);
+    else if (error < 0.0)
+      stopping_room = std::min(stopping_room,
+                               previous_position - lower_safe_bound);
+    stopping_room = std::min(stopping_room, full_position_remaining);
+    stopping_room = std::max(0.0, stopping_room -
+        std::abs(previous_velocity) * dt -
+        0.5 * std::abs(previous_acceleration) * dt * dt);
+    const double stopping_safe_velocity =
+        std::sqrt(2.0 * braking_acceleration * stopping_room);
+    double permitted_velocity =
+        std::min(max_velocity, stopping_safe_velocity);
+    double velocity_goal = std::abs(error) > kTolerance
+        ? std::copysign(permitted_velocity, error)
+        : 0.0;
+    output.permitted_velocity[joint] = velocity_goal;
+    if (std::abs(requested_velocity) > max_velocity + kTolerance) {
+      AddReason(output, joint, LimitReason::kCommandVelocity);
+      output.step_limited[joint] = true;
+    }
+    if (stopping_safe_velocity < max_velocity - kTolerance &&
+        std::abs(requested_velocity) > stopping_safe_velocity + kTolerance) {
+      AddReason(output, joint, LimitReason::kStoppingDistance);
+    }
+
+    bool target_stopping =
+        (normal_delta_v_remaining <= kTolerance ||
+         normal_position_remaining <= kTolerance) &&
+        (std::abs(previous_velocity) > kTolerance ||
+         std::abs(previous_acceleration) > kTolerance);
+    target_stopping = target_stopping ||
+        normal_position_remaining <=
+            std::abs(previous_velocity) * dt +
+                0.5 * std::abs(previous_acceleration) * dt * dt ||
+        normal_delta_v_remaining <=
+            std::abs(previous_acceleration) * dt;
+    if (target_stopping) {
+      velocity_goal = 0.0;
+      AddReason(output, joint, LimitReason::kStoppingDistance);
+    }
+    if (!target_stopping && std::abs(previous_velocity) > kTolerance) {
       const double motion_direction = std::copysign(1.0, previous_velocity);
       const double directed_velocity = std::abs(previous_velocity);
       const double directed_acceleration =
@@ -665,80 +857,58 @@ class PerJointMotionLimiter {
       double room = motion_direction > 0.0
                         ? upper_safe_bound - previous_position
                         : previous_position - lower_safe_bound;
-      room = std::min(room, full_position_remaining);
-      if (target_is_terminal && error * motion_direction > 0.0)
+      // Begin braking before the normal drive allowance is exhausted. Once
+      // braking is selected below, the full position and delta-v reserves are
+      // available; this prevents an empty drive budget from becoming an
+      // infeasible acceleration intersection and a false joint fault.
+      room = std::min(room, normal_position_remaining);
+      if (error * motion_direction > 0.0)
         room = std::min(room, std::abs(error));
       const double stopping_distance = JerkLimitedStoppingDistance(
-          directed_velocity, directed_acceleration, max_acceleration, max_jerk);
+          directed_velocity, directed_acceleration, braking_acceleration,
+          max_jerk);
       const double stopping_delta_v =
           directed_velocity +
           std::max(0.0, directed_acceleration) *
-              (directed_acceleration + max_acceleration) / max_jerk;
-      if ((target_is_terminal && error * motion_direction <= 0.0) ||
-          stopping_distance + 4.0 * std::abs(previous_velocity) * dt +
-                  2.0 * std::abs(previous_acceleration) * dt * dt >=
-              std::max(0.0, room) ||
+              (directed_acceleration + braking_acceleration) / max_jerk;
+      if (error * motion_direction <= 0.0 ||
+          stopping_distance >= std::max(0.0, room) ||
+          normal_delta_v_remaining <= kTolerance ||
           stopping_delta_v >= full_delta_v_remaining) {
         velocity_goal = 0.0;
         target_stopping = true;
-        AddReason(output, joint, LimitReason::kTargetStopping);
+        AddReason(output, joint, LimitReason::kStoppingDistance);
       }
     }
 
-    // Also test the state that one normal tracking tick would create. Looking
-    // only at the current state can cross the viability boundary in that tick,
-    // especially during a target reversal while acceleration still points in
-    // the old direction.
-    if (!target_stopping) {
-      const double provisional_acceleration_goal = std::clamp(
-          (velocity_goal - previous_velocity) / dt, -max_acceleration,
-          max_acceleration);
-      const double provisional_acceleration = std::clamp(
-          provisional_acceleration_goal, previous_acceleration - max_jerk * dt,
-          previous_acceleration + max_jerk * dt);
-      const double provisional_velocity =
-          previous_velocity + provisional_acceleration * dt;
-      const double provisional_position =
-          previous_position + provisional_velocity * dt;
-      if (std::abs(provisional_velocity) > kTolerance) {
-        const double direction = std::copysign(1.0, provisional_velocity);
-        double next_room = direction > 0.0
-                               ? upper_safe_bound - provisional_position
-                               : provisional_position - lower_safe_bound;
-        next_room = std::min(
-            next_room,
-            std::max(0.0, full_position_remaining -
-                              std::abs(provisional_velocity) * dt));
-        const double next_error = target - provisional_position;
-        if (target_is_terminal && next_error * direction > 0.0)
-          next_room = std::min(next_room, std::abs(next_error));
-        const double next_stopping_distance = JerkLimitedStoppingDistance(
-            std::abs(provisional_velocity),
-            provisional_acceleration * direction, max_acceleration, max_jerk);
-        if ((target_is_terminal && next_error * direction <= 0.0) ||
-            next_stopping_distance +
-                    4.0 * std::abs(provisional_velocity) * dt +
-                    2.0 * std::abs(provisional_acceleration) * dt * dt >=
-                std::max(0.0, next_room)) {
-          velocity_goal = 0.0;
-          target_stopping = true;
-          AddReason(output, joint, LimitReason::kTargetStopping);
-        }
-      }
-    }
+    // stopping_room above already reserves one writer tick. Re-evaluating a
+    // second provisional tick here creates a finite dead band around the
+    // target (especially during termination), so the next real 500 Hz tick is
+    // the only look-ahead used by this causal governor.
+    output.permitted_velocity[joint] = velocity_goal;
 
-    double acceleration_goal =
-        (velocity_goal - previous_velocity) / dt;
+    double acceleration_goal = (velocity_goal - previous_velocity) / dt;
+    output.requested_acceleration[joint] = acceleration_goal;
+    const bool command_braking = target_stopping ||
+        (std::abs(previous_velocity) > kTolerance &&
+         previous_velocity * acceleration_goal < 0.0);
+    const double acceleration_limit =
+        command_braking ? braking_acceleration : drive_acceleration_limit;
     const double bounded_acceleration_goal =
-        std::clamp(acceleration_goal, -max_acceleration, max_acceleration);
+        std::clamp(acceleration_goal, -acceleration_limit, acceleration_limit);
     if (std::abs(bounded_acceleration_goal - acceleration_goal) > kTolerance) {
-      AddReason(output, joint, LimitReason::kInstantAcceleration);
+      if (command_braking) {
+        AddReason(output, joint, LimitReason::kBrakingAcceleration);
+      } else {
+        if (distance_factor * velocity_factor > kTolerance)
+          AddReason(output, joint, LimitReason::kPeakAcceleration);
+        if (distance_factor * velocity_factor < 1.0 - kTolerance)
+          AddReason(output, joint, LimitReason::kSustainedAcceleration);
+      }
       output.acceleration_limited[joint] = true;
     }
     acceleration_goal = bounded_acceleration_goal;
 
-    const bool command_braking = target_stopping ||
-        (previous_velocity * acceleration_goal < 0.0);
     const bool use_braking_reserve = faulted || !accept_desired ||
         measured_motion_braking || command_braking;
     const double position_remaining = use_braking_reserve
@@ -765,14 +935,61 @@ class PerJointMotionLimiter {
     Intersect((-max_velocity - previous_velocity) / dt,
               (max_velocity - previous_velocity) / dt,
               allowed_acceleration_lower, allowed_acceleration_upper);
+    if (acceleration_goal <
+            (-max_velocity - previous_velocity) / dt - kTolerance ||
+        acceleration_goal >
+            (max_velocity - previous_velocity) / dt + kTolerance) {
+      AddReason(output, joint, LimitReason::kCommandVelocity);
+      output.step_limited[joint] = true;
+    }
     const double delta_v_acceleration_cap = delta_v_remaining / dt;
     Intersect(-delta_v_acceleration_cap, delta_v_acceleration_cap,
               allowed_acceleration_lower, allowed_acceleration_upper);
+    if (std::abs(acceleration_goal) >
+        delta_v_acceleration_cap + kTolerance) {
+      AddReason(output, joint, LimitReason::kDeltaVWindow);
+      output.acceleration_window_limited[joint] = true;
+    }
 
     const double velocity_from_position_budget = position_remaining / dt;
     Intersect((-velocity_from_position_budget - previous_velocity) / dt,
               (velocity_from_position_budget - previous_velocity) / dt,
               allowed_acceleration_lower, allowed_acceleration_upper);
+    if (acceleration_goal <
+            (-velocity_from_position_budget - previous_velocity) / dt -
+                kTolerance ||
+        acceleration_goal >
+            (velocity_from_position_budget - previous_velocity) / dt +
+                kTolerance) {
+      AddReason(output, joint, LimitReason::kPositionWindow);
+      output.window_limited[joint] = true;
+    }
+
+    // When the reference is already travelling toward an unchanged target,
+    // land on it rather than stepping through it. If a fresh target moved
+    // behind an in-flight reference, stopping remains gradual and this bound
+    // is deliberately not applied.
+    if (error > kTolerance && previous_velocity >= -kTolerance) {
+      const double target_acceleration_upper =
+          (target - previous_position - previous_velocity * dt) / (dt * dt);
+      if (allowed_acceleration_lower <=
+          target_acceleration_upper + kConstraintTolerance) {
+        allowed_acceleration_upper =
+            std::min(allowed_acceleration_upper, target_acceleration_upper);
+        if (acceleration_goal > target_acceleration_upper + kTolerance)
+          AddReason(output, joint, LimitReason::kStoppingDistance);
+      }
+    } else if (error < -kTolerance && previous_velocity <= kTolerance) {
+      const double target_acceleration_lower =
+          (target - previous_position - previous_velocity * dt) / (dt * dt);
+      if (target_acceleration_lower <=
+          allowed_acceleration_upper + kConstraintTolerance) {
+        allowed_acceleration_lower =
+            std::max(allowed_acceleration_lower, target_acceleration_lower);
+        if (acceleration_goal < target_acceleration_lower - kTolerance)
+          AddReason(output, joint, LimitReason::kStoppingDistance);
+      }
+    }
 
     // Target updates may legitimately move behind a reference that is already
     // in flight. Treat the target as a stopping objective, not a hard position
@@ -787,15 +1004,38 @@ class PerJointMotionLimiter {
                previous_velocity * dt) /
                   (dt * dt),
               allowed_acceleration_lower, allowed_acceleration_upper);
+    if (acceleration_goal <
+            (next_lower_position - previous_position -
+             previous_velocity * dt) /
+                    (dt * dt) -
+                kTolerance ||
+        acceleration_goal >
+            (next_upper_position - previous_position -
+             previous_velocity * dt) /
+                    (dt * dt) +
+                kTolerance) {
+      AddReason(output, joint, LimitReason::kTrackingEnvelope);
+      output.tracking_limited[joint] = true;
+    }
 
-    if (allowed_acceleration_lower > allowed_acceleration_upper + kTolerance) {
+    if (allowed_acceleration_lower > allowed_acceleration_upper &&
+        allowed_acceleration_lower <=
+            allowed_acceleration_upper + kConstraintTolerance) {
+      const double numerical_boundary =
+          0.5 * (allowed_acceleration_lower + allowed_acceleration_upper);
+      allowed_acceleration_lower = numerical_boundary;
+      allowed_acceleration_upper = numerical_boundary;
+    }
+    if (allowed_acceleration_lower >
+        allowed_acceleration_upper + kConstraintTolerance) {
       // A moving measured-position envelope can become unreachable without a
       // command discontinuity. Preserve the last bounded reference and damp
       // only this joint instead of snapping the target or damping the body.
       LatchFault(joint, JointFaultReason::kEmergencyTrackingCorrection);
       ++stats.emergency_tracking_corrections;
       output.tracking_limited[joint] = true;
-      AddReason(output, joint, LimitReason::kTrackingDistance);
+      AddReason(output, joint, LimitReason::kTrackingEnvelope);
+      AddReason(output, joint, LimitReason::kJointFault);
       output.local_damping[joint] = true;
       ++stats.local_damping_ticks;
       ++stats.fault_ticks;
@@ -806,18 +1046,7 @@ class PerJointMotionLimiter {
     double next_acceleration = std::clamp(
         acceleration_goal, allowed_acceleration_lower,
         allowed_acceleration_upper);
-    if (std::abs(next_acceleration - acceleration_goal) > kTolerance) {
-      if (next_acceleration <= -delta_v_acceleration_cap + kTolerance ||
-          next_acceleration >= delta_v_acceleration_cap - kTolerance) {
-        AddReason(output, joint, LimitReason::kDeltaVWindow);
-        output.acceleration_window_limited[joint] = true;
-      }
-      if (std::abs(previous_velocity + next_acceleration * dt) >=
-          velocity_from_position_budget - kTolerance) {
-        AddReason(output, joint, LimitReason::kPositionWindow);
-        output.window_limited[joint] = true;
-      }
-    }
+    (void)velocity_from_position_budget;
 
     const double next_velocity =
         previous_velocity + next_acceleration * dt;
@@ -829,19 +1058,22 @@ class PerJointMotionLimiter {
     velocity_[joint] = next_velocity;
     acceleration_[joint] = next_acceleration;
     window_history_[joint][window_cursor_] = position_motion;
-    delta_v_window_history_[joint][window_cursor_] = delta_v;
+    delta_v_window_history_[joint][delta_v_window_cursor_] = delta_v;
     window_sum_[joint] += position_motion;
     delta_v_window_sum_[joint] += delta_v;
 
     const std::uint32_t command_reason_mask =
         ReasonBit(LimitReason::kMechanicalPosition) |
-        ReasonBit(LimitReason::kTrackingDistance) |
-        ReasonBit(LimitReason::kInstantVelocity) |
-        ReasonBit(LimitReason::kInstantAcceleration) |
-        ReasonBit(LimitReason::kInstantJerk) |
+        ReasonBit(LimitReason::kTargetOffset) |
+        ReasonBit(LimitReason::kTrackingEnvelope) |
+        ReasonBit(LimitReason::kCommandVelocity) |
+        ReasonBit(LimitReason::kPeakAcceleration) |
+        ReasonBit(LimitReason::kSustainedAcceleration) |
+        ReasonBit(LimitReason::kBrakingAcceleration) |
+        ReasonBit(LimitReason::kAccelerationSlew) |
         ReasonBit(LimitReason::kPositionWindow) |
         ReasonBit(LimitReason::kDeltaVWindow) |
-        ReasonBit(LimitReason::kTargetStopping);
+        ReasonBit(LimitReason::kStoppingDistance);
     const bool command_limited =
         (output.reasons[joint] & command_reason_mask) != 0;
     if (states_[joint] == JointState::kJointFault) {
@@ -887,11 +1119,12 @@ class PerJointMotionLimiter {
   bool seeded_ = false;
   std::size_t window_samples_ = 1;
   std::size_t window_cursor_ = 0;
+  std::size_t delta_v_window_samples_ = 1;
+  std::size_t delta_v_window_cursor_ = 0;
   std::size_t measured_velocity_samples_ = 2;
   std::size_t measured_velocity_cursor_ = 0;
   std::size_t measured_velocity_population_ = 0;
   double measured_velocity_regression_denominator_ = 0.0;
-  double tracking_time_ = 0.020;
   double target_interval_ = 0.020;
   double target_elapsed_ = 0.0;
   bool target_endpoint_reported_ = false;

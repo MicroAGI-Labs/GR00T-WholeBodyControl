@@ -3092,18 +3092,36 @@ class G1Deploy {
       double max_desired_error = 0.0;
       double max_tracking_error = 0.0;
       double max_window_fraction = 0.0;
+      std::size_t max_desired_error_joint = 0;
+      std::size_t max_tracking_error_joint = 0;
+      std::size_t max_window_fraction_joint = 0;
       bool faulted = false;
       for (std::size_t i = 0; i < G1_NUM_MOTOR; ++i) {
-        max_desired_error = std::max(
-            max_desired_error, std::abs(limited.position[i] - desired[i]));
-        max_tracking_error = std::max(
-            max_tracking_error, std::abs(measured[i] - limited.position[i]));
+        // Priming evaluates convergence to the measured-relative goal accepted
+        // by the 500 Hz governor, not to an uncapped raw SONIC sample. The raw
+        // target may intentionally remain outside the permitted command-energy
+        // envelope while q_out and the measured joint advance continuously.
+        const double desired_error =
+            std::abs(limited.position[i] - limited.target_position[i]);
+        if (desired_error > max_desired_error) {
+          max_desired_error = desired_error;
+          max_desired_error_joint = i;
+        }
+        const double tracking_error =
+            std::abs(measured[i] - limited.position[i]);
+        if (tracking_error > max_tracking_error) {
+          max_tracking_error = tracking_error;
+          max_tracking_error_joint = i;
+        }
         const double full_window_budget =
             limits.max_window_velocity[i] * limits.window_duration;
         if (full_window_budget > 0.0) {
-          max_window_fraction = std::max(
-              max_window_fraction,
-              limited.window_motion[i] / full_window_budget);
+          const double window_fraction =
+              limited.window_motion[i] / full_window_budget;
+          if (window_fraction > max_window_fraction) {
+            max_window_fraction = window_fraction;
+            max_window_fraction_joint = i;
+          }
         }
         faulted |= limited.state[i] ==
             sonic::safety::JointState::kJointFault;
@@ -3147,9 +3165,14 @@ class G1Deploy {
         std::cout << "[JOINT-LIMITER-PRIME] status tick=" << tick
                   << " alpha=" << joint_limiter_handover_alpha_
                   << " endpoint_desired_error_rad=" << endpoint_desired_error
+                  << " current_desired_error_joint="
+                  << max_desired_error_joint
                   << " endpoint_sample=" << limited.target_endpoint_sample
                   << " max_tracking_error_rad=" << max_tracking_error
+                  << " max_tracking_error_joint=" << max_tracking_error_joint
                   << " max_window_fraction=" << max_window_fraction
+                  << " max_window_fraction_joint="
+                  << max_window_fraction_joint
                   << " stable_ticks=" << joint_limiter_prime_stable_ticks_
                   << " faulted=" << faulted << std::endl;
       }
@@ -3517,6 +3540,9 @@ class G1Deploy {
                       static_cast<double>(stats.ticks) * limits.writer_dt;
                   const double window_budget =
                       limits.max_window_velocity[i] * limits.window_duration;
+                  const double delta_v_budget =
+                      limits.max_window_acceleration[i] *
+                      limits.delta_v_window_duration;
                   if (state != sonic::safety::JointState::kJointFault) {
                     if (!transition_log_allowed) {
                       joint_limiter_last_logged_state_[i] = state;
@@ -3545,15 +3571,17 @@ class G1Deploy {
                         << (limited.window_limited[i] ? 'W' : '-')
                         << (limited.acceleration_window_limited[i] ? 'D' : '-')
                         << (limited.tracking_limited[i] ? 'T' : '-')
+                        << ";reasons=" << limited.reasons[i]
                         << ";q=" << measured[i]
                         << ";raw=" << raw_desired[i]
                         << ";shaped=" << desired[i]
+                        << ";goal=" << limited.target_position[i]
                         << ";out=" << limited.position[i]
                         << ";dq=" << measured_velocity[i]
                         << ";dqout=" << limited.velocity[i]
                         << ";window=" << limited.window_motion[i]
                         << ";delta_v_window=" << limited.window_delta_v[i]
-                        << '/' << window_budget << ')';
+                        << '/' << delta_v_budget << ')';
                   } else {
                     std::cout << "[JOINT-LIMITER-EVENT] tick=" << stats.ticks
                             << " t_s=" << elapsed_s
@@ -3573,6 +3601,7 @@ class G1Deploy {
                             << limited.acceleration_window_limited[i]
                             << " tracking_limited=" << limited.tracking_limited[i]
                             << " actual_motion_braking=" << actual_motion_braking
+                            << " reasons=" << limited.reasons[i]
                             << " q_measured=" << measured[i]
                             << " q_des_raw=" << raw_desired[i]
                             << " q_des=" << desired[i]
@@ -3584,6 +3613,18 @@ class G1Deploy {
                             << limited.measured_acceleration[i]
                             << " window_motion=" << limited.window_motion[i]
                             << " window_delta_v=" << limited.window_delta_v[i]
+                            << " requested_velocity="
+                            << limited.requested_velocity[i]
+                            << " permitted_velocity="
+                            << limited.permitted_velocity[i]
+                            << " requested_acceleration="
+                            << limited.requested_acceleration[i]
+                            << " drive_acceleration_limit="
+                            << limited.drive_acceleration_limit[i]
+                            << " burst_distance_factor="
+                            << limited.burst_distance_factor[i]
+                            << " burst_velocity_factor="
+                            << limited.burst_velocity_factor[i]
                             << " instant_velocity_cap="
                             << limits.max_instant_velocity[i]
                             << " acceleration_cap=" << limits.max_acceleration[i]
@@ -3671,7 +3712,7 @@ class G1Deploy {
       std::cout << "[JOINT-LIMITER-SUMMARY] {\"enabled\":"
                 << (joint_limiter_enabled_ ? "true" : "false")
                 << ",\"schema_version\":2"
-                << ",\"algorithm\":\"continuous-qva-jerk-window-v1\""
+                << ",\"algorithm\":\"causal-burst-reference-governor-v3\""
                 << ",\"profile\":\"" << joint_limiter_profile_ << "\""
                 << ",\"limiting_level\":" << joint_limiter_level_
                 << ",\"limiting_level_min\":" << joint_limiter_level_min_
@@ -3772,12 +3813,24 @@ class G1Deploy {
                 [](const auto& s) { return s.emergency_tracking_corrections; });
       print_u64("mechanical_limit_ticks",
                 [](const auto& s) { return s.mechanical_limit_ticks; });
+      print_u64("target_offset_ticks",
+                [](const auto& s) { return s.target_offset_ticks; });
       print_u64("tracking_limit_ticks",
                 [](const auto& s) { return s.tracking_limit_ticks; });
       print_u64("velocity_limit_ticks",
                 [](const auto& s) { return s.velocity_limit_ticks; });
       print_u64("acceleration_limit_ticks",
                 [](const auto& s) { return s.acceleration_limit_ticks; });
+      print_u64("peak_acceleration_limit_ticks",
+                [](const auto& s) { return s.peak_acceleration_limit_ticks; });
+      print_u64("sustained_acceleration_limit_ticks",
+                [](const auto& s) {
+                  return s.sustained_acceleration_limit_ticks;
+                });
+      print_u64("braking_acceleration_limit_ticks",
+                [](const auto& s) {
+                  return s.braking_acceleration_limit_ticks;
+                });
       print_u64("jerk_limit_ticks",
                 [](const auto& s) { return s.jerk_limit_ticks; });
       print_u64("position_window_limit_ticks",
@@ -3820,6 +3873,13 @@ class G1Deploy {
       };
       const auto& limits = joint_limiter_.limits();
       print_limit("instant_velocity_caps_rad_s", limits.max_instant_velocity);
+      print_limit("peak_acceleration_caps_rad_s2", limits.peak_acceleration);
+      print_limit("sustained_acceleration_caps_rad_s2",
+                  limits.sustained_acceleration);
+      print_limit("braking_acceleration_caps_rad_s2",
+                  limits.braking_acceleration);
+      print_limit("burst_distance_rad", limits.burst_distance);
+      print_limit("burst_velocity_rad_s", limits.burst_velocity);
       print_limit("acceleration_caps_rad_s2", limits.max_acceleration);
       print_limit("jerk_caps_rad_s3", limits.max_jerk);
       print_limit("window_velocity_caps_rad_s", limits.max_window_velocity);

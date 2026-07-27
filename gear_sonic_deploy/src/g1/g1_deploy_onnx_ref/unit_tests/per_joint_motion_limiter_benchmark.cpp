@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
   const auto maximum = durations.back();
   std::string json =
       "{\n"
-      "  \"algorithm\": \"continuous-qva-jerk-window-v1\",\n"
+      "  \"algorithm\": \"causal-burst-reference-governor-v3\",\n"
       "  \"iterations\": " + std::to_string(iterations) + ",\n" +
       "  \"command_updates\": " + std::to_string(command_updates) + ",\n" +
       "  \"p50_ns\": " + std::to_string(p50) + ",\n" +
