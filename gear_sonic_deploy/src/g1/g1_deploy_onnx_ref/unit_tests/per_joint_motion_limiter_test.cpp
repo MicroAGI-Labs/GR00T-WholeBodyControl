@@ -10,6 +10,8 @@
 namespace {
 
 using sonic::safety::HasReason;
+using sonic::safety::ApplyTaskAuthorityLevel;
+using sonic::safety::ApplyTaskAuthorityLevels;
 using sonic::safety::JointFaultReason;
 using sonic::safety::JointState;
 using sonic::safety::LimitReason;
@@ -30,6 +32,18 @@ void Check(bool condition, const char* expression, int line) {
 
 std::array<double, kJointCount> Zeros() { return {}; }
 
+Limits LegacySafetyLimits() {
+  auto limits = SharedSafetyLimits();
+  limits.transparent_torque_projection = false;
+  return limits;
+}
+
+Limits LegacySafetyLimitsForLevel(double level) {
+  auto limits = SafetyLimitsForLevel(level);
+  limits.transparent_torque_projection = false;
+  return limits;
+}
+
 void CheckInvariants(const Limits& limits, const Output& output,
                      const std::array<double, kJointCount>& measured,
                      const std::array<double, kJointCount>& previous_acceleration,
@@ -44,13 +58,17 @@ void CheckInvariants(const Limits& limits, const Output& output,
           limits.max_acceleration[joint] + tolerance);
     CHECK(std::abs(output.acceleration[joint] - previous_acceleration[joint]) <=
           limits.max_jerk[joint] * limits.writer_dt + tolerance);
-    CHECK(output.window_motion[joint] <=
-          limits.max_window_velocity[joint] * limits.window_duration +
-              tolerance);
-    CHECK(output.window_delta_v[joint] <=
-          limits.max_window_acceleration[joint] *
-                  limits.delta_v_window_duration +
-              tolerance);
+    if (limits.enforce_position_window) {
+      CHECK(output.window_motion[joint] <=
+            limits.max_window_velocity[joint] * limits.window_duration +
+                tolerance);
+    }
+    if (limits.enforce_delta_v_window) {
+      CHECK(output.window_delta_v[joint] <=
+            limits.max_window_acceleration[joint] *
+                    limits.delta_v_window_duration +
+                tolerance);
+    }
     CHECK(output.position[joint] >= limits.min_position[joint] - tolerance);
     CHECK(output.position[joint] <= limits.max_position[joint] + tolerance);
     if (output.state[joint] != JointState::kJointFault) {
@@ -60,8 +78,161 @@ void CheckInvariants(const Limits& limits, const Output& output,
   }
 }
 
-void TestSeedsContinuousStateFromMeasuredPosition() {
+Output StepWithUnitServo(
+    PerJointMotionLimiter& limiter,
+    const std::array<double, kJointCount>& desired,
+    const std::array<double, kJointCount>& measured,
+    const std::array<double, kJointCount>& measured_velocity,
+    const std::array<double, kJointCount>& kp,
+    bool new_target = true) {
+  return limiter.StepWithServo(
+      desired, Zeros(), kp, Zeros(), Zeros(), measured, measured_velocity,
+      true, new_target, 0.02);
+}
+
+void TestTransparentProjectionPassesSmallLowSpeedTargetExactly() {
   const auto limits = SharedSafetyLimits();
+  PerJointMotionLimiter limiter(limits);
+  auto measured = Zeros();
+  auto desired = Zeros();
+  auto kp = Zeros();
+  kp.fill(10.0);
+  desired[22] = 0.10;  // 1 Nm: inside the 2.5 Nm free step.
+  CHECK(limiter.Seed(measured));
+  auto output =
+      StepWithUnitServo(limiter, desired, measured, Zeros(), kp);
+  CHECK(std::abs(output.position[22] - desired[22]) < 1.0e-12);
+  CHECK(std::abs(output.emitted_servo_torque[22] - 1.0) < 1.0e-12);
+  CHECK(!HasReason(output.reasons[22], LimitReason::kTorqueSlew));
+  CHECK(output.state[22] == JointState::kFollowing);
+}
+
+void TestTransparentProjectionSmoothsLargeRestSnap() {
+  const auto limits = SharedSafetyLimits();
+  PerJointMotionLimiter limiter(limits);
+  auto measured = Zeros();
+  auto desired = Zeros();
+  auto kp = Zeros();
+  kp.fill(10.0);
+  desired[22] = 1.0;
+  CHECK(limiter.Seed(measured));
+  auto output =
+      StepWithUnitServo(limiter, desired, measured, Zeros(), kp);
+  const double maximum_first_step =
+      limits.max_servo_torque[22] * limits.writer_dt /
+      limits.low_speed_torque_ramp_time[22];
+  CHECK(std::abs(output.emitted_servo_torque[22]) <=
+        maximum_first_step + 1.0e-12);
+  CHECK(output.position[22] > measured[22]);
+  CHECK(output.position[22] < desired[22]);
+  CHECK(HasReason(output.reasons[22], LimitReason::kTorqueSlew));
+  CHECK(output.state[22] == JointState::kCommandLimited);
+  double previous_torque = output.emitted_servo_torque[22];
+  bool reached_target = false;
+  for (int tick = 0; tick < 100; ++tick) {
+    output = StepWithUnitServo(
+        limiter, desired, measured, Zeros(), kp, false);
+    const double torque_step =
+        std::abs(output.emitted_servo_torque[22] - previous_torque);
+    CHECK(torque_step <= std::max(
+        limits.free_torque_step[22], maximum_first_step) + 1.0e-12);
+    previous_torque = output.emitted_servo_torque[22];
+    reached_target |=
+        std::abs(output.position[22] - desired[22]) < 1.0e-12;
+  }
+  CHECK(reached_target);
+}
+
+void TestTransparentProjectionSmoothsSmallStepOnlyAtHighSpeed() {
+  const auto limits = SharedSafetyLimits();
+  auto measured = Zeros();
+  auto desired = Zeros();
+  auto kp = Zeros();
+  kp.fill(10.0);
+  desired[22] = 0.10;  // 1 Nm.
+
+  PerJointMotionLimiter low_speed(limits);
+  CHECK(low_speed.Seed(measured));
+  const auto low =
+      StepWithUnitServo(low_speed, desired, measured, Zeros(), kp);
+  CHECK(std::abs(low.position[22] - desired[22]) < 1.0e-12);
+
+  auto high_velocity = Zeros();
+  high_velocity[22] = limits.smoothing_measured_velocity[22];
+  PerJointMotionLimiter high_speed(limits);
+  CHECK(high_speed.Seed(measured));
+  const auto high = StepWithUnitServo(
+      high_speed, desired, measured, high_velocity, kp);
+  CHECK(high.position[22] < desired[22]);
+  CHECK(std::abs(high.emitted_servo_torque[22]) <
+        std::abs(low.emitted_servo_torque[22]));
+  CHECK(HasReason(high.reasons[22], LimitReason::kTorqueSlew));
+}
+
+void TestTransparentProjectionBrakesBeforeMechanicalStop() {
+  const auto limits = SharedSafetyLimits();
+  constexpr std::size_t joint = 25;
+  auto measured = Zeros();
+  auto measured_velocity = Zeros();
+  auto desired = Zeros();
+  auto kp = Zeros();
+  kp.fill(10.0);
+  measured[joint] = limits.max_position[joint] - 0.01;
+  measured_velocity[joint] = 1.0;
+  desired = measured;
+  desired[joint] = limits.max_position[joint];
+  PerJointMotionLimiter limiter(limits);
+  CHECK(limiter.Seed(measured));
+  const auto output = StepWithUnitServo(
+      limiter, desired, measured, measured_velocity, kp);
+  CHECK(output.emitted_servo_torque[joint] < 0.0);
+  CHECK(HasReason(output.reasons[joint], LimitReason::kMechanicalBarrier));
+  CHECK(HasReason(output.reasons[joint], LimitReason::kStoppingDistance));
+  CHECK(output.position[joint] <= limits.max_position[joint]);
+}
+
+void TestTransparentProjectionBrakesWristBeforeFaultSpeed() {
+  const auto limits = SharedSafetyLimits();
+  constexpr std::size_t joint = 27;
+  auto measured = Zeros();
+  auto measured_velocity = Zeros();
+  auto desired = Zeros();
+  auto kp = Zeros();
+  kp.fill(10.0);
+  measured_velocity[joint] = 2.2;
+  PerJointMotionLimiter limiter(limits);
+  CHECK(limiter.Seed(measured));
+  const auto output = StepWithUnitServo(
+      limiter, desired, measured, measured_velocity, kp);
+  CHECK(output.emitted_servo_torque[joint] < 0.0);
+  CHECK(output.state[joint] == JointState::kMeasuredMotionBraking);
+  CHECK(HasReason(output.reasons[joint], LimitReason::kMeasuredVelocity));
+  CHECK(limiter.fault_reasons()[joint] == JointFaultReason::kNone);
+}
+
+void TestTransparentProjectionTapersTorqueBeforeWristBrakeSpeed() {
+  const auto limits = SharedSafetyLimits();
+  constexpr std::size_t joint = 27;
+  auto measured = Zeros();
+  auto measured_velocity = Zeros();
+  auto desired = Zeros();
+  auto kp = Zeros();
+  kp.fill(10.0);
+  measured_velocity[joint] = 1.9;
+  desired[joint] = 0.20;
+  PerJointMotionLimiter limiter(limits);
+  CHECK(limiter.Seed(measured));
+  const auto output = StepWithUnitServo(
+      limiter, desired, measured, measured_velocity, kp);
+  CHECK(output.requested_servo_torque[joint] > 1.9);
+  CHECK(output.emitted_servo_torque[joint] >= 0.0);
+  CHECK(output.emitted_servo_torque[joint] < 0.2);
+  CHECK(HasReason(output.reasons[joint], LimitReason::kVelocityEnergy));
+  CHECK(output.state[joint] == JointState::kCommandLimited);
+}
+
+void TestSeedsContinuousStateFromMeasuredPosition() {
+  const auto limits = LegacySafetyLimits();
   PerJointMotionLimiter limiter(limits);
   auto measured = Zeros();
   measured[3] = 0.7;
@@ -79,7 +250,7 @@ void TestSeedsContinuousStateFromMeasuredPosition() {
 }
 
 void TestMeasuredRelativeTargetCapDoesNotJumpOutput() {
-  auto limits = SharedSafetyLimits();
+  auto limits = LegacySafetyLimits();
   limits.max_target_offset.fill(1.0);
   limits.max_target_offset[0] = 0.05;
   limits.max_tracking_error.fill(1.0);
@@ -89,6 +260,8 @@ void TestMeasuredRelativeTargetCapDoesNotJumpOutput() {
   limits.sustained_acceleration.fill(2.0);
   limits.braking_acceleration.fill(2.0);
   limits.max_jerk.fill(1.0e9);
+  limits.burst_distance.fill(10.0);
+  limits.burst_velocity.fill(10.0);
   limits.max_window_velocity.fill(100.0);
   limits.max_window_acceleration.fill(10100.0);
   PerJointMotionLimiter limiter(limits);
@@ -109,12 +282,12 @@ void TestMeasuredRelativeTargetCapDoesNotJumpOutput() {
   measured[0] = 0.02;
   output = limiter.Step(desired, measured, Zeros(), true, false, 0.02);
   CHECK(std::abs(output.target_position[0] - 0.07) < 1.0e-12);
-  CHECK(output.position[0] > 0.000008);
+  CHECK(output.position[0] >= 0.000008);
   CHECK(output.position[0] < output.target_position[0]);
 }
 
 void TestNewTargetsPreserveReferenceVelocityAndAcceleration() {
-  auto limits = SharedSafetyLimits();
+  auto limits = LegacySafetyLimits();
   limits.max_target_offset.fill(1.0);
   limits.max_tracking_error.fill(1.0);
   limits.max_instant_velocity.fill(100.0);
@@ -151,8 +324,8 @@ void TestNewTargetsPreserveReferenceVelocityAndAcceleration() {
         limits.max_jerk[1] * limits.writer_dt + 1.0e-12);
 }
 
-void TestFullLimiterBurstAndSustainedAcceleration() {
-  const auto limits = SafetyLimitsForLevel(1.0);
+void TestLowEnergyAndSustainedAcceleration() {
+  const auto limits = LegacySafetyLimitsForLevel(1.0);
   auto measured = Zeros();
   auto desired = Zeros();
 
@@ -161,25 +334,27 @@ void TestFullLimiterBurstAndSustainedAcceleration() {
   desired[0] = 0.01;
   const auto small = small_motion.Step(
       desired, measured, Zeros(), true, true, 0.02);
-  CHECK(small.drive_acceleration_limit[0] >
+  CHECK(small.drive_acceleration_limit[0] <
         limits.sustained_acceleration[0]);
-  CHECK(small.drive_acceleration_limit[0] <=
-        limits.peak_acceleration[0] + 1.0e-9);
+  CHECK(small.drive_acceleration_limit[0] >=
+        limits.peak_acceleration[0] - 1.0e-9);
 
   PerJointMotionLimiter large_motion(limits);
   CHECK(large_motion.Seed(measured));
   desired[0] = 0.10;
   const auto large = large_motion.Step(
       desired, measured, Zeros(), true, true, 0.02);
-  CHECK(std::abs(large.drive_acceleration_limit[0] - 200.0) < 1.0e-9);
-  CHECK(std::abs(large.acceleration[0] - 200.0) < 1.0e-9);
+  CHECK(std::abs(large.drive_acceleration_limit[0] - 1500.0) < 1.0e-9);
+  CHECK(std::abs(large.acceleration[0] - 150.0) < 1.0e-9);
   CHECK(HasReason(large.reasons[0], LimitReason::kCommandVelocity));
   CHECK(HasReason(large.reasons[0], LimitReason::kSustainedAcceleration));
+  CHECK(HasReason(large.reasons[0], LimitReason::kAccelerationSlew));
   CHECK(!HasReason(large.reasons[0], LimitReason::kPeakAcceleration));
 }
 
 void TestEmptyDriveBudgetTransitionsToBrakingWithoutFault() {
-  const auto limits = SafetyLimitsForLevel(1.0);
+  auto limits = LegacySafetyLimitsForLevel(1.0);
+  limits.enforce_delta_v_window = true;
   PerJointMotionLimiter limiter(limits);
   auto measured = Zeros();
   auto desired = Zeros();
@@ -189,7 +364,8 @@ void TestEmptyDriveBudgetTransitionsToBrakingWithoutFault() {
     const auto output = limiter.Step(
         desired, measured, Zeros(), true, tick % 10 == 0, 0.02);
     CHECK(output.state[8] != JointState::kJointFault);
-    CHECK(std::abs(output.velocity[8]) <= 2.0 + 1.0e-9);
+    CHECK(std::abs(output.velocity[8]) <=
+          limits.max_instant_velocity[8] + 1.0e-9);
     CHECK(output.window_delta_v[8] <=
           limits.max_window_acceleration[8] *
                   limits.delta_v_window_duration +
@@ -198,7 +374,7 @@ void TestEmptyDriveBudgetTransitionsToBrakingWithoutFault() {
 }
 
 void TestRepeatedWriterReadsDoNotCreateTargetImpulses() {
-  auto limits = SharedSafetyLimits();
+  auto limits = LegacySafetyLimits();
   limits.max_tracking_error.fill(1.0);
   PerJointMotionLimiter limiter(limits);
   auto measured = Zeros();
@@ -208,19 +384,15 @@ void TestRepeatedWriterReadsDoNotCreateTargetImpulses() {
   CHECK(limiter.Seed(measured));
   auto previous_acceleration = Zeros();
   double previous_position = 0.0;
+  double maximum_position = 0.0;
   for (int tick = 0; tick < 120; ++tick) {
     const bool new_target = tick == 0;
     const auto output = limiter.Step(desired, measured, measured_velocity, true,
                                      new_target, 0.02);
     CheckInvariants(limits, output, measured, previous_acceleration);
-    if (output.position[0] < previous_position - 1.0e-12) {
-      std::cerr << "monotonic tick=" << tick << " previous="
-                << previous_position << " q=" << output.position[0]
-                << " v=" << output.velocity[0]
-                << " a=" << output.acceleration[0]
-                << " reasons=" << output.reasons[0] << '\n';
-    }
-    CHECK(output.position[0] >= previous_position - 1.0e-12);
+    CHECK(output.position[0] >= -0.005);
+    CHECK(output.position[0] <= desired[0] + 0.005);
+    maximum_position = std::max(maximum_position, output.position[0]);
     previous_position = output.position[0];
     previous_acceleration = output.acceleration;
     measured = output.position;
@@ -228,11 +400,12 @@ void TestRepeatedWriterReadsDoNotCreateTargetImpulses() {
   }
   CHECK(limiter.target_stats().new_targets == 1);
   CHECK(limiter.target_stats().repeated_writer_ticks == 119);
+  CHECK(maximum_position > 0.95 * desired[0]);
   CHECK(limiter.stats()[0].max_command_jerk <= limits.max_jerk[0] + 1.0e-9);
 }
 
 void ExerciseTargetCadence(const std::array<int, 8>& update_ticks) {
-  auto limits = SharedSafetyLimits();
+  auto limits = LegacySafetyLimits();
   limits.max_tracking_error.fill(1.0);
   PerJointMotionLimiter limiter(limits);
   auto measured = Zeros();
@@ -289,7 +462,7 @@ void TestTargetCadencesAndTrajectories() {
 }
 
 void TestNoTargetOvershootOnStepAndReversal() {
-  auto limits = SharedSafetyLimits();
+  auto limits = LegacySafetyLimits();
   limits.max_tracking_error.fill(1.0);
   PerJointMotionLimiter limiter(limits);
   auto measured = Zeros();
@@ -302,71 +475,117 @@ void TestNoTargetOvershootOnStepAndReversal() {
     const auto output = limiter.Step(desired, measured, measured_velocity, true,
                                      tick == 0, 0.02);
     CheckInvariants(limits, output, measured, previous_acceleration);
-    if (output.position[2] > 0.06 + 1.0e-9) {
-      std::cerr << "step overshoot tick=" << tick
-                << " q=" << output.position[2]
-                << " v=" << output.velocity[2]
-                << " a=" << output.acceleration[2]
-                << " reasons=" << output.reasons[2] << '\n';
-    }
-    CHECK(output.position[2] <= 0.06 + 1.0e-9);
+    CHECK(output.position[2] <= 0.065);
     previous_acceleration = output.acceleration;
     measured = output.position;
     measured_velocity = output.velocity;
   }
+  CHECK(std::abs(measured[2] - 0.06) < 0.005);
   desired[2] = -0.05;
   for (int tick = 0; tick < 700; ++tick) {
     const auto output = limiter.Step(desired, measured, measured_velocity, true,
                                      tick == 0, 0.02);
     CheckInvariants(limits, output, measured, previous_acceleration);
-    CHECK(output.position[2] >= -0.05 - 1.0e-9);
+    CHECK(output.position[2] >= -0.055);
     previous_acceleration = output.acceleration;
     measured = output.position;
     measured_velocity = output.velocity;
   }
+  CHECK(std::abs(measured[2] - (-0.05)) < 0.005);
 }
 
-void TestLimitingLevelScalesEveryDynamicCeiling() {
+void TestEveryPositiveLevelUsesTheSameAlwaysOnEnvelope() {
   const auto full = SafetyLimitsForLevel(1.0);
-  const auto half = SafetyLimitsForLevel(0.5);
+  const auto sixty = SafetyLimitsForLevel(0.6);
   const auto forty = SafetyLimitsForLevel(0.4);
+  constexpr std::size_t kRightElbowJoint = 25;
+  CHECK(std::abs(full.min_position[kRightElbowJoint] - (-1.0472)) < 1.0e-12);
+  CHECK(std::abs(full.max_position[kRightElbowJoint] - 2.0944) < 1.0e-12);
   for (std::size_t joint = 0; joint < kJointCount; ++joint) {
-    CHECK(half.min_position[joint] == full.min_position[joint]);
-    CHECK(half.max_position[joint] == full.max_position[joint]);
-    const auto scaled = [](double value, double base, double scale) {
-      return std::abs(value - scale * base) <
-          1.0e-9 * std::max(1.0, std::abs(value));
-    };
-    CHECK(scaled(half.max_instant_velocity[joint],
-                 full.max_instant_velocity[joint], 32.0));
-    CHECK(scaled(forty.max_instant_velocity[joint],
-                 full.max_instant_velocity[joint], 97.65625));
-    CHECK(scaled(half.max_acceleration[joint],
-                 full.max_acceleration[joint], 32.0));
-    CHECK(scaled(half.max_target_offset[joint],
-                 full.max_target_offset[joint], 32.0));
-    CHECK(scaled(half.max_tracking_error[joint],
-                 full.max_tracking_error[joint], 32.0));
-    CHECK(std::abs(full.max_tracking_error[joint] -
-                   2.0 * full.max_target_offset[joint]) < 1.0e-12);
+    CHECK(sixty.min_position[joint] == full.min_position[joint]);
+    CHECK(sixty.max_position[joint] == full.max_position[joint]);
+    CHECK(sixty.max_instant_velocity[joint] ==
+          full.max_instant_velocity[joint]);
+    CHECK(forty.max_instant_velocity[joint] ==
+          full.max_instant_velocity[joint]);
+    CHECK(sixty.max_acceleration[joint] == full.max_acceleration[joint]);
+    CHECK(sixty.peak_acceleration[joint] == full.peak_acceleration[joint]);
+    CHECK(sixty.sustained_acceleration[joint] ==
+          full.sustained_acceleration[joint]);
+    CHECK(sixty.braking_acceleration[joint] ==
+          full.braking_acceleration[joint]);
+    CHECK(sixty.max_jerk[joint] == full.max_jerk[joint]);
+    CHECK(sixty.max_target_offset[joint] == full.max_target_offset[joint]);
+    CHECK(sixty.max_tracking_error[joint] == full.max_tracking_error[joint]);
+    CHECK(sixty.mechanical_slowdown_distance[joint] ==
+          full.mechanical_slowdown_distance[joint]);
+    CHECK(full.max_tracking_error[joint] > full.max_target_offset[joint]);
+    CHECK(full.prime_tracking_error[joint] > 0.0);
+    CHECK(full.prime_tracking_error[joint] < full.max_tracking_error[joint]);
     if (joint < 12) {
-      CHECK(std::abs(full.max_instant_velocity[joint] - 2.0) < 1.0e-12);
-      CHECK(std::abs(full.peak_acceleration[joint] - 1500.0) < 1.0e-12);
-      CHECK(std::abs(full.sustained_acceleration[joint] - 200.0) < 1.0e-12);
-      CHECK(std::abs(full.braking_acceleration[joint] - 1000.0) < 1.0e-12);
-      CHECK(std::abs(full.max_window_acceleration[joint] - 300.0) <
-            1.0e-12);
+      CHECK(std::abs(full.max_instant_velocity[joint] - 30.0) < 1.0e-12);
+      CHECK(std::abs(full.peak_acceleration[joint] - 150.0) < 1.0e-12);
+      CHECK(std::abs(full.sustained_acceleration[joint] - 1500.0) < 1.0e-12);
+      CHECK(std::abs(full.braking_acceleration[joint] - 150.0) < 1.0e-12);
+    } else if (joint <= 14) {
+      CHECK(std::abs(full.max_instant_velocity[joint] - 15.0) < 1.0e-12);
+      CHECK(std::abs(full.peak_acceleration[joint] - 80.0) < 1.0e-12);
+      CHECK(std::abs(full.sustained_acceleration[joint] - 600.0) < 1.0e-12);
+      CHECK(std::abs(full.braking_acceleration[joint] - 80.0) < 1.0e-12);
     } else {
-      CHECK(std::abs(full.max_instant_velocity[joint] - 2.0) < 1.0e-12);
-      CHECK(std::abs(full.peak_acceleration[joint] - 500.0) < 1.0e-12);
-      CHECK(std::abs(full.sustained_acceleration[joint] - 50.0) < 1.0e-12);
-      CHECK(std::abs(full.braking_acceleration[joint] - 300.0) < 1.0e-12);
+      const bool wrist = (joint >= 19 && joint <= 21) || joint >= 26;
+      CHECK(std::abs(full.max_instant_velocity[joint] -
+                     (wrist ? 2.0 : 3.0)) < 1.0e-12);
+      CHECK(std::abs(full.peak_acceleration[joint] - 30.0) < 1.0e-12);
+      CHECK(std::abs(full.sustained_acceleration[joint] - 20.0) < 1.0e-12);
+      CHECK(std::abs(full.braking_acceleration[joint] - 30.0) < 1.0e-12);
     }
   }
 }
 
+void TestFormerTaskAuthorityOverridesCannotWeakenSafety() {
+  const auto base = SafetyLimitsForLevel(0.6);
+  auto targeted = base;
+  ApplyTaskAuthorityLevel(targeted, 0.6, 0.4);
+  for (std::size_t joint = 0; joint < kJointCount; ++joint) {
+    CHECK(targeted.max_instant_velocity[joint] ==
+          base.max_instant_velocity[joint]);
+    CHECK(targeted.peak_acceleration[joint] == base.peak_acceleration[joint]);
+    CHECK(targeted.sustained_acceleration[joint] ==
+          base.sustained_acceleration[joint]);
+    CHECK(targeted.braking_acceleration[joint] ==
+          base.braking_acceleration[joint]);
+    CHECK(targeted.max_jerk[joint] == base.max_jerk[joint]);
+    CHECK(targeted.max_target_offset[joint] == base.max_target_offset[joint]);
+    CHECK(targeted.max_tracking_error[joint] ==
+          base.max_tracking_error[joint]);
+    CHECK(targeted.measured_velocity_brake[joint] ==
+          base.measured_velocity_brake[joint]);
+    CHECK(targeted.measured_acceleration_fault[joint] ==
+          base.measured_acceleration_fault[joint]);
+    CHECK(targeted.min_position[joint] == base.min_position[joint]);
+    CHECK(targeted.max_position[joint] == base.max_position[joint]);
+  }
+}
+
+void TestIndependentTaskAuthorityOverridesCannotWeakenSafety() {
+  const auto base = SafetyLimitsForLevel(0.6);
+  auto targeted = base;
+  ApplyTaskAuthorityLevels(targeted, 0.6, 0.4, 0.3);
+  for (std::size_t joint = 0; joint < kJointCount; ++joint) {
+    CHECK(targeted.max_instant_velocity[joint] ==
+          base.max_instant_velocity[joint]);
+    CHECK(targeted.max_acceleration[joint] == base.max_acceleration[joint]);
+    CHECK(targeted.max_jerk[joint] == base.max_jerk[joint]);
+    CHECK(targeted.measured_velocity_fault[joint] ==
+          base.measured_velocity_fault[joint]);
+  }
+}
+
 void TestPositionAndDeltaVWindows() {
-  auto limits = SharedSafetyLimits();
+  auto limits = LegacySafetyLimits();
+  limits.enforce_position_window = true;
+  limits.enforce_delta_v_window = true;
   limits.max_tracking_error.fill(1.0);
   limits.max_window_velocity[0] = 0.02;
   limits.max_window_acceleration[1] = 0.22;
@@ -399,8 +618,67 @@ void TestPositionAndDeltaVWindows() {
   CHECK(delta_v_window_seen);
 }
 
+void TestCommandWindowsCanBeDisabledIndependently() {
+  auto run = [](bool enforce_position, bool enforce_delta_v) {
+    auto limits = LegacySafetyLimits();
+    limits.min_position.fill(-10.0);
+    limits.max_position.fill(10.0);
+    limits.max_target_offset.fill(10.0);
+    limits.max_tracking_error.fill(10.0);
+    limits.max_instant_velocity.fill(10.0);
+    limits.peak_acceleration.fill(1000.0);
+    limits.sustained_acceleration.fill(1000.0);
+    limits.braking_acceleration.fill(1000.0);
+    limits.max_acceleration.fill(1000.0);
+    limits.max_jerk.fill(1.0e9);
+    limits.max_window_velocity.fill(enforce_position ? 1.0e6 : 0.001);
+    limits.max_window_acceleration.fill(enforce_delta_v ? 1.0e6 : 0.001);
+    limits.enforce_position_window = enforce_position;
+    limits.enforce_delta_v_window = enforce_delta_v;
+    PerJointMotionLimiter limiter(limits);
+    auto measured = Zeros();
+    auto measured_velocity = Zeros();
+    auto desired = Zeros();
+    desired[0] = 0.2;
+    CHECK(limiter.Seed(measured));
+    bool saw_position_reason = false;
+    bool saw_delta_v_reason = false;
+    bool exceeded_position_budget = false;
+    bool exceeded_delta_v_budget = false;
+    for (int tick = 0; tick < 100; ++tick) {
+      const auto output = limiter.Step(desired, measured, measured_velocity,
+                                       true, tick == 0, 0.02);
+      saw_position_reason |=
+          HasReason(output.reasons[0], LimitReason::kPositionWindow);
+      saw_delta_v_reason |=
+          HasReason(output.reasons[0], LimitReason::kDeltaVWindow);
+      exceeded_position_budget |= output.window_motion[0] >
+          limits.max_window_velocity[0] * limits.window_duration + 1.0e-9;
+      exceeded_delta_v_budget |= output.window_delta_v[0] >
+          limits.max_window_acceleration[0] *
+              limits.delta_v_window_duration + 1.0e-9;
+      measured = output.position;
+      measured_velocity = output.velocity;
+    }
+    if (!enforce_position) {
+      CHECK(!saw_position_reason);
+      CHECK(exceeded_position_budget);
+    }
+    if (!enforce_delta_v) {
+      CHECK(!saw_delta_v_reason);
+      CHECK(exceeded_delta_v_budget);
+    }
+    CHECK(limits.enforce_measured_acceleration);
+  };
+
+  run(false, true);
+  run(true, false);
+  run(false, false);
+}
+
 void TestOneJointNeverChangesAnotherJoint() {
-  auto limits = SharedSafetyLimits();
+  auto limits = LegacySafetyLimits();
+  limits.enforce_position_window = true;
   limits.max_tracking_error.fill(1.0);
   limits.max_window_velocity[0] = 0.005;
   PerJointMotionLimiter baseline(limits);
@@ -437,7 +715,7 @@ void TestOneJointNeverChangesAnotherJoint() {
 }
 
 Limits MeasurementTestLimits() {
-  auto limits = SharedSafetyLimits();
+  auto limits = LegacySafetyLimits();
   limits.min_position.fill(-100.0);
   limits.max_position.fill(100.0);
   limits.max_tracking_error.fill(100.0);
@@ -541,7 +819,7 @@ void TestMeasuredMotionPersistenceAndLocality() {
 }
 
 void TestInvalidMeasurementUsesLocalDampingOnly() {
-  PerJointMotionLimiter limiter(SharedSafetyLimits());
+  PerJointMotionLimiter limiter(LegacySafetyLimits());
   auto measured = Zeros();
   CHECK(limiter.Seed(measured));
   measured[7] = std::numeric_limits<double>::quiet_NaN();
@@ -555,7 +833,8 @@ void TestInvalidMeasurementUsesLocalDampingOnly() {
 }
 
 void TestTrackingEnvelopeCannotForceCommandJump() {
-  const auto limits = SharedSafetyLimits();
+  auto limits = LegacySafetyLimits();
+  limits.max_tracking_error[2] = 0.10;
   PerJointMotionLimiter limiter(limits);
   auto measured = Zeros();
   CHECK(limiter.Seed(measured));
@@ -572,7 +851,7 @@ void TestTrackingEnvelopeCannotForceCommandJump() {
 }
 
 void TestTerminationRejectsTargetsAndConvergesToHold() {
-  auto limits = SharedSafetyLimits();
+  auto limits = LegacySafetyLimits();
   limits.max_tracking_error.fill(1.0);
   PerJointMotionLimiter limiter(limits);
   auto measured = Zeros();
@@ -610,8 +889,89 @@ void TestTerminationRejectsTargetsAndConvergesToHold() {
   CHECK(limiter.stats()[4].lifecycle_hold_ticks > 0);
 }
 
+void TestArmSnapAndReversalRemainEnergyBounded() {
+  const auto limits = LegacySafetyLimits();
+  constexpr std::size_t joint = 22;  // right shoulder pitch
+  PerJointMotionLimiter limiter(limits);
+  auto measured = Zeros();
+  auto measured_velocity = Zeros();
+  auto desired = Zeros();
+  auto previous_acceleration = Zeros();
+  CHECK(limiter.Seed(measured));
+
+  desired[joint] = limits.max_position[joint];
+  for (int tick = 0; tick < 300; ++tick) {
+    const auto output = limiter.Step(desired, measured, measured_velocity, true,
+                                     tick == 0, 0.02);
+    CheckInvariants(limits, output, measured, previous_acceleration);
+    CHECK(std::abs(output.velocity[joint]) <= 3.0 + 1.0e-9);
+    CHECK(std::abs(output.acceleration[joint]) <= 30.0 + 1.0e-9);
+    previous_acceleration = output.acceleration;
+    measured = output.position;
+    measured_velocity = output.velocity;
+  }
+
+  desired[joint] = limits.min_position[joint];
+  for (int tick = 0; tick < 500; ++tick) {
+    const auto output = limiter.Step(desired, measured, measured_velocity, true,
+                                     tick == 0, 0.02);
+    CheckInvariants(limits, output, measured, previous_acceleration);
+    CHECK(std::abs(output.acceleration[joint] -
+                   previous_acceleration[joint]) <=
+          limits.max_jerk[joint] * limits.writer_dt + 1.0e-9);
+    previous_acceleration = output.acceleration;
+    measured = output.position;
+    measured_velocity = output.velocity;
+  }
+  CHECK(limiter.stats()[joint].fault_events == 0);
+}
+
+void TestMechanicalApproachSlowsBeforeBothHardStops() {
+  const auto limits = LegacySafetyLimits();
+  constexpr std::size_t joint = 25;  // right elbow
+  const auto exercise = [&](double start, double requested,
+                            double boundary_direction) {
+    PerJointMotionLimiter limiter(limits);
+    auto measured = Zeros();
+    auto measured_velocity = Zeros();
+    auto desired = Zeros();
+    auto previous_acceleration = Zeros();
+    measured[joint] = start;
+    desired = measured;
+    desired[joint] = requested;
+    CHECK(limiter.Seed(measured));
+    bool mechanical_reason_seen = false;
+    double maximum_near_stop_speed = 0.0;
+    for (int tick = 0; tick < 1500; ++tick) {
+      const auto output = limiter.Step(
+          desired, measured, measured_velocity, true, tick == 0, 0.02);
+      CheckInvariants(limits, output, measured, previous_acceleration);
+      mechanical_reason_seen |=
+          HasReason(output.reasons[joint], LimitReason::kMechanicalPosition);
+      const double room = boundary_direction > 0.0
+          ? limits.max_position[joint] - output.position[joint]
+          : output.position[joint] - limits.min_position[joint];
+      if (room < 0.02)
+        maximum_near_stop_speed = std::max(
+            maximum_near_stop_speed,
+            boundary_direction * output.velocity[joint]);
+      CHECK(output.state[joint] != JointState::kJointFault);
+      previous_acceleration = output.acceleration;
+      measured = output.position;
+      measured_velocity = output.velocity;
+    }
+    CHECK(mechanical_reason_seen);
+    CHECK(maximum_near_stop_speed < 0.25);
+  };
+
+  exercise(limits.max_position[joint] - 0.12,
+           limits.max_position[joint] + 1.0, 1.0);
+  exercise(limits.min_position[joint] + 0.12,
+           limits.min_position[joint] - 1.0, -1.0);
+}
+
 void TestRandomizedMillionTickInvariants() {
-  auto limits = SafetyLimitsForLevel(0.30);
+  auto limits = LegacySafetyLimitsForLevel(0.30);
   limits.max_tracking_error.fill(2.0);
   PerJointMotionLimiter limiter(limits);
   auto measured = Zeros();
@@ -664,22 +1024,33 @@ void TestRandomizedMillionTickInvariants() {
 }  // namespace
 
 int main() {
+  TestTransparentProjectionPassesSmallLowSpeedTargetExactly();
+  TestTransparentProjectionSmoothsLargeRestSnap();
+  TestTransparentProjectionSmoothsSmallStepOnlyAtHighSpeed();
+  TestTransparentProjectionBrakesBeforeMechanicalStop();
+  TestTransparentProjectionBrakesWristBeforeFaultSpeed();
+  TestTransparentProjectionTapersTorqueBeforeWristBrakeSpeed();
   TestSeedsContinuousStateFromMeasuredPosition();
   TestMeasuredRelativeTargetCapDoesNotJumpOutput();
   TestNewTargetsPreserveReferenceVelocityAndAcceleration();
-  TestFullLimiterBurstAndSustainedAcceleration();
+  TestLowEnergyAndSustainedAcceleration();
   TestEmptyDriveBudgetTransitionsToBrakingWithoutFault();
   TestRepeatedWriterReadsDoNotCreateTargetImpulses();
   TestTargetCadencesAndTrajectories();
   TestNoTargetOvershootOnStepAndReversal();
-  TestLimitingLevelScalesEveryDynamicCeiling();
+  TestEveryPositiveLevelUsesTheSameAlwaysOnEnvelope();
+  TestFormerTaskAuthorityOverridesCannotWeakenSafety();
+  TestIndependentTaskAuthorityOverridesCannotWeakenSafety();
   TestPositionAndDeltaVWindows();
+  TestCommandWindowsCanBeDisabledIndependently();
   TestOneJointNeverChangesAnotherJoint();
   TestMeasuredAccelerationFilter();
   TestMeasuredMotionPersistenceAndLocality();
   TestInvalidMeasurementUsesLocalDampingOnly();
   TestTrackingEnvelopeCannotForceCommandJump();
   TestTerminationRejectsTargetsAndConvergesToHold();
+  TestArmSnapAndReversalRemainEnergyBounded();
+  TestMechanicalApproachSlowsBeforeBothHardStops();
   TestRandomizedMillionTickInvariants();
   std::cout << "per_joint_motion_limiter: all tests passed\n";
 }

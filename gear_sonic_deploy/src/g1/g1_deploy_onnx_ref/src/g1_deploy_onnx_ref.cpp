@@ -315,7 +315,12 @@ class G1Deploy {
     // budget, braking, and fault state; a joint event never damps another.
     bool joint_limiter_enabled_ = true;
     bool joint_limiter_terminating_ = false;
-    std::string joint_limiter_profile_ = "shared-safety";
+    bool joint_limiter_position_window_enabled_ = false;
+    bool joint_limiter_delta_v_window_enabled_ = false;
+    bool joint_limiter_task_authority_enabled_ = false;
+    double joint_limiter_task_authority_level_ = 1.0;
+    double joint_limiter_waist_authority_level_ = 1.0;
+    std::string joint_limiter_profile_ = "always-on-energy-envelope";
     std::string joint_limiter_level_file_;
     double joint_limiter_level_ = 1.0;
     std::atomic<bool> joint_limiter_active_for_policy_{true};
@@ -342,14 +347,14 @@ class G1Deploy {
         sonic::safety::SharedSafetyLimits()};
     std::array<sonic::safety::JointState, G1_NUM_MOTOR>
         joint_limiter_last_logged_state_{};
-    // A limited controller must not see a discontinuous first SONIC target.
-    // The limiter's continuous reference is seeded from measured position while
-    // external support remains engaged. Handover alpha is lifecycle timing only;
-    // it does not add a second position interpolation after the limiter.
+    // Seed SONIC's first target from measured position while external support
+    // remains engaged. Handover alpha is lifecycle timing only; subsequent
+    // 50 Hz targets are consumed directly and any high-energy discontinuity is
+    // projected in equivalent servo-torque space by the 500 Hz limiter.
     double joint_limiter_handover_duration_s_ = 0.1;
     double joint_limiter_handover_trigger_rad_ = 0.01;
     double joint_limiter_prime_desired_error_rad_ = 0.10;
-    double joint_limiter_prime_tracking_error_rad_ = 0.55;
+    double joint_limiter_prime_tracking_error_rad_ = 0.30;
     double joint_limiter_prime_window_fraction_ = 0.50;
     double joint_limiter_prime_stable_duration_s_ = 0.10;
     std::array<double, G1_NUM_MOTOR> joint_limiter_handover_start_q_{};
@@ -2341,10 +2346,11 @@ class G1Deploy {
       // each isolated on its own domain (e.g. MuJoCo on domain 0, Isaac on domain 1).
       const char* _dds_domain_env = std::getenv("DDS_DOMAIN");
       int _dds_domain = _dds_domain_env ? std::atoi(_dds_domain_env) : 0;
-      // Simulation and hardware use the same limiter implementation and full
-      // envelope. Simulation may scale that envelope through a live level file;
-      // there is no alternate profile or CRC-selected set of limits.
+      // Simulation and hardware use the same limiter implementation and exact
+      // positive-level envelope. Level zero is a simulator-only diagnostic
+      // bypass; positive level values no longer scale safety authority.
       ConfigureJointLimiterPriming();
+      ConfigureJointLimiterWindows();
       ConfigureJointLimiterLevelFile();
       joint_limiter_last_logged_state_.fill(
           sonic::safety::JointState::kFollowing);
@@ -2352,6 +2358,18 @@ class G1Deploy {
                 << (joint_limiter_enabled_ ? "true" : "false")
                 << " profile=" << joint_limiter_profile_
                 << " limiting_level=" << joint_limiter_level_
+                << " position_window="
+                << (joint_limiter_position_window_enabled_ ? "true" : "false")
+                << " delta_v_window="
+                << (joint_limiter_delta_v_window_enabled_ ? "true" : "false")
+                << " task_authority_level="
+                << (joint_limiter_task_authority_enabled_
+                        ? std::to_string(joint_limiter_task_authority_level_)
+                        : "off")
+                << " waist_authority_level="
+                << (joint_limiter_task_authority_enabled_
+                        ? std::to_string(joint_limiter_waist_authority_level_)
+                        : "off")
                 << " window_s=" << joint_limiter_.limits().window_duration
                 << " writer_dt_s=" << joint_limiter_.limits().writer_dt
                 << std::endl;
@@ -3056,15 +3074,14 @@ class G1Deploy {
         joint_limiter_handover_elapsed_s_ = 0.0;
         joint_limiter_handover_alpha_ = 0.0;
         joint_limiter_handover_started_ = true;
-        std::cout << "[JOINT-LIMITER-PRIME] handover_started; continuous "
+        std::cout << "[JOINT-LIMITER-PRIME] handover_started; first "
                      "reference seeded at measured position; raw_delta_rad="
                   << max_raw_desired_delta
                   << std::endl;
       }
 
       // SONIC keeps evolving while support is present. The alpha gates support
-      // release only; command continuity is produced by the limiter's single
-      // jerk-limited q/v/a reference rather than a cascaded position blend.
+      // release only; it never blends or interpolates SONIC targets.
       joint_limiter_handover_alpha_ = std::clamp(
           joint_limiter_handover_elapsed_s_ /
               joint_limiter_handover_duration_s_,
@@ -3072,8 +3089,8 @@ class G1Deploy {
       if (joint_limiter_handover_alpha_ >= 1.0 &&
           !joint_limiter_handover_complete_logged_) {
         joint_limiter_handover_complete_logged_ = true;
-        std::cout << "[JOINT-LIMITER-PRIME] handover_complete; continuous "
-                     "reference follows live SONIC targets"
+        std::cout << "[JOINT-LIMITER-PRIME] handover_complete; limiter follows "
+                     "live SONIC targets"
                   << std::endl;
       }
       joint_limiter_handover_elapsed_s_ = std::min(
@@ -3096,26 +3113,36 @@ class G1Deploy {
       std::size_t max_tracking_error_joint = 0;
       std::size_t max_window_fraction_joint = 0;
       bool faulted = false;
+      bool tracking_converged = true;
       for (std::size_t i = 0; i < G1_NUM_MOTOR; ++i) {
-        // Priming evaluates convergence to the measured-relative goal accepted
-        // by the 500 Hz governor, not to an uncapped raw SONIC sample. The raw
-        // target may intentionally remain outside the permitted command-energy
-        // envelope while q_out and the measured joint advance continuously.
+        // Priming evaluates whether the projected 500 Hz command has reached
+        // the current SONIC target. It does not require the static load-bearing
+        // command position to equal measured position.
         const double desired_error =
             std::abs(limited.position[i] - limited.target_position[i]);
         if (desired_error > max_desired_error) {
           max_desired_error = desired_error;
           max_desired_error_joint = i;
         }
+        // A transparent position command may intentionally remain separated
+        // from measured q to produce the static PD torque required for stance.
+        // In v5, readiness therefore means the projected command has caught
+        // the current SONIC target; requiring q_command ~= q_measured would
+        // reject ordinary load-bearing targets and recreate startup lag.
         const double tracking_error =
-            std::abs(measured[i] - limited.position[i]);
+            limits.transparent_torque_projection
+                ? desired_error
+                : std::abs(measured[i] - limited.position[i]);
         if (tracking_error > max_tracking_error) {
           max_tracking_error = tracking_error;
           max_tracking_error_joint = i;
         }
+        tracking_converged &= tracking_error <= std::min(
+            limits.prime_tracking_error[i],
+            joint_limiter_prime_tracking_error_rad_);
         const double full_window_budget =
             limits.max_window_velocity[i] * limits.window_duration;
-        if (full_window_budget > 0.0) {
+        if (limits.enforce_position_window && full_window_budget > 0.0) {
           const double window_fraction =
               limited.window_motion[i] / full_window_budget;
           if (window_fraction > max_window_fraction) {
@@ -3152,7 +3179,7 @@ class G1Deploy {
           joint_limiter_handover_alpha_ >= 1.0 &&
           joint_limiter_prime_has_endpoint_error_ &&
           endpoint_desired_error <= joint_limiter_prime_desired_error_rad_ &&
-          max_tracking_error <= joint_limiter_prime_tracking_error_rad_ &&
+          tracking_converged &&
           max_window_fraction <= joint_limiter_prime_window_fraction_;
       if (converged) {
         ++joint_limiter_prime_stable_ticks_;
@@ -3206,6 +3233,49 @@ class G1Deploy {
       return true;
     }
 
+    static bool ReadBooleanEnvironment(const char* name, bool& value) {
+      const char* text = std::getenv(name);
+      if (!(text && *text)) return false;
+      if (std::strcmp(text, "1") == 0 || std::strcmp(text, "true") == 0) {
+        value = true;
+        return true;
+      }
+      if (std::strcmp(text, "0") == 0 || std::strcmp(text, "false") == 0) {
+        value = false;
+        return true;
+      }
+      std::cerr << "[JOINT-LIMITER] invalid " << name << "=" << text
+                << "; expected 0, 1, false, or true" << std::endl;
+      return false;
+    }
+
+    sonic::safety::Limits JointLimiterLimitsForLevel(double level) const {
+      auto limits = sonic::safety::SafetyLimitsForLevel(level);
+      limits.enforce_position_window =
+          joint_limiter_position_window_enabled_;
+      limits.enforce_delta_v_window =
+          joint_limiter_delta_v_window_enabled_;
+      return limits;
+    }
+
+    void ConfigureJointLimiterWindows() {
+      bool position_enabled = false;
+      bool delta_v_enabled = false;
+      ReadBooleanEnvironment("SONIC_JOINT_LIMITER_POSITION_WINDOW_ENABLED",
+                             position_enabled);
+      ReadBooleanEnvironment("SONIC_JOINT_LIMITER_DELTA_V_WINDOW_ENABLED",
+                             delta_v_enabled);
+      joint_limiter_position_window_enabled_ = position_enabled;
+      joint_limiter_delta_v_window_enabled_ = delta_v_enabled;
+      if (std::getenv("SONIC_JOINT_LIMITER_TASK_AUTHORITY_LEVEL") ||
+          std::getenv("SONIC_JOINT_LIMITER_WAIST_AUTHORITY_LEVEL")) {
+        std::cerr << "[JOINT-LIMITER] task-authority overrides are retired; "
+                     "using the invariant always-on envelope" << std::endl;
+      }
+      joint_limiter_ = sonic::safety::PerJointMotionLimiter(
+          JointLimiterLimitsForLevel(joint_limiter_level_));
+    }
+
     void ConfigureJointLimiterLevelFile() {
       const char* path = std::getenv("SONIC_JOINT_LIMITER_LEVEL_FILE");
       if (!(path && *path)) return;
@@ -3221,7 +3291,7 @@ class G1Deploy {
         joint_limiter_active_for_policy_.store(requested > 0.0);
         if (requested > 0.0) {
           joint_limiter_ = sonic::safety::PerJointMotionLimiter(
-              sonic::safety::SafetyLimitsForLevel(requested));
+              JointLimiterLimitsForLevel(requested));
         }
       }
       joint_limiter_level_min_ = joint_limiter_level_;
@@ -3243,7 +3313,7 @@ class G1Deploy {
 
       if (requested > 0.0) {
         sonic::safety::PerJointMotionLimiter replacement(
-            sonic::safety::SafetyLimitsForLevel(requested));
+            JointLimiterLimitsForLevel(requested));
         if (!replacement.Seed(measured)) {
           std::cerr << "[JOINT-LIMITER] rejected live limiting level change; "
                        "measured-state reseed failed" << std::endl;
@@ -3255,8 +3325,12 @@ class G1Deploy {
         // Level zero is an exact writer bypass. Replace the stateful limiter as
         // well so telemetry after the change cannot be confused with the
         // previous limited segment.
-        joint_limiter_ = sonic::safety::PerJointMotionLimiter(
-            sonic::safety::SharedSafetyLimits());
+        auto limits = sonic::safety::SharedSafetyLimits();
+        limits.enforce_position_window =
+            joint_limiter_position_window_enabled_;
+        limits.enforce_delta_v_window =
+            joint_limiter_delta_v_window_enabled_;
+        joint_limiter_ = sonic::safety::PerJointMotionLimiter(limits);
       }
       joint_limiter_level_ = requested;
       joint_limiter_active_for_policy_.store(requested > 0.0);
@@ -3413,11 +3487,19 @@ class G1Deploy {
           } else {
             std::array<double, G1_NUM_MOTOR> desired{};
             std::array<double, G1_NUM_MOTOR> raw_desired{};
+            std::array<double, G1_NUM_MOTOR> desired_velocity{};
+            std::array<double, G1_NUM_MOTOR> effective_kp{};
+            std::array<double, G1_NUM_MOTOR> effective_kd{};
+            std::array<double, G1_NUM_MOTOR> feedforward_torque{};
             std::array<double, G1_NUM_MOTOR> measured{};
             std::array<double, G1_NUM_MOTOR> measured_velocity{};
             for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
               raw_desired[i] = mc->q_target.at(i);
               desired[i] = raw_desired[i];
+              desired_velocity[i] = mc->dq_target.at(i);
+              effective_kp[i] = mc->kp.at(i) * gain_kp_scale_;
+              effective_kd[i] = mc->kd.at(i) * gain_kd_scale_;
+              feedforward_torque[i] = mc->tau_ff.at(i);
               measured[i] = low_state_data.data->motor_state()[i].q();
               measured_velocity[i] = low_state_data.data->motor_state()[i].dq();
             }
@@ -3480,8 +3562,9 @@ class G1Deploy {
               struct timespec limiter_cpu_start {};
               struct timespec limiter_cpu_end {};
               clock_gettime(CLOCK_THREAD_CPUTIME_ID, &limiter_cpu_start);
-              limited = joint_limiter_.Step(
-                  desired, measured, measured_velocity,
+              limited = joint_limiter_.StepWithServo(
+                  desired, desired_velocity, effective_kp, effective_kd,
+                  feedforward_torque, measured, measured_velocity,
                   accept_desired, new_target, target_interval_s);
               clock_gettime(CLOCK_THREAD_CPUTIME_ID, &limiter_cpu_end);
               const auto limiter_wall_elapsed_ns =
@@ -3659,11 +3742,11 @@ class G1Deploy {
           const bool local_damping =
               limiting_active && limited.local_damping[i];
           dds_low_command.motor_cmd().at(i).tau() =
-              limiting_active ? 0.0 : mc->tau_ff.at(i);
+              local_damping ? 0.0 : mc->tau_ff.at(i);
           dds_low_command.motor_cmd().at(i).q() = limiting_active
               ? limited.position[i] : mc->q_target.at(i);
           dds_low_command.motor_cmd().at(i).dq() =
-              limiting_active ? 0.0 : mc->dq_target.at(i);
+              local_damping ? 0.0 : mc->dq_target.at(i);
           dds_low_command.motor_cmd().at(i).kp() = local_damping
               ? 0.0 : mc->kp.at(i) * gain_kp_scale_;
           dds_low_command.motor_cmd().at(i).kd() = local_damping
@@ -3711,13 +3794,32 @@ class G1Deploy {
       };
       std::cout << "[JOINT-LIMITER-SUMMARY] {\"enabled\":"
                 << (joint_limiter_enabled_ ? "true" : "false")
-                << ",\"schema_version\":2"
-                << ",\"algorithm\":\"causal-burst-reference-governor-v3\""
+                << ",\"schema_version\":4"
+                << ",\"algorithm\":\"state-dependent-torque-projection-v5\""
                 << ",\"profile\":\"" << joint_limiter_profile_ << "\""
                 << ",\"limiting_level\":" << joint_limiter_level_
                 << ",\"limiting_level_min\":" << joint_limiter_level_min_
                 << ",\"limiting_level_max\":" << joint_limiter_level_max_
                 << ",\"limiting_level_changes\":" << joint_limiter_level_changes_
+                << ",\"position_window_enforcing\":"
+                << (joint_limiter_.limits().enforce_position_window
+                        ? "true" : "false")
+                << ",\"transparent_torque_projection\":"
+                << (joint_limiter_.limits().transparent_torque_projection
+                        ? "true" : "false")
+                << ",\"delta_v_window_enforcing\":"
+                << (joint_limiter_.limits().enforce_delta_v_window
+                        ? "true" : "false")
+                << ",\"task_authority_enabled\":"
+                << (joint_limiter_task_authority_enabled_ ? "true" : "false")
+                << ",\"task_authority_level\":"
+                << (joint_limiter_task_authority_enabled_
+                        ? joint_limiter_task_authority_level_
+                        : joint_limiter_level_)
+                << ",\"waist_authority_level\":"
+                << (joint_limiter_task_authority_enabled_
+                        ? joint_limiter_waist_authority_level_
+                        : joint_limiter_level_)
                 << ",\"bypass_ticks\":" << joint_limiter_bypass_ticks_
                 << ",\"stats_since_level_change\":true"
                 << ",\"handover_duration_s\":"
@@ -3847,6 +3949,14 @@ class G1Deploy {
                 [](const auto& s) { return s.stale_target_ticks; });
       print_u64("termination_ticks",
                 [](const auto& s) { return s.termination_ticks; });
+      print_u64("servo_torque_limit_ticks",
+                [](const auto& s) { return s.servo_torque_limit_ticks; });
+      print_u64("torque_slew_ticks",
+                [](const auto& s) { return s.torque_slew_ticks; });
+      print_u64("mechanical_barrier_ticks",
+                [](const auto& s) { return s.mechanical_barrier_ticks; });
+      print_u64("velocity_energy_ticks",
+                [](const auto& s) { return s.velocity_energy_ticks; });
       print_double("max_command_velocity_rad_s",
                    [](const auto& s) { return s.max_command_velocity; });
       print_double("max_command_acceleration_rad_s2",
@@ -3863,6 +3973,16 @@ class G1Deploy {
                    [](const auto& s) { return s.max_measured_acceleration; });
       print_double("max_tracking_error_rad",
                    [](const auto& s) { return s.max_tracking_error; });
+      print_double("max_requested_servo_torque_nm",
+                   [](const auto& s) { return s.max_requested_servo_torque; });
+      print_double("max_emitted_servo_torque_nm",
+                   [](const auto& s) { return s.max_emitted_servo_torque; });
+      print_double("max_servo_torque_step_nm",
+                   [](const auto& s) { return s.max_servo_torque_step; });
+      print_double("max_ordinary_servo_torque_step_nm",
+                   [](const auto& s) {
+                     return s.max_ordinary_servo_torque_step;
+                   });
       const auto print_limit = [&](const char* name, const auto& values) {
         std::cout << ",\"" << name << "\":[";
         for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
@@ -3886,6 +4006,27 @@ class G1Deploy {
       print_limit("window_acceleration_caps_rad_s2",
                   limits.max_window_acceleration);
       print_limit("tracking_error_caps_rad", limits.max_tracking_error);
+      print_limit("prime_tracking_error_caps_rad",
+                  limits.prime_tracking_error);
+      print_limit("target_offset_caps_rad", limits.max_target_offset);
+      print_limit("mechanical_min_position_rad", limits.min_position);
+      print_limit("mechanical_max_position_rad", limits.max_position);
+      print_limit("mechanical_slowdown_distance_rad",
+                  limits.mechanical_slowdown_distance);
+      print_limit("minimum_convergence_time_s",
+                  limits.minimum_convergence_time);
+      print_limit("max_servo_torque_nm", limits.max_servo_torque);
+      print_limit("free_torque_step_nm", limits.free_torque_step);
+      print_limit("free_measured_velocity_rad_s",
+                  limits.free_measured_velocity);
+      print_limit("smoothing_measured_velocity_rad_s",
+                  limits.smoothing_measured_velocity);
+      print_limit("low_speed_torque_ramp_time_s",
+                  limits.low_speed_torque_ramp_time);
+      print_limit("high_speed_torque_ramp_time_s",
+                  limits.high_speed_torque_ramp_time);
+      print_limit("protective_braking_ramp_time_s",
+                  limits.protective_braking_ramp_time);
       print_limit("measured_velocity_brake_rad_s", limits.measured_velocity_brake);
       print_limit("measured_velocity_fault_rad_s", limits.measured_velocity_fault);
       print_limit("measured_acceleration_brake_rad_s2",
