@@ -136,6 +136,9 @@
 // Error monitor
 #include "../include/error_monitor.hpp"
 
+// research-atlas: final 500 Hz per-joint limiter and would-send telemetry.
+#include "../include/research_atlas_command_safety.hpp"
+
 #include "audio_thread/audio_thread.hpp"
 
 // DDS
@@ -273,6 +276,10 @@ class G1Deploy {
     ChannelSubscriberPtr<IMUState_> imutorso_subscriber_;
     ThreadPtr input_thread_ptr_, command_writer_ptr_, control_thread_ptr_, planner_thread_ptr_;
     
+    bool actuate_robot_;
+    research_atlas::sonic::CommandSafety command_safety_;
+    std::uint64_t rejected_limiter_seed_ticks_ = 0;
+
     // =========================================================================
     // External clients and peripheral managers
     // =========================================================================
@@ -2158,6 +2165,9 @@ class G1Deploy {
       int zmq_out_port = 5557,
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
+      bool no_actuate = false,
+      std::string joint_limiter_profile = "supported-commissioning",
+      int command_telemetry_port = 0,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0)
       : time_(0.0),
@@ -2171,6 +2181,8 @@ class G1Deploy {
         mode_machine_(0),
         disable_crc_check_(disable_crc_check),
         program_state_(ProgramState::INIT),
+        actuate_robot_(!no_actuate),
+        command_safety_(joint_limiter_profile, !no_actuate, command_telemetry_port),
         last_action {0.0},
         last_left_hand_action {0.0},
         last_right_hand_action {0.0},
@@ -2184,8 +2196,10 @@ class G1Deploy {
       // Initialize ChannelFactory
       ChannelFactory::Instance()->Init(0, networkInterface);
 
-      // Initialize Dex3 hands (ChannelFactory already initialized above)
-      dex3_hands_.initialize("");
+      // Shadow mode owns no body or hand command publisher.
+      if (actuate_robot_) {
+        dex3_hands_.initialize("");
+      }
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2244,19 +2258,23 @@ class G1Deploy {
       planner_motion_->ReserveCapacity(1500, 29, 1, 1, 0, 0);
       planner_motion_->timesteps = 0;
       planner_motion_->name = "planner_motion";
-      // try to shutdown motion control-related service
-      msc_ = std::make_unique<unitree::robot::b2::MotionSwitcherClient>();
-      msc_->SetTimeout(5.0f);
-      msc_->Init();
-      std::string form, name;
-      while (msc_->CheckMode(form, name), !name.empty()) {
-        if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
-        sleep(5);
+      // Shadow inspection must not release another robot service or create
+      // a command publisher.  This gate is set before worker threads start.
+      if (actuate_robot_) {
+        msc_ = std::make_unique<unitree::robot::b2::MotionSwitcherClient>();
+        msc_->SetTimeout(5.0f);
+        msc_->Init();
+        std::string form, name;
+        while (msc_->CheckMode(form, name), !name.empty()) {
+          if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
+          sleep(5);
+        }
+        lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(HG_CMD_TOPIC));
+        lowcmd_publisher_->InitChannel();
+      } else {
+        std::cout << "[research-atlas] HARDWARE SHADOW: no LowCmd or hand "
+                     "publisher was constructed" << std::endl;
       }
-
-      // create publisher
-      lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(HG_CMD_TOPIC));
-      lowcmd_publisher_->InitChannel();
       // create subscriber
       lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
@@ -2659,27 +2677,61 @@ class G1Deploy {
      * Also publishes Dex3 hand commands at the same cadence.
      */
     void LowCommandWriter() {
+      const auto low_state = low_state_buffer_.GetDataWithTime().data;
       LowCmd_ dds_low_command;
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
       dds_low_command.mode_machine() = mode_machine_;
 
       const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
-      if (mc) {
+      if (mc && low_state &&
+          low_state->motor_state().size() >= G1_NUM_MOTOR) {
+        std::array<double, G1_NUM_MOTOR> raw_q{};
+        std::array<double, G1_NUM_MOTOR> measured_q{};
+        std::array<double, G1_NUM_MOTOR> measured_dq{};
+        for (std::size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+          raw_q[i] = mc->q_target.at(i);
+          measured_q[i] = low_state->motor_state()[i].q();
+          measured_dq[i] = low_state->motor_state()[i].dq();
+        }
+        const auto final_command = command_safety_.Step(
+            raw_q, measured_q, measured_dq, !operator_state.stop);
+        if (!final_command.ready) {
+          if ((rejected_limiter_seed_ticks_++ % 500) == 0) {
+            std::cerr << "[research-atlas] limiter rejected measured-state "
+                         "seed; withholding LowCmd" << std::endl;
+          }
+          return;
+        }
+
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
           dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
-          dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
-          dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);
-          dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);
-          dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i);
-          dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
+          const bool local_damping = final_command.local_damping[i];
+          dds_low_command.motor_cmd().at(i).tau() = 0.0;
+          dds_low_command.motor_cmd().at(i).q() = final_command.command_q[i];
+          dds_low_command.motor_cmd().at(i).dq() = 0.0;
+          dds_low_command.motor_cmd().at(i).kp() =
+              local_damping ? 0.0 : mc->kp.at(i);
+          dds_low_command.motor_cmd().at(i).kd() =
+              local_damping ? 8.0 : mc->kd.at(i);
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-        lowcmd_publisher_->Write(dds_low_command);
+        command_safety_.Publish(final_command);
+        if (actuate_robot_) {
+          lowcmd_publisher_->Write(dds_low_command);
+        }
+      } else if (mc && !low_state) {
+        static bool missing_state_logged = false;
+        if (!missing_state_logged) {
+          std::cerr << "[research-atlas] no LowState; withholding LowCmd"
+                    << std::endl;
+          missing_state_logged = true;
+        }
       }
 
-      // Publish Dex3 hand commands at the same publish cadence
-      dex3_hands_.writeOnce();
+      if (actuate_robot_) {
+        dex3_hands_.writeOnce();
+      }
     }
 
     /// Gracefully stop all threads and send a damping-only command.
@@ -4117,6 +4169,9 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
+    std::cout << "  --no-actuate: read LowState and run Sonic without constructing command publishers" << std::endl;
+    std::cout << "  --joint-limiter-profile <simulation|supported-commissioning>" << std::endl;
+    std::cout << "  --command-telemetry-port <port>: publish exact post-limiter would-send q" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
@@ -4168,6 +4223,9 @@ int main(int argc, char const* argv[]) {
   std::string outputType = "zmq"; // Default to zmq
   bool plannerFp16 = false;
   bool policyFp16 = false;
+  bool noActuate = false;
+  std::string jointLimiterProfile = "supported-commissioning";
+  int commandTelemetryPort = 0;
   std::string logsDir = "";
   bool enableCsvLogs = false;
   std::string zmq_host = "localhost";
@@ -4184,6 +4242,23 @@ int main(int argc, char const* argv[]) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--no-actuate") {
+      noActuate = true;
+      std::cout << "[INFO] fail-closed hardware shadow requested" << std::endl;
+    } else if (std::string(argv[i]) == "--joint-limiter-profile") {
+      if (i + 1 >= argc) {
+        throw std::runtime_error("--joint-limiter-profile requires a value");
+      }
+      jointLimiterProfile = argv[++i];
+      if (jointLimiterProfile != "simulation" &&
+          jointLimiterProfile != "supported-commissioning") {
+        throw std::runtime_error("invalid --joint-limiter-profile");
+      }
+    } else if (std::string(argv[i]) == "--command-telemetry-port") {
+      if (i + 1 >= argc) {
+        throw std::runtime_error("--command-telemetry-port requires a value");
+      }
+      commandTelemetryPort = std::stoi(argv[++i]);
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4440,6 +4515,9 @@ int main(int argc, char const* argv[]) {
     zmq_out_port,
     zmq_out_topic,
     enableMotionRecording,
+    noActuate,
+    jointLimiterProfile,
+    commandTelemetryPort,
     initial_compliance,
     initial_max_close_ratio
   );
