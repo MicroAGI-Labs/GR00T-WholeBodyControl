@@ -249,6 +249,24 @@ void TestSeedsContinuousStateFromMeasuredPosition() {
         limits.max_jerk[3] * limits.writer_dt + 1.0e-12);
 }
 
+void TestWristRollSeedUsesPhysicalMechanicalRange() {
+  const auto limits = SharedSafetyLimits();
+  CHECK(std::abs(limits.min_position[19] + 1.98) < 1.0e-12);
+  CHECK(std::abs(limits.max_position[19] - 1.98) < 1.0e-12);
+  CHECK(std::abs(limits.min_position[26] + 1.98) < 1.0e-12);
+  CHECK(std::abs(limits.max_position[26] - 1.98) < 1.0e-12);
+
+  auto measured = Zeros();
+  measured[19] = limits.min_position[19];
+  measured[26] = limits.max_position[26];
+  PerJointMotionLimiter at_limits(limits);
+  CHECK(at_limits.Seed(measured));
+
+  measured[19] = limits.min_position[19] - 1.0e-6;
+  PerJointMotionLimiter beyond_limit(limits);
+  CHECK(!beyond_limit.Seed(measured));
+}
+
 void TestMeasuredRelativeTargetCapDoesNotJumpOutput() {
   auto limits = LegacySafetyLimits();
   limits.max_target_offset.fill(1.0);
@@ -1031,6 +1049,7 @@ int main() {
   TestTransparentProjectionBrakesWristBeforeFaultSpeed();
   TestTransparentProjectionTapersTorqueBeforeWristBrakeSpeed();
   TestSeedsContinuousStateFromMeasuredPosition();
+  TestWristRollSeedUsesPhysicalMechanicalRange();
   TestMeasuredRelativeTargetCapDoesNotJumpOutput();
   TestNewTargetsPreserveReferenceVelocityAndAcceleration();
   TestLowEnergyAndSustainedAcceleration();

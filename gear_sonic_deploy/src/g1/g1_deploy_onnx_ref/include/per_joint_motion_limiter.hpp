@@ -238,19 +238,22 @@ inline Limits BaseLimits() {
   // right_elbow_joint (index 25) as [-1.0472, 2.0944] rad.  Do not silently
   // narrow that range here; any desired soft-limit behavior should be modeled
   // explicitly and reported separately from MECHANICAL_POSITION.
+  // The physical Thor-connected G1 reports wrist roll down to -1.9778 rad at
+  // rest, slightly beyond the MuJoCo +/-1.97222 range. Indices 19 and 26 use
+  // the minimal symmetric physical envelope of +/-1.98 rad.
   limits.min_position = {
       -2.4807, -0.4736, -2.7076, -0.037267, -0.82267, -0.2118,
       -2.4807, -2.9171, -2.7076, -0.037267, -0.82267, -0.2118,
       -2.5680, -0.4700, -0.4700,
-      -3.0392, -1.5382, -2.5680, -0.9972, -1.92222, -1.56443, -1.56443,
-      -3.0392, -2.2015, -2.5680, -1.0472, -1.92222, -1.56443, -1.56443,
+      -3.0392, -1.5382, -2.5680, -0.9972, -1.98000, -1.56443, -1.56443,
+      -3.0392, -2.2015, -2.5680, -1.0472, -1.98000, -1.56443, -1.56443,
   };
   limits.max_position = {
       2.8298, 2.9171, 2.7076, 2.8298, 0.4736, 0.2118,
       2.8298, 0.4736, 2.7076, 2.8298, 0.4736, 0.2118,
       2.5680, 0.4700, 0.4700,
-      2.6204, 2.2015, 2.5680, 2.0444, 1.92222, 1.56443, 1.56443,
-      2.6204, 1.5382, 2.5680, 2.0944, 1.92222, 1.56443, 1.56443,
+      2.6204, 2.2015, 2.5680, 2.0444, 1.98000, 1.56443, 1.56443,
+      2.6204, 1.5382, 2.5680, 2.0944, 1.98000, 1.56443, 1.56443,
   };
   return limits;
 }
