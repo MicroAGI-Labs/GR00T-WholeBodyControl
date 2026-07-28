@@ -278,7 +278,7 @@ class G1Deploy {
     
     bool actuate_robot_;
     research_atlas::sonic::CommandSafety command_safety_;
-    std::uint64_t rejected_limiter_seed_ticks_ = 0;
+    std::uint64_t rejected_command_ticks_ = 0;
 
     // =========================================================================
     // External clients and peripheral managers
@@ -2696,19 +2696,24 @@ class G1Deploy {
         const auto final_command = command_safety_.Step(
             raw_q, measured_q, measured_dq, !operator_state.stop);
         if (!final_command.ready) {
-          if ((rejected_limiter_seed_ticks_++ % 500) == 0) {
-            std::cerr << "[research-atlas] limiter rejected measured-state "
-                         "seed; withholding LowCmd" << std::endl;
+          if ((rejected_command_ticks_++ % 500) == 0) {
+            std::cerr << "[research-atlas] final command rejected (invalid "
+                         "direct command or limiter seed); withholding LowCmd"
+                      << std::endl;
           }
           return;
         }
 
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
           dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
-          const bool local_damping = final_command.local_damping[i];
-          dds_low_command.motor_cmd().at(i).tau() = 0.0;
+          const bool limiter_enabled = command_safety_.limiter_enabled();
+          const bool local_damping =
+              limiter_enabled && final_command.local_damping[i];
+          dds_low_command.motor_cmd().at(i).tau() =
+              limiter_enabled ? 0.0 : mc->tau_ff.at(i);
           dds_low_command.motor_cmd().at(i).q() = final_command.command_q[i];
-          dds_low_command.motor_cmd().at(i).dq() = 0.0;
+          dds_low_command.motor_cmd().at(i).dq() =
+              limiter_enabled ? 0.0 : mc->dq_target.at(i);
           dds_low_command.motor_cmd().at(i).kp() =
               local_damping ? 0.0 : mc->kp.at(i);
           dds_low_command.motor_cmd().at(i).kd() =
@@ -4170,8 +4175,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
     std::cout << "  --no-actuate: read LowState and run Sonic without constructing command publishers" << std::endl;
-    std::cout << "  --joint-limiter-profile <simulation|supported-commissioning>" << std::endl;
-    std::cout << "  --command-telemetry-port <port>: publish exact post-limiter would-send q" << std::endl;
+    std::cout << "  --joint-limiter-profile <upstream-direct|simulation|supported-commissioning>" << std::endl;
+    std::cout << "  --command-telemetry-port <port>: publish exact final would-send q" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
@@ -4250,7 +4255,8 @@ int main(int argc, char const* argv[]) {
         throw std::runtime_error("--joint-limiter-profile requires a value");
       }
       jointLimiterProfile = argv[++i];
-      if (jointLimiterProfile != "simulation" &&
+      if (jointLimiterProfile != "upstream-direct" &&
+          jointLimiterProfile != "simulation" &&
           jointLimiterProfile != "supported-commissioning") {
         throw std::runtime_error("invalid --joint-limiter-profile");
       }

@@ -8,6 +8,7 @@
 // safety boundary small enough to test separately.
 
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -37,17 +38,24 @@ class CommandSafety {
   CommandSafety(std::string profile, bool actuating, int telemetry_port)
       : profile_(std::move(profile)), actuating_(actuating) {
     ::sonic::safety::Limits limits;
-    if (profile_ == "simulation") {
+    if (profile_ == "upstream-direct") {
+      // Preserve Sonic's original robot-facing joint positions. The overlay
+      // remains only to mirror the exact final command and to keep hardware
+      // shadow incapable of constructing a publisher.
+    } else if (profile_ == "simulation") {
       limits = ::sonic::safety::SimulationQualificationLimits();
     } else if (profile_ == "supported-commissioning") {
       limits = ::sonic::safety::SupportedCommissioningLimits();
     } else {
       throw std::invalid_argument(
           "unknown joint limiter profile '" + profile_ +
-          "'; expected simulation or supported-commissioning");
+          "'; expected upstream-direct, simulation, or "
+          "supported-commissioning");
     }
-    limiter_ =
-        std::make_unique<::sonic::safety::PerJointMotionLimiter>(std::move(limits));
+    if (profile_ != "upstream-direct") {
+      limiter_ = std::make_unique<::sonic::safety::PerJointMotionLimiter>(
+          std::move(limits));
+    }
     if (telemetry_port != 0) {
       if (telemetry_port < 1 || telemetry_port > 65535) {
         throw std::invalid_argument("command telemetry port must be in 1..65535");
@@ -69,6 +77,14 @@ class CommandSafety {
     result.raw_q = raw_q;
     result.measured_q = measured_q;
     result.accepting_desired = accept_desired;
+    if (!limiter_) {
+      for (const double value : raw_q) {
+        if (!std::isfinite(value)) return result;
+      }
+      result.command_q = raw_q;
+      result.ready = true;
+      return result;
+    }
     if (!limiter_->seeded() && !limiter_->Seed(measured_q)) {
       return result;
     }
@@ -90,7 +106,7 @@ class CommandSafety {
     PackField(packer, "schema_version", 1);
     PackField(packer, "sequence", sequence_++);
     PackField(packer, "actuating", actuating_);
-    PackField(packer, "limiter_enabled", true);
+    PackField(packer, "limiter_enabled", limiter_enabled());
     PackField(packer, "limiter_profile", profile_);
     PackField(packer, "accepting_desired", command.accepting_desired);
     PackArray(packer, "raw_q", command.raw_q);
@@ -109,6 +125,9 @@ class CommandSafety {
   }
 
   [[nodiscard]] bool actuating() const { return actuating_; }
+  [[nodiscard]] bool limiter_enabled() const {
+    return static_cast<bool>(limiter_);
+  }
   [[nodiscard]] const std::string& profile() const { return profile_; }
 
  private:
