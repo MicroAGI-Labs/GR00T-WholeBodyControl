@@ -5,3 +5,7 @@ build/
 target/
 logs/
 *.trt
+
+# research-atlas runtime inputs/outputs are pinned separately from source.
+policy/low_latency/
+reference/recorded_motion/
