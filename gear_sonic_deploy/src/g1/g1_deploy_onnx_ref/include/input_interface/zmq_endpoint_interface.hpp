@@ -575,6 +575,17 @@ public:
         toggle_zmq_mode = true;
     }
 
+    /// Enter network streaming without resetting the buffered first token or
+    /// pausing the active controller.  ZMQManager uses this only for the
+    /// planner-to-VLA continuous handoff after a fresh protocol-v4 message has
+    /// already arrived.
+    void ActivateStreamingForContinuousHandoff() {
+        use_zmq_stream = true;
+        toggle_zmq_mode = false;
+        std::cout << "[ZMQEndpointInterface] ZMQ streaming enabled "
+                     "(continuous control handoff)" << std::endl;
+    }
+
     std::optional<std::chrono::steady_clock::time_point> GetLastUpdateTime() const override {
       if (is_localhost_) {
         return data_timestamp_;
