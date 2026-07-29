@@ -69,8 +69,8 @@
  *  23  | base_trans_measured    | double[3]    | Measured base translation (fixed default).
  *  24  | base_quat_measured     | double[4]    | Measured base quaternion (= base_quat).
  *  25  | body_q_measured        | double[29]   | Measured joint positions (= body_q).
- *  26  | left_hand_q_measured   | double[7]    | Measured left-hand Dex3 positions.
- *  27  | right_hand_q_measured  | double[7]    | Measured right-hand Dex3 positions.
+ *  26  | left_hand_q_measured   | double[7]    | Measured left RH56E2 policy channels.
+ *  27  | right_hand_q_measured  | double[7]    | Measured right RH56E2 policy channels.
  *      |                        |              |
  *      | **Viz: VR 3-point**    |              |
  *  28  | vr_3point_position     | double[9]    | VR positions (3×xyz, target body frame).
@@ -121,7 +121,7 @@
  */
 class ZMQOutputHandler : public OutputInterface {
 public:
-    static constexpr bool DEBUG_LOGGING = true;
+    static constexpr bool DEBUG_LOGGING = false;  // per-publish logs; set true to debug
 
     /**
      * @brief Construct the handler: create a ZMQ PUB socket and bind to the given port.

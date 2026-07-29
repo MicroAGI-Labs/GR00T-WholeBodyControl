@@ -62,8 +62,8 @@ struct CommandMessage {
  *   - height             : float – desired body height      (-1.0 = use default)
  *   - upper_body_position: float[17] – target upper-body joint positions  (radians)
  *   - upper_body_velocity: float[17] – target upper-body joint velocities (rad/s)
- *   - left_hand_joints   : float[7]  – Dex3 left-hand joint positions
- *   - right_hand_joints  : float[7]  – Dex3 right-hand joint positions
+ *   - left_hand_joints   : float[7]  – RH56E2 close fractions + unused slot
+ *   - right_hand_joints  : float[7]  – RH56E2 close fractions + unused slot
  *
  * The `timestamp` field is set locally on receipt and used for timeout
  * detection (planner messages older than ~1 s are considered stale).
@@ -89,10 +89,10 @@ struct PlannerMessage {
   /// Optional upper-body joint target velocities (17 DOF, rad/s).
   std::optional<std::array<double, 17>> upper_body_velocity;
 
-  /// Optional left-hand Dex3 joint positions (7 DOF).
+  /// Optional left RH56E2 policy channels (6 actuators + unused slot).
   std::optional<std::array<double, 7>> left_hand_joints;
 
-  /// Optional right-hand Dex3 joint positions (7 DOF).
+  /// Optional right RH56E2 policy channels (6 actuators + unused slot).
   std::optional<std::array<double, 7>> right_hand_joints;
 
   /// Desired locomotion speed.  -1.0 means "use the default for the current mode".
@@ -105,4 +105,3 @@ struct PlannerMessage {
   /// Used to detect planner timeouts (stale data → fallback to IDLE).
   std::chrono::steady_clock::time_point timestamp{};
 };
-

@@ -145,6 +145,15 @@ resolve_interface() {
         ENV_TYPE="sim"
         return 0
     
+    elif [[ "$interface" == "g1zenoh" ]]; then
+        # Real robot reached via the Zenoh DDS bridge.
+        # The bridge republishes the robot's DDS onto the Spark's loopback,
+        # so the deploy talks DDS on "lo" while behaving as a real-robot run.
+        TARGET="lo"
+        ENV_TYPE="real"
+        USE_ZENOH_BRIDGE=1
+        return 0
+
     elif [[ "$interface" == "real" ]]; then
         # Try to find interface with 192.168.123.x IP (Unitree robot network)
         local real_interface
@@ -385,6 +394,13 @@ if [[ "$ENV_TYPE" == "sim" ]]; then
     EXTRA_ARGS="--disable-crc-check"
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
     echo ""
+elif [[ -n "$USE_ZENOH_BRIDGE" ]]; then
+    # LowState is round-tripped through the Zenoh<->DDS bridge; disable the
+    # incoming-CRC check to avoid false rejects from re-serialization.
+    # (Outgoing LowCmd CRC is always computed by the deploy regardless.)
+    EXTRA_ARGS="--disable-crc-check"
+    echo -e "${YELLOW}📋 Zenoh-bridge mode: incoming CRC check disabled${NC}"
+    echo ""
 fi
 
 # ============================================================================
@@ -515,6 +531,7 @@ echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
+echo -e "  Hand Model:         ${GREEN}inspire-rh56e2${NC}"
 if [[ -n "$EXTRA_ARGS" ]]; then
 echo -e "  Extra Args:         ${GREEN}$EXTRA_ARGS${NC}"
 fi
@@ -544,13 +561,103 @@ else
     echo -e "${YELLOW}📋 This will start the simulation control system.${NC}"
 fi
 echo ""
-read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+# Skip the interactive prompt when DEPLOY_YES is set (e.g. DEPLOY_YES=1).
+# Useful under shells like ble.sh where bash `read` returns EAGAIN.
+if [[ -n "$DEPLOY_YES" ]]; then
+    echo -e "${GREEN}DEPLOY_YES set — skipping confirmation.${NC}"
+    confirm="Y"
+else
+    read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
+fi
 
 if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""
     echo -e "${GREEN}🚀 Starting deployment...${NC}"
     echo ""
-    
+
+    # ------------------------------------------------------------------
+    # Zenoh DDS Bridge (Spark side) — only for the g1zenoh real-robot path.
+    # Pulls the robot's DDS (rt/lowstate) from the Jetson bridge over Zenoh
+    # and re-publishes it on the Spark's loopback; forwards the deploy's
+    # rt/lowcmd back to the robot. Bypasses the robot switch's broken
+    # inbound multicast (IGMP snooping).
+    # ------------------------------------------------------------------
+    if [[ -n "$USE_ZENOH_BRIDGE" ]]; then
+        ZENOH_JETSON_ENDPOINT="${ZENOH_JETSON_ENDPOINT:-tcp/192.168.1.229:7447}"
+        echo "[INFO] Starting Zenoh DDS bridge on Spark (peer -> $ZENOH_JETSON_ENDPOINT)..."
+
+        # Write config FILES before docker run. If these paths don't exist,
+        # Docker silently creates them as directories and the bridge crash-loops.
+        cat > "$HOME/cyclonedds_spark.xml" <<'XML'
+<CycloneDDS>
+  <Domain>
+    <General>
+      <Interfaces>
+        <NetworkInterface name="lo" priority="default" multicast="false" />
+      </Interfaces>
+    </General>
+    <!-- Loopback has no multicast discovery.  Give the bridge a participant
+         index and explicitly scan localhost so controllers can start before
+         or after the bridge without relying on Zenoh discovery replicas. -->
+    <Discovery>
+      <ParticipantIndex>auto</ParticipantIndex>
+      <MaxAutoParticipantIndex>99</MaxAutoParticipantIndex>
+      <Peers AddLocalhost="true">
+        <Peer Address="127.0.0.1" />
+      </Peers>
+    </Discovery>
+  </Domain>
+</CycloneDDS>
+XML
+        cat > "$HOME/zenoh-spark-config.json5" <<JSON5
+{
+  mode: "peer",
+  connect: { endpoints: ["$ZENOH_JETSON_ENDPOINT"] },
+  scouting: { multicast: { enabled: false } },
+  // The sim bridge is remote (SSH TCP), not a same-host SHM peer.  Keeping
+  // SHM off preserves serialized forwarding for non-memcpy-safe DDS types.
+  transport: { shared_memory: { enabled: false } },
+  plugins: {
+    dds: {
+      domain: 0,
+      allow: [
+        "rt/lowstate", "rt/lowcmd", "rt/secondary_imu", "rt/eval",
+        "rt/inspire/cmd", "rt/inspire/state",
+        "rt/api/motion_switcher/request", "rt/api/motion_switcher/response",
+        "^rt/sim/g1/[0-9]+/(lowstate|lowcmd|secondary_imu|reset_pose/cmd|eval)$"
+      ],
+      // Unitree topics need data routing, not remote endpoint replication.
+      // Local route mode avoids discovery feedback and survives either bridge
+      // starting before its local DDS readers/writers.
+      forward_discovery: false
+    }
+  },
+  open: {
+    return_conditions: { "connect_scouted": false }
+  }
+}
+JSON5
+
+        docker rm -f zenoh-spark-bridge >/dev/null 2>&1 || true
+        docker run -d --restart unless-stopped \
+          --name zenoh-spark-bridge \
+          --network host \
+          -v "$HOME/cyclonedds_spark.xml:/cyclonedds_spark.xml:ro" \
+          -v "$HOME/zenoh-spark-config.json5:/zenoh-spark-config.json5:ro" \
+          -e CYCLONEDDS_URI=/cyclonedds_spark.xml \
+          -e UHLC_MAX_DELTA_MS="${UHLC_MAX_DELTA_MS:-500}" \
+          eclipse/zenoh-bridge-dds:latest \
+          --config /zenoh-spark-config.json5
+
+        sleep 3
+        if [[ "$(docker inspect -f '{{.State.Running}}' zenoh-spark-bridge 2>/dev/null)" != "true" ]]; then
+            echo -e "${RED}✗ Zenoh bridge failed to start. Logs:${NC}"
+            docker logs --tail 15 zenoh-spark-bridge 2>&1
+            exit 1
+        fi
+        echo "[INFO] Zenoh bridge up. G1 rt/lowstate now on Spark 'lo'; rt/lowcmd forwarded to robot."
+    fi
+
     # Build the command with optional extra args
     if [[ -n "$EXTRA_ARGS" ]]; then
         just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \

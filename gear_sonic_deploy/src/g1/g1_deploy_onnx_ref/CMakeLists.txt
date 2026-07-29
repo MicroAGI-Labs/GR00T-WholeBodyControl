@@ -83,16 +83,31 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
 
   set(CUDA_LINK_DIRS ${CUDA_ARM_LIB_PATH})
 
-  # DLA support: only for non-Thor Jetson devices
-  if(IS_THOR)
+  # DLA support: only for real Jetson devices that have DLA hardware.
+  # The DGX Spark (Grace + Blackwell) is aarch64 but has no DLA → must not link cudla.
+  set(IS_JETSON FALSE)
+  if(EXISTS "/etc/nv_tegra_release")
+    set(IS_JETSON TRUE)
+  elseif(EXISTS "/proc/device-tree/compatible")
+    file(READ "/proc/device-tree/compatible" COMPAT)
+    if(COMPAT MATCHES "nvidia,tegra")
+      set(IS_JETSON TRUE)
+    endif()
+  endif()
+
+  if(IS_THOR OR NOT IS_JETSON)
     set(CUDLA_LIBRARY "")
-    message(STATUS "🚀 ARM64 (Thor) detected - building without DLA support")
+    if(NOT IS_JETSON)
+      message(STATUS "🚀 Generic aarch64 (DGX Spark / non-Jetson) detected - building WITHOUT DLA support")
+      message(STATUS "   libcudla does not exist on this platform (expected).")
+    else()
+      message(STATUS "🚀 ARM64 (Thor) detected - building without DLA support")
+    endif()
     message(STATUS "   Using CUDA library path: ${CUDA_ARM_LIB_PATH}")
-    message(STATUS "   Thor doesn't have DLA engines")
   else()
-    # Match bare-metal Jetson builds: link cudla from the CUDA toolkit (targets/aarch64-linux/lib)
+    # Real Jetson (non-Thor) with DLA
     set(CUDLA_LIBRARY "cudla")
-    message(STATUS "✅ ARM64 detected - enabling DLA (cudla) support")
+    message(STATUS "✅ ARM64 Jetson detected - enabling DLA (cudla) support")
     message(STATUS "   Using CUDA library path: ${CUDA_ARM_LIB_PATH}")
     message(STATUS "   Using CUDLA library: -l${CUDLA_LIBRARY}")
   endif()
@@ -206,6 +221,10 @@ target_link_libraries(
   ${EXECUTABLE_NAME} PRIVATE ${PROJECT_NAME}
   ${EXE_LIBS}
 )
+# Safety validation depends on IEEE NaN/Inf semantics. The project-wide
+# -ffast-math setting would otherwise allow the compiler to remove finite
+# checks in the final command writer.
+target_compile_options(${EXECUTABLE_NAME} PRIVATE -fno-fast-math)
 
 # Setting our output directory and C++ standard
 set_target_properties(
@@ -245,6 +264,10 @@ FetchContent_MakeAvailable(googletest)
 find_package(GTest REQUIRED)
 
 file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
+list(REMOVE_ITEM TEST_SRCS
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_test.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_benchmark.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/rh56e2_mapping_test.cpp)
 
 add_executable(run_tests ${TEST_SRCS})
 target_link_directories(run_tests PRIVATE ${CUDA_LINK_DIRS})
@@ -259,3 +282,42 @@ set_target_properties(
              CXX_STANDARD 20
              CXX_STANDARD_REQUIRED ON
              CXX_EXTENSIONS OFF)
+
+# Header-only command-safety properties. This target intentionally links no
+# robot, DDS, CUDA, or TensorRT libraries, so it can run in a network-isolated
+# build environment.
+add_executable(command_safety_limiter_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_test.cpp)
+target_include_directories(command_safety_limiter_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(command_safety_limiter_test PRIVATE -fno-fast-math)
+set_target_properties(command_safety_limiter_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+enable_testing()
+add_test(NAME command_safety_limiter COMMAND command_safety_limiter_test)
+
+add_executable(rh56e2_mapping_test
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/rh56e2_mapping_test.cpp)
+target_include_directories(rh56e2_mapping_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+set_target_properties(rh56e2_mapping_test PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)
+add_test(NAME rh56e2_mapping COMMAND rh56e2_mapping_test)
+
+add_executable(command_safety_limiter_benchmark
+  ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/per_joint_motion_limiter_benchmark.cpp)
+target_include_directories(command_safety_limiter_benchmark PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(command_safety_limiter_benchmark PRIVATE
+  -O3 -fno-fast-math)
+set_target_properties(command_safety_limiter_benchmark PROPERTIES
+  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  CXX_EXTENSIONS OFF)

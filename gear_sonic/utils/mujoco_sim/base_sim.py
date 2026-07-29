@@ -21,6 +21,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 from unitree_sdk2py.core.channel import ChannelFactoryInitialize
 
+from gear_sonic.utils.data_collection.keyboard_subscriber import ZMQKeyboardSubscriber
 from gear_sonic.utils.mujoco_sim.metric_utils import check_contact, check_height
 from gear_sonic.utils.mujoco_sim.sim_utils import get_subtree_body_names
 from gear_sonic.utils.mujoco_sim.unitree_sdk2py_bridge import ElasticBand, UnitreeSdk2Bridge
@@ -45,10 +46,9 @@ class DefaultEnv:
         self.env_name = env_name
         self.robot = Robot(self.config)
         self.num_body_dof = self.robot.NUM_JOINTS
-        self.num_hand_dof = self.robot.NUM_HAND_JOINTS
         self.sim_dt = self.config["SIMULATE_DT"]
         self.obs = None
-        self.torques = np.zeros(self.num_body_dof + self.num_hand_dof * 2)
+        self.torques = np.zeros(self.num_body_dof)
         self.torque_limit = np.array(self.robot.MOTOR_EFFORT_LIMIT_LIST)
         self.camera_configs = camera_configs
 
@@ -182,8 +182,20 @@ class DefaultEnv:
                 )
 
         # Enable the elastic band
+        self.elastic_band = None
+        self._band_keyboard_sub = None
+        self._band_released = False
         if self.config["ENABLE_ELASTIC_BAND"] and self.use_floating_root_link:
             self.elastic_band = ElasticBand()
+            # Subscribe to the existing keyboard publisher so the band auto-
+            # disables on first 'p' press (= operator unpaused VLA inference).
+            # This makes the band a startup-only stabilizer that releases as
+            # soon as the policy takes over balance — closer to real-hardware
+            # behavior than a permanent tether at z=1.
+            try:
+                self._band_keyboard_sub = ZMQKeyboardSubscriber()
+            except Exception as e:
+                print(f"[ElasticBand] keyboard subscriber init failed: {e}")
             if "g1" in self.config["ROBOT_TYPE"]:
                 if self.config["enable_waist"]:
                     self.band_attached_link = self.mj_model.body("pelvis").id
@@ -223,8 +235,6 @@ class DefaultEnv:
             self.viewer.cam.trackbodyid = self.mj_model.body("pelvis").id
 
         self.body_joint_index = []
-        self.left_hand_index = []
-        self.right_hand_index = []
         for i in range(self.mj_model.njnt):
             name = self.mj_model.joint(i).name
             if any(
@@ -234,18 +244,10 @@ class DefaultEnv:
                 ]
             ):
                 self.body_joint_index.append(i)
-            elif "left_hand" in name:
-                self.left_hand_index.append(i)
-            elif "right_hand" in name:
-                self.right_hand_index.append(i)
 
         assert len(self.body_joint_index) == self.robot.NUM_JOINTS
-        assert len(self.left_hand_index) == self.robot.NUM_HAND_JOINTS
-        assert len(self.right_hand_index) == self.robot.NUM_HAND_JOINTS
 
         self.body_joint_index = np.array(self.body_joint_index)
-        self.left_hand_index = np.array(self.left_hand_index)
-        self.right_hand_index = np.array(self.right_hand_index)
 
     def init_renderers(self):
         self.renderers = {}
@@ -297,53 +299,12 @@ class DefaultEnv:
     def get_root_vel(self) -> np.ndarray:
         return self.mj_data.qvel[:6]
 
-    def compute_hand_torques(self) -> np.ndarray:
-        left_hand_torques = np.zeros(self.num_hand_dof)
-        right_hand_torques = np.zeros(self.num_hand_dof)
-        if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
-            for i in range(self.unitree_bridge.num_hand_motor):
-                left_hand_torques[i] = (
-                    self.unitree_bridge.left_hand_cmd.motor_cmd[i].tau
-                    + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kp
-                    * (
-                        self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.left_hand_index[i] + self.qpos_offset - 1]
-                    )
-                    + self.unitree_bridge.left_hand_cmd.motor_cmd[i].kd
-                    * (
-                        self.unitree_bridge.left_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.left_hand_index[i] + self.qvel_offset - 1]
-                    )
-                )
-                right_hand_torques[i] = (
-                    self.unitree_bridge.right_hand_cmd.motor_cmd[i].tau
-                    + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kp
-                    * (
-                        self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
-                        - self.mj_data.qpos[self.right_hand_index[i] + self.qpos_offset - 1]
-                    )
-                    + self.unitree_bridge.right_hand_cmd.motor_cmd[i].kd
-                    * (
-                        self.unitree_bridge.right_hand_cmd.motor_cmd[i].dq
-                        - self.mj_data.qvel[self.right_hand_index[i] + self.qvel_offset - 1]
-                    )
-                )
-        return np.concatenate((left_hand_torques, right_hand_torques))
-
     def compute_body_qpos(self) -> np.ndarray:
         body_qpos = np.zeros(self.num_body_dof)
         if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
             for i in range(self.unitree_bridge.num_body_motor):
                 body_qpos[i] = self.unitree_bridge.low_cmd.motor_cmd[i].q
         return body_qpos
-
-    def compute_hand_qpos(self) -> np.ndarray:
-        hand_qpos = np.zeros(self.num_hand_dof * 2)
-        if self.unitree_bridge is not None and self.unitree_bridge.low_cmd:
-            for i in range(self.unitree_bridge.num_hand_motor):
-                hand_qpos[i] = self.unitree_bridge.left_hand_cmd.motor_cmd[i].q
-                hand_qpos[i + self.num_hand_dof] = self.unitree_bridge.right_hand_cmd.motor_cmd[i].q
-        return hand_qpos
 
     def prepare_obs(self) -> Dict[str, any]:
         obs = {}
@@ -374,15 +335,6 @@ class DefaultEnv:
         obs["body_dq"] = self.mj_data.qvel[self.body_joint_index + 6 - 1]
         obs["body_ddq"] = self.mj_data.qacc[self.body_joint_index + 6 - 1]
         obs["body_tau_est"] = self.mj_data.actuator_force[self.body_joint_index - 1]
-        if self.num_hand_dof > 0:
-            obs["left_hand_q"] = self.mj_data.qpos[self.left_hand_index + self.qpos_offset - 1]
-            obs["left_hand_dq"] = self.mj_data.qvel[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_ddq"] = self.mj_data.qacc[self.left_hand_index + self.qvel_offset - 1]
-            obs["left_hand_tau_est"] = self.mj_data.actuator_force[self.left_hand_index - 1]
-            obs["right_hand_q"] = self.mj_data.qpos[self.right_hand_index + self.qpos_offset - 1]
-            obs["right_hand_dq"] = self.mj_data.qvel[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_ddq"] = self.mj_data.qacc[self.right_hand_index + self.qvel_offset - 1]
-            obs["right_hand_tau_est"] = self.mj_data.actuator_force[self.right_hand_index - 1]
         obs["time"] = self.mj_data.time
         return obs
 
@@ -392,6 +344,21 @@ class DefaultEnv:
         if self.unitree_bridge.joystick:
             self.unitree_bridge.PublishWirelessController()
         if self.elastic_band:
+            import os as _os_band
+            _rel = float(_os_band.environ.get("MUJOCO_BAND_RELEASE_S", "0"))
+            if not self._band_released and _rel > 0.0 and self.mj_data.time > _rel:
+                self.elastic_band.enable = False
+                self._band_released = True
+                print(f"[ElasticBand] AUTO-RELEASED at t={self.mj_data.time:.1f}s "
+                      f"(MUJOCO_BAND_RELEASE_S) — SONIC now balances UNAIDED", flush=True)
+            if (
+                not self._band_released
+                and self._band_keyboard_sub is not None
+                and self._band_keyboard_sub.read_msg() == "p"
+            ):
+                self.elastic_band.enable = False
+                self._band_released = True
+                print("[ElasticBand] Released — policy is now in control.")
             if self.elastic_band.enable and self.use_floating_root_link:
                 pose = np.concatenate(
                     [
@@ -413,12 +380,8 @@ class DefaultEnv:
             else:
                 self.mj_data.xfrc_applied[self.band_attached_link] = np.zeros(6)
         body_torques = self.compute_body_torques()
-        hand_torques = self.compute_hand_torques()
         # -1: actuator array is 0-based while joint indices from the model are 1-based
         self.torques[self.body_joint_index - 1] = body_torques
-        if self.num_hand_dof > 0:
-            self.torques[self.left_hand_index - 1] = hand_torques[: self.num_hand_dof]
-            self.torques[self.right_hand_index - 1] = hand_torques[self.num_hand_dof :]
 
         self.torques = np.clip(self.torques, -self.torque_limit, self.torque_limit)
 

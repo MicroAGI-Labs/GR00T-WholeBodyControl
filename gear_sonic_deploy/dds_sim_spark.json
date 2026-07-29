@@ -1,0 +1,6 @@
+{
+  "Participant": {
+    "DomainId": 0,
+    "Config": "<?xml version=\"1.0\" encoding=\"UTF-8\" ?><CycloneDDS><Domain Id=\"any\"><General><Interfaces><NetworkInterface name=\"lo\" priority=\"default\" multicast=\"false\" /></Interfaces></General><Discovery><ParticipantIndex>auto</ParticipantIndex><MaxAutoParticipantIndex>99</MaxAutoParticipantIndex><Peers><Peer Address=\"127.0.0.1\" /></Peers></Discovery></Domain></CycloneDDS>"
+  }
+}

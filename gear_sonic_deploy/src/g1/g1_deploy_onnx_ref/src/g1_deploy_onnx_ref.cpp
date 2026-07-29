@@ -46,25 +46,32 @@
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
 #include <cmath>
+#include <cstdlib>
 #include <cuda_runtime_api.h>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <stdexcept>
 #include <pthread.h>
 #include <sched.h>
 #include <array>
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <unistd.h>
+#include <fcntl.h>
 #include <cstring>
 #include <functional>
 #include <unordered_map>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <chrono>
 #include <algorithm>
 #include <numeric>
+#include <atomic>
 
 // DDS
 #include <unitree/robot/channel/channel_publisher.hpp>
@@ -130,11 +137,13 @@
 // Control policy
 #include "../include/control_policy.hpp"
 
-// Dex3 hands
-#include "../include/dex3_hands.hpp"
+// Inspire RH56E2 hands
+#include "../include/inspire_rh56e2_hands.hpp"
 
 // Error monitor
 #include "../include/error_monitor.hpp"
+#include "../include/walk_to_idle_transition.hpp"
+#include "../include/per_joint_motion_limiter.hpp"
 
 #include "audio_thread/audio_thread.hpp"
 
@@ -154,7 +163,7 @@ using namespace unitree_hg::msg::dds_;
  *  - PolicyEngine (TensorRT control policy)
  *  - EncoderEngine (optional TensorRT observation encoder)
  *  - LocalMotionPlannerBase (optional TensorRT locomotion planner)
- *  - Dex3Hands (optional Dex3 hand controller)
+ *  - InspireRh56e2Hands
  *  - StateLogger (ring buffer + CSV persistence)
  *  - OutputInterface(s) (ZMQ / ROS2 state publishers)
  *  - MotionDataReader (pre-loaded reference motions)
@@ -165,7 +174,7 @@ using namespace unitree_hg::msg::dds_;
 class G1Deploy {
   private:
     /// State machine for the control loop lifecycle.
-    enum class ProgramState { INIT, WAIT_FOR_CONTROL, CONTROL };
+    enum class ProgramState { INIT, WAIT_FOR_CONTROL, CONTROL, RECOVER_DAMPING };
     
     // =========================================================================
     // Core timing, mode, and counters
@@ -222,32 +231,51 @@ class G1Deploy {
     std::string planner_path;
     std::unique_ptr<LocalMotionPlannerBase> planner_;
     std::shared_ptr<MotionSequence> planner_motion_;
+    // The locomotion planner's learned IDLE clip is not necessarily the pose
+    // the robot is actually standing in.  In sim that mismatch can put the
+    // low-level policy into a perpetual balance-recovery step.  For the
+    // opt-in stationary-IDLE mode, replace only the IDLE reference with the
+    // measured pose at the point the new clip is accepted.  WALK and all other
+    // generated motions remain untouched.
+    bool idle_hold_reference_enabled_ = false;
+    double idle_hold_pitch_bias_rad_ = 0.0;
+    double idle_hold_root_height_ = -1.0;
+    // Blend the 12 leg-joint IDLE references from the measured handoff pose
+    // toward SONIC's native standing angles.  Zero preserves the measured-pose
+    // hold; one requests the complete native leg pose.  This changes reference
+    // observations only--the learned policy remains the low-level controller.
+    double idle_hold_leg_blend_ = 0.0;
+    // Optional live IDLE target file: "<pitch-deg> <leg-blend>".  The measured
+    // handoff pose is retained as an immutable baseline and new targets are
+    // slewed onto the active stationary clip without restarting the deploy.
+    std::string idle_reference_file_;
+    std::array<double, G1_NUM_MOTOR> idle_hold_baseline_q_ = {};
+    std::array<double, 4> idle_hold_baseline_quat_ = {1.0, 0.0, 0.0, 0.0};
+    bool idle_hold_baseline_valid_ = false;
+    bool idle_hold_motion_active_ = false;
+    double idle_target_pitch_bias_rad_ = 0.0;
+    double idle_target_leg_blend_ = 0.0;
+    std::chrono::steady_clock::time_point idle_reference_next_check_ = {};
+    std::atomic<bool> next_planner_motion_is_idle_{true};
     
-    // Movement momentum system
-    MovementState last_movement_state_ = MovementState(static_cast<int>(LocomotionMode::IDLE), {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, -1.0f, -1.0f);
+    // Planner command state. Requested WALK -> IDLE changes pass through a
+    // model-native deceleration before the final IDLE request.
+    MovementState last_planner_state_ = MovementState(static_cast<int>(LocomotionMode::IDLE), {0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}, -1.0f, -1.0f);
+    WalkToIdleTransition walk_to_idle_transition_;
     float replan_interval_running_ = 0.1;
     float replan_interval_crawling_ = 0.2;
     float replan_interval_boxing_ = 1.0;
     float replan_interval_ = 1.0;
     float replan_interval_counter_ = 0.0f;
 
-    // Idle-mode error-based readaptation with double-threshold state machine.
-    // States: IDLE (do nothing), ADAPTING (toward robot state), RECOVERING (toward planner target).
-    // Each state has a trigger threshold (enter) and stop threshold (exit).
-    enum class IdleReadaptState { IDLE, ADAPTING, RECOVERING };
-    std::array<double, 29> idle_readapt_original_targets_{};
-    bool idle_readapt_stored_ = false;
-    IdleReadaptState idle_readapt_state_ = IdleReadaptState::IDLE;
-    static constexpr double kAdaptTrigger  = 0.10;   // rad: start adapting
-    static constexpr double kAdaptStop     = 0.05;   // rad: stop adapting → IDLE
-    static constexpr double kRecoverTrigger = 0.045;  // rad: start recovering
-
-    
     // =========================================================================
     // Low-level robot I/O buffers, channels, and threads
     // =========================================================================
     // Flag to disable CRC checking for MuJoCo simulation
     bool disable_crc_check_ = false;
+    double pred_horizon_s_ = 0.0;  ///< Forward state-prediction horizon (s) to cancel round-trip control-loop delay; 0 = off (real robot / unchanged).
+    double gain_kp_scale_ = 1.0;   ///< Multiplier on commanded kp (lower = softer/lower-bandwidth = more delay-tolerant); 1.0 = unchanged.
+    double gain_kd_scale_ = 1.0;   ///< Multiplier on commanded kd; 1.0 = unchanged.
     
     bool reinitialize_heading_ = true;
     bool report_temperature_ = false;
@@ -278,11 +306,70 @@ class G1Deploy {
     // =========================================================================
     std::unique_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
     
-    // Dex3 hands manager
-    Dex3Hands dex3_hands_;
+    InspireRh56e2Hands hands_;
 
     // Motor error monitor (tracks fault state transitions)
     ErrorMonitor error_monitor_;
+
+    // Final 500 Hz position-command envelope. Each joint owns independent
+    // budget, braking, and fault state; a joint event never damps another.
+    bool joint_limiter_enabled_ = true;
+    bool joint_limiter_terminating_ = false;
+    bool joint_limiter_position_window_enabled_ = false;
+    bool joint_limiter_delta_v_window_enabled_ = false;
+    bool joint_limiter_task_authority_enabled_ = false;
+    double joint_limiter_task_authority_level_ = 1.0;
+    double joint_limiter_waist_authority_level_ = 1.0;
+    std::string joint_limiter_profile_ = "always-on-energy-envelope";
+    std::string joint_limiter_level_file_;
+    double joint_limiter_level_ = 1.0;
+    std::atomic<bool> joint_limiter_active_for_policy_{true};
+    double joint_limiter_level_min_ = 1.0;
+    double joint_limiter_level_max_ = 1.0;
+    std::uint64_t joint_limiter_level_changes_ = 0;
+    std::uint64_t joint_limiter_bypass_ticks_ = 0;
+    int joint_limiter_level_refresh_ticks_ = 0;
+    bool joint_limiter_has_target_timestamp_ = false;
+    std::chrono::steady_clock::time_point joint_limiter_last_target_timestamp_{};
+    std::uint64_t joint_limiter_target_age_samples_ = 0;
+    double joint_limiter_target_age_sum_ms_ = 0.0;
+    double joint_limiter_target_age_max_ms_ = 0.0;
+    static constexpr std::size_t kJointLimiterTimingSamples = 100000;
+    std::array<std::uint32_t, kJointLimiterTimingSamples>
+        joint_limiter_timing_ns_{};
+    std::size_t joint_limiter_timing_cursor_ = 0;
+    std::size_t joint_limiter_timing_population_ = 0;
+    std::uint64_t joint_limiter_timing_calls_ = 0;
+    std::uint64_t joint_limiter_deadline_misses_ = 0;
+    std::uint64_t joint_limiter_wall_timing_max_ns_ = 0;
+    std::uint64_t joint_limiter_last_transition_log_tick_ = 0;
+    sonic::safety::PerJointMotionLimiter joint_limiter_{
+        sonic::safety::SharedSafetyLimits()};
+    std::array<sonic::safety::JointState, G1_NUM_MOTOR>
+        joint_limiter_last_logged_state_{};
+    // Seed SONIC's first target from measured position while external support
+    // remains engaged. Handover alpha is lifecycle timing only; subsequent
+    // 50 Hz targets are consumed directly and any high-energy discontinuity is
+    // projected in equivalent servo-torque space by the 500 Hz limiter.
+    double joint_limiter_handover_duration_s_ = 0.1;
+    double joint_limiter_handover_trigger_rad_ = 0.01;
+    double joint_limiter_prime_desired_error_rad_ = 0.10;
+    double joint_limiter_prime_tracking_error_rad_ = 0.30;
+    double joint_limiter_prime_window_fraction_ = 0.50;
+    double joint_limiter_prime_stable_duration_s_ = 0.10;
+    std::array<double, G1_NUM_MOTOR> joint_limiter_handover_start_q_{};
+    double joint_limiter_handover_elapsed_s_ = 0.0;
+    double joint_limiter_handover_alpha_ = 0.0;
+    bool joint_limiter_handover_started_ = false;
+    bool joint_limiter_handover_complete_logged_ = false;
+    std::uint64_t joint_limiter_prime_stable_ticks_ = 0;
+    std::uint64_t joint_limiter_prime_ready_tick_ = 0;
+    bool joint_limiter_prime_ready_ = false;
+    bool joint_limiter_prime_failed_ = false;
+    double joint_limiter_prime_max_desired_error_rad_ = 0.0;
+    bool joint_limiter_prime_has_endpoint_error_ = false;
+    double joint_limiter_prime_max_tracking_error_rad_ = 0.0;
+    double joint_limiter_prime_max_window_fraction_ = 0.0;
 
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
@@ -296,8 +383,26 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
     ProgramState program_state_;
     std::array<double, G1_NUM_MOTOR> last_action;
+    std::mutex last_action_mutex_;
+    std::atomic<bool> continuous_first_policy_target_pending_{false};
     std::array<double, 7> last_left_hand_action;
     std::array<double, 7> last_right_hand_action;
+
+    // ---- Auto-recovery (SIM_RESILIENCE_PLAN.md Workstream B) ----------------
+    // When the LowState feed drops (network flap / sidecar bounce / shm glitch)
+    // the control loop enters RECOVER_DAMPING (emit damping, keep threads alive)
+    // instead of terminally stopping; when the feed returns fresh AND advancing
+    // for auto_recover_stable_, it soft-ramps from the measured pose (reusing the
+    // INIT ramp) and auto-resumes CONTROL with the pre-loss mode -- no operator
+    // input. Enabled by default (strict improvement on the real robot too);
+    // AUTO_RECOVER=0 restores the old terminal-stop behaviour.
+    bool auto_recover_enabled_ = true;
+    std::chrono::milliseconds auto_recover_absent_{1000};  ///< feed age/frozen -> damp (~1s; ride out flaps/jitter)
+    std::chrono::milliseconds auto_recover_stable_{300};   ///< healthy this long -> re-arm
+    bool auto_resume_pending_ = false;                    ///< INIT should auto-start CONTROL
+    uint32_t last_health_tick_ = 0;                       ///< frozen-feed detection
+    std::chrono::steady_clock::time_point last_tick_change_{};
+    std::chrono::steady_clock::time_point feed_healthy_since_{};
     
     // =========================================================================
     // Logging / recording streams
@@ -305,6 +410,8 @@ class G1Deploy {
     std::unique_ptr<std::ofstream> target_motion_file_;
     std::unique_ptr<std::ofstream> planner_motion_file_;
     std::unique_ptr<std::ofstream> policy_input_file_;
+    std::unique_ptr<std::ofstream> idle_telemetry_file_;
+    uint64_t idle_telemetry_rows_ = 0;
     std::unique_ptr<std::ofstream> record_input_file_;
     std::unique_ptr<std::ifstream> playback_input_file_;
 
@@ -319,7 +426,7 @@ class G1Deploy {
     // =========================================================================
     std::array<double, 3> initial_vr_3point_compliance_ = {0.5, 0.5, 0.0};
     
-    // Initial max close ratio for Dex3 hands (set from command line)
+    // Initial max close ratio for the RH56E2 hands (set from command line)
     // Default 1.0 allows full closure, use --max-close-ratio to limit
     // Keyboard controls (J/K) always available for runtime adjustment
     double initial_max_close_ratio_ = 1.0;
@@ -332,6 +439,18 @@ class G1Deploy {
     int logging_counter_ = 0;
     TimestampedData<LowState_> used_low_state_data_;
     TimestampedData<IMUState_> used_imu_torso_data_;
+
+    // Optional MuJoCo episode clock. In slow/offscreen simulation, the normal
+    // wall-clock recurrent threads otherwise advance against stale LowState
+    // while rendering or VLA inference has physics paused. Each worker keeps
+    // its trained logical dt but executes only when the shared simulator clock
+    // reaches its next deadline.
+    std::string sim_clock_path_;
+    int sim_clock_fd_ = -1;
+    std::mutex sim_clock_fd_mutex_;
+    double control_next_sim_time_ = -1.0;
+    double planner_next_sim_time_ = -1.0;
+    double writer_next_sim_time_ = -1.0;
 
     // State logger
     std::unique_ptr<StateLogger> state_logger_;
@@ -533,6 +652,45 @@ class G1Deploy {
           );
         }
       }
+      return true;
+    }
+
+    bool ReadSimulatorClock(double& episode_time, double& active_time) {
+      if (sim_clock_path_.empty()) return false;
+      if (sim_clock_fd_ < 0) {
+        std::lock_guard<std::mutex> lock(sim_clock_fd_mutex_);
+        if (sim_clock_fd_ < 0) sim_clock_fd_ = open(sim_clock_path_.c_str(), O_RDONLY);
+      }
+      if (sim_clock_fd_ < 0) return false;
+      double values[2] = {0.0, -1.0};
+      const ssize_t count = pread(sim_clock_fd_, values, sizeof(values), 0);
+      if (count != static_cast<ssize_t>(sizeof(values)) ||
+          !std::isfinite(values[0]) || !std::isfinite(values[1])) {
+        return false;
+      }
+      episode_time = values[0];
+      active_time = values[1];
+      return true;
+    }
+
+    bool SimulatorTickDue(double logical_period, double& next_time) {
+      double episode_time = 0.0;
+      double active_time = -1.0;
+      // Retain wall cadence only while MuJoCo physics is frozen at t=0 so the
+      // deploy initialization ramp and operator commands cannot deadlock. As
+      // soon as physics advances, gate on episode time even before scoring:
+      // otherwise 50 Hz wall cadence at 0.5 RTF becomes 100 Hz in simulator
+      // time and advances SONIC's recurrent state twice as fast as the robot.
+      if (!ReadSimulatorClock(episode_time, active_time) ||
+          (active_time < 0.0 && episode_time <= 1e-9)) {
+        next_time = -1.0;
+        return true;
+      }
+      if (next_time < 0.0 || episode_time + logical_period < next_time) {
+        next_time = episode_time;
+      }
+      if (episode_time + 1e-9 < next_time) return false;
+      next_time += logical_period;
       return true;
     }
 
@@ -2128,6 +2286,10 @@ class G1Deploy {
   public:
     OperatorState operator_state;
 
+    // When false we still read LowState from the real G1 and run the full policy,
+    // but we never send motor commands to the robot (safe "log only" mode).
+    bool actuate_robot_ = true;
+
     G1Deploy(
       std::string networkInterface,
       std::string model_file_path,
@@ -2139,6 +2301,7 @@ class G1Deploy {
       std::string target_motion_file_path = "",
       std::string planner_motion_file_path = "",
       std::string policy_input_file_path = "",
+      std::string idle_telemetry_file_path = "",
       std::string input_type = "keyboard",
       std::string output_type = "zmq",
       std::string record_input_file_path = "",
@@ -2178,11 +2341,59 @@ class G1Deploy {
         model_path(model_file_path),
         planner_path(planner_file_path) {
       
-      // Initialize ChannelFactory
-      ChannelFactory::Instance()->Init(0, networkInterface);
+      // Initialize ChannelFactory. DDS domain is configurable via the DDS_DOMAIN env
+      // var (default 0) so multiple deploys can run concurrently on the same host,
+      // each isolated on its own domain (e.g. MuJoCo on domain 0, Isaac on domain 1).
+      const char* _dds_domain_env = std::getenv("DDS_DOMAIN");
+      int _dds_domain = _dds_domain_env ? std::atoi(_dds_domain_env) : 0;
+      // Simulation and hardware use the same limiter implementation and exact
+      // positive-level envelope. Level zero is a simulator-only diagnostic
+      // bypass; positive level values no longer scale safety authority.
+      ConfigureJointLimiterPriming();
+      ConfigureJointLimiterWindows();
+      ConfigureJointLimiterLevelFile();
+      joint_limiter_last_logged_state_.fill(
+          sonic::safety::JointState::kFollowing);
+      std::cout << "[JOINT-LIMITER] enabled="
+                << (joint_limiter_enabled_ ? "true" : "false")
+                << " profile=" << joint_limiter_profile_
+                << " limiting_level=" << joint_limiter_level_
+                << " position_window="
+                << (joint_limiter_position_window_enabled_ ? "true" : "false")
+                << " delta_v_window="
+                << (joint_limiter_delta_v_window_enabled_ ? "true" : "false")
+                << " task_authority_level="
+                << (joint_limiter_task_authority_enabled_
+                        ? std::to_string(joint_limiter_task_authority_level_)
+                        : "off")
+                << " waist_authority_level="
+                << (joint_limiter_task_authority_enabled_
+                        ? std::to_string(joint_limiter_waist_authority_level_)
+                        : "off")
+                << " window_s=" << joint_limiter_.limits().window_duration
+                << " writer_dt_s=" << joint_limiter_.limits().writer_dt
+                << std::endl;
+      const char* _dds_config_env = std::getenv("DDS_CONFIG_FILE");
+      if (_dds_config_env && *_dds_config_env) {
+        std::cout << "[deploy] DDS config file = " << _dds_config_env << std::endl;
+        ChannelFactory::Instance()->Init(std::string(_dds_config_env));
+      } else {
+        std::cout << "[deploy] DDS domain = " << _dds_domain
+                  << " (interface '" << networkInterface << "')" << std::endl;
+        ChannelFactory::Instance()->Init(_dds_domain, networkInterface);
+      }
 
-      // Initialize Dex3 hands (ChannelFactory already initialized above)
-      dex3_hands_.initialize("");
+      const char* _instance_env = std::getenv("SONIC_INSTANCE_ID");
+      const char* _topic_prefix_env = std::getenv("SONIC_TOPIC_PREFIX");
+      std::cout << "[deploy] SONIC instance="
+                << (_instance_env && *_instance_env ? _instance_env : "default")
+                << " topic_prefix="
+                << (_topic_prefix_env && *_topic_prefix_env ? _topic_prefix_env : "<physical-default>")
+                << std::endl;
+
+      // RH56E2 is the only supported hand configuration.
+      hands_.initialize("");
+      std::cout << "[deploy] hand_model=inspire-rh56e2" << std::endl;
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2216,6 +2427,55 @@ class G1Deploy {
         policy_input_file_ = std::make_unique<std::ofstream>(policy_input_file_path, std::ios::app);
       }
 
+      if (!idle_telemetry_file_path.empty()) {
+        idle_telemetry_file_ =
+            std::make_unique<std::ofstream>(idle_telemetry_file_path,
+                                            std::ios::out | std::ios::trunc);
+        if (!*idle_telemetry_file_) {
+          throw std::runtime_error("cannot open idle telemetry file: " +
+                                   idle_telemetry_file_path);
+        }
+        (*idle_telemetry_file_)
+            << "seq,controller_time_s,frame,movement_mode,"
+               "ref_px,ref_py,ref_pz,ref_qw,ref_qx,ref_qy,ref_qz,"
+               "meas_qw,meas_qx,meas_qy,meas_qz,"
+               "meas_wx,meas_wy,meas_wz";
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",ref_q" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",ref_dq" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",meas_q" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",meas_dq" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",meas_tau" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",cmd_q" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",cmd_dq" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",cmd_tau" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",cmd_kp" << i;
+        }
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          (*idle_telemetry_file_) << ",cmd_kd" << i;
+        }
+        (*idle_telemetry_file_) << '\n';
+        idle_telemetry_file_->flush();
+        std::cout << "[idle-telemetry] recording synchronized reference/state/command to "
+                  << idle_telemetry_file_path << std::endl;
+      }
+
       if(!record_input_file_path.empty())
       {
         // clear existing file:
@@ -2236,28 +2496,61 @@ class G1Deploy {
 
       movement_state_buffer_.SetData(MovementState());
 
+      { const char* e = std::getenv("SONIC_IDLE_HOLD_REFERENCE");
+        if (e) idle_hold_reference_enabled_ = (std::string(e) != "0"); }
+      { const char* e = std::getenv("SONIC_IDLE_PITCH_BIAS_DEG");
+        if (e) {
+          const double degrees = std::clamp(std::atof(e), -20.0, 20.0);
+          idle_hold_pitch_bias_rad_ = degrees * M_PI / 180.0;
+        }
+      }
+      { const char* e = std::getenv("SONIC_IDLE_LEG_BLEND");
+        if (e) idle_hold_leg_blend_ = std::clamp(std::atof(e), 0.0, 1.0); }
+      { const char* e = std::getenv("SONIC_IDLE_ROOT_HEIGHT");
+        if (e) idle_hold_root_height_ = std::clamp(std::atof(e), 0.5, 1.2); }
+      idle_target_pitch_bias_rad_ = idle_hold_pitch_bias_rad_;
+      idle_target_leg_blend_ = idle_hold_leg_blend_;
+      { const char* e = std::getenv("SONIC_IDLE_REFERENCE_FILE");
+        if (e) idle_reference_file_ = e; }
+      std::cout << "[deploy] SONIC_IDLE_HOLD_REFERENCE="
+                << (idle_hold_reference_enabled_ ? "on" : "off")
+                << " (IDLE target = measured pose at transition, pitch bias="
+                << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg, leg blend="
+                << idle_hold_leg_blend_ << ", root height="
+                << idle_hold_root_height_ << ")" << std::endl;
+      if (!idle_reference_file_.empty()) {
+        std::cout << "[idle-hold] live reference file: " << idle_reference_file_
+                  << " (format: <pitch-deg> <leg-blend>)" << std::endl;
+      }
+
       // Initialize planner motion state as shared_ptr
       planner_motion_ = std::make_shared<MotionSequence>();
       planner_motion_->ReserveCapacity(1500, 29, 1, 1, 0, 0);
       planner_motion_->timesteps = 0;
       planner_motion_->name = "planner_motion";
       // try to shutdown motion control-related service
-      msc_ = std::make_unique<unitree::robot::b2::MotionSwitcherClient>();
-      msc_->SetTimeout(5.0f);
-      msc_->Init();
-      std::string form, name;
-      while (msc_->CheckMode(form, name), !name.empty()) {
-        if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
-        sleep(5);
+      const char* _skip_msc_env = std::getenv("SONIC_SKIP_MOTION_SWITCHER");
+      const bool _skip_msc = _skip_msc_env && std::string(_skip_msc_env) != "0";
+      if (_skip_msc) {
+        std::cout << "[deploy] skipping MotionSwitcher client (simulation mode)" << std::endl;
+      } else {
+        msc_ = std::make_unique<unitree::robot::b2::MotionSwitcherClient>();
+        msc_->SetTimeout(5.0f);
+        msc_->Init();
+        std::string form, name;
+        while (msc_->CheckMode(form, name), !name.empty()) {
+          if (msc_->ReleaseMode()) std::cout << "Failed to switch to Release Mode\n";
+          std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
       }
 
       // create publisher
-      lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(HG_CMD_TOPIC));
+      lowcmd_publisher_.reset(new ChannelPublisher<LowCmd_>(SonicDdsTopic(HG_CMD_TOPIC)));
       lowcmd_publisher_->InitChannel();
       // create subscriber
-      lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(HG_STATE_TOPIC));
+      lowstate_subscriber_.reset(new ChannelSubscriber<LowState_>(SonicDdsTopic(HG_STATE_TOPIC)));
       lowstate_subscriber_->InitChannel(std::bind(&G1Deploy::LowStateHandler, this, std::placeholders::_1), 1);
-      imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(HG_IMU_TORSO));
+      imutorso_subscriber_.reset(new ChannelSubscriber<IMUState_>(SonicDdsTopic(HG_IMU_TORSO)));
       imutorso_subscriber_->InitChannel(std::bind(&G1Deploy::imuTorsoHandler, this, std::placeholders::_1), 1);
       // Load motion data
       if (motion_reader_.ReadFromCSV(motion_data_path)) {
@@ -2393,6 +2686,16 @@ class G1Deploy {
       if (!planner_path.empty()) {
         PlannerConfig planner_config;
         planner_config.model_path = planner_path;
+        if (const char* seed_text = std::getenv("SONIC_EPISODE_SEED")) {
+          char* end = nullptr;
+          const long seed = std::strtol(seed_text, &end, 10);
+          if (end == seed_text || *end != '\0' || seed < 0 ||
+              seed >= (1L << 31)) {
+            throw std::runtime_error(
+                "SONIC_EPISODE_SEED must be an integer in [0, 2^31)");
+          }
+          planner_config.initial_random_seed = static_cast<int>(seed);
+        }
         if (planner_path.find("V0") != std::string::npos)
         {
           planner_config.version = 0;
@@ -2515,7 +2818,7 @@ class G1Deploy {
         input_interface_->SetVR3PointCompliance(initial_vr_3point_compliance_);
         // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
         input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
-        dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        hands_.SetMaxCloseRatio(initial_max_close_ratio_);
         std::cout << "[INFO] Initial VR 3-point compliance: ["
                   << initial_vr_3point_compliance_[0] << ", "
                   << initial_vr_3point_compliance_[1] << ", "
@@ -2573,16 +2876,60 @@ class G1Deploy {
         std::cout << "Total output interfaces initialized: " << output_interfaces_.size() << std::endl;
       }
 
+      // Wall-clock rate scale for sim2sim timing alignment. When the target sim can't
+      // run at real time (e.g. single-env Isaac PhysX caps at RTF~0.86), the deploy's
+      // fixed wall-clock threads over-sample the slow sim in sim-time and destabilize the
+      // balance policy. Dividing every thread PERIOD by CONTROL_WALL_SCALE (=sim RTF) slows
+      // the whole deploy to the sim's wall rate WITHOUT touching the policy's control_dt_
+      // (=0.02) math, so control/planner/writer all land at their trained rates in
+      // sim-time. Default 1.0 == unchanged (real robot / MuJoCo unaffected).
+      double wall_scale = 1.0;
+      { const char* e = std::getenv("CONTROL_WALL_SCALE");
+        if (e) { double v = std::atof(e); if (v > 0.05 && v <= 2.0) wall_scale = v; } }
+      std::cout << "[deploy] CONTROL_WALL_SCALE=" << wall_scale
+                << " (thread periods /= scale; 1.0 = real-time / unchanged)" << std::endl;
+
+      { const char* e = std::getenv("SIM_CLOCK_PATH");
+        if (e && *e) sim_clock_path_ = e; }
+      std::cout << "[deploy] SIM_CLOCK_PATH="
+                << (sim_clock_path_.empty() ? "off" : sim_clock_path_)
+                << " (active MuJoCo clock gates control/planner/writer)" << std::endl;
+
+      // Forward state-prediction horizon (s): on receipt, extrapolate LowState/IMU
+      // forward by this many seconds (q += dq*T, quaternion integrated by gyro) to
+      // cancel the ~40ms round-trip control-loop delay (network + async gaps) that
+      // eats the stiff SONIC policy's phase margin at RTF~1.0. Set to the measured
+      // effective loop delay. 0 = off (real robot / MuJoCo unchanged).
+      { const char* e = std::getenv("PRED_HORIZON_S");
+        if (e) { double v = std::atof(e); if (v >= 0.0 && v <= 0.2) pred_horizon_s_ = v; } }
+      std::cout << "[deploy] PRED_HORIZON_S=" << pred_horizon_s_
+                << " (forward state prediction to cancel loop delay; 0 = off)" << std::endl;
+
+      // Auto-recovery (SIM_RESILIENCE_PLAN.md Workstream B): on LowState feed loss,
+      // drop to damping and auto-resume when it returns instead of terminal-stopping.
+      // Default on (strict improvement on the real robot too). AUTO_RECOVER=0 restores
+      // the old terminal-stop path. Thresholds tunable via env (ms).
+      { const char* e = std::getenv("AUTO_RECOVER");
+        if (e) auto_recover_enabled_ = (std::string(e) != "0"); }
+      { const char* e = std::getenv("AUTO_RECOVER_ABSENT_MS");
+        if (e) { int v = std::atoi(e); if (v >= 40 && v <= 5000) auto_recover_absent_ = std::chrono::milliseconds(v); } }
+      { const char* e = std::getenv("AUTO_RECOVER_STABLE_MS");
+        if (e) { int v = std::atoi(e); if (v >= 50 && v <= 10000) auto_recover_stable_ = std::chrono::milliseconds(v); } }
+      std::cout << "[deploy] AUTO_RECOVER=" << (auto_recover_enabled_ ? "on" : "off")
+                << " absent=" << auto_recover_absent_.count() << "ms"
+                << " stable=" << auto_recover_stable_.count() << "ms"
+                << " (feed-loss -> damping -> auto re-arm; 0 = terminal stop)" << std::endl;
+
       // create threads
-      input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
-      command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
+      input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6 / wall_scale, &G1Deploy::Input, this);
+      command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6 / wall_scale,
                                                     &G1Deploy::LowCommandWriter, this);
       control_thread_ptr_ =
-          CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_dt_ * 1e6, &G1Deploy::Control, this);
-      
+          CreateRecurrentThreadEx("control", UT_CPU_ID_NONE, control_dt_ * 1e6 / wall_scale, &G1Deploy::Control, this);
+
       if (planner_) {
         planner_thread_ptr_ =
-          CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6, &G1Deploy::Planner, this);
+          CreateRecurrentThreadEx("planner", UT_CPU_ID_NONE, planner_dt_ * 1e6 / wall_scale, &G1Deploy::Planner, this);
       }
           
       SetThreadPriority();
@@ -2590,17 +2937,464 @@ class G1Deploy {
 
     ~G1Deploy()
     {
+      if (sim_clock_fd_ >= 0) {
+        close(sim_clock_fd_);
+        sim_clock_fd_ = -1;
+      }
       // CUDA resources are now cleaned up by the PolicyEngine and planner classes automatically
     }
 
     void SetThreadPriority() {
+      const char* topic_prefix = std::getenv("SONIC_TOPIC_PREFIX");
+      const char* cpu_env = std::getenv("SONIC_CPU_ID");
+      const bool simulation_instance = topic_prefix && *topic_prefix;
+      if (simulation_instance && !(cpu_env && *cpu_env)) {
+        std::cout << "[deploy] simulation instance: CPU affinity disabled" << std::endl;
+        return;
+      }
+
       struct sched_param param;
       param.sched_priority = sched_get_priority_max(SCHED_FIFO);
       pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
+      int cpu_id = 0;
+      if (cpu_env && *cpu_env) {
+        cpu_id = std::atoi(cpu_env);
+      }
+      if (cpu_id < 0 || cpu_id >= CPU_SETSIZE) {
+        std::cerr << "[deploy] ignoring invalid SONIC_CPU_ID=" << cpu_id << std::endl;
+        return;
+      }
       cpu_set_t cpuset;
       CPU_ZERO(&cpuset);
-      CPU_SET(0, &cpuset);
+      CPU_SET(cpu_id, &cpuset);
       pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+      std::cout << "[deploy] main thread pinned to CPU " << cpu_id << std::endl;
+    }
+
+    /// Live-refresh commanded-gain scales from GAIN_SCALE_FILE (default /tmp/gain_scale),
+    /// format "<kp_scale> <kd_scale>" ~every 0.5s so the effective control bandwidth can
+    /// be swept without restarting the deploy. Missing/invalid leaves current values.
+    void MaybeRefreshGainScale() {
+      static int c = 0;
+      if (++c < 250) return;   // ~every 0.5s at 500Hz
+      c = 0;
+      const char* f = std::getenv("GAIN_SCALE_FILE");
+      std::ifstream in(f ? f : "/tmp/gain_scale");
+      double kp, kd;
+      if (in >> kp >> kd && kp > 0.05 && kp <= 2.0 && kd > 0.05 && kd <= 4.0) {
+        gain_kp_scale_ = kp; gain_kd_scale_ = kd;
+      }
+    }
+
+    void ConfigureJointLimiterPriming() {
+      const auto read_bounded = [](const char* name, double& value,
+                                   double minimum, double maximum) {
+        const char* text = std::getenv(name);
+        if (!(text && *text)) return;
+        const double requested = std::atof(text);
+        if (std::isfinite(requested) && requested >= minimum &&
+            requested <= maximum) {
+          value = requested;
+        } else {
+          std::cerr << "[JOINT-LIMITER-PRIME] ignoring invalid " << name
+                    << '=' << text << std::endl;
+        }
+      };
+      read_bounded("SONIC_JOINT_LIMITER_HANDOVER_S",
+                   joint_limiter_handover_duration_s_, 0.1, 20.0);
+      read_bounded("SONIC_JOINT_LIMITER_HANDOVER_TRIGGER_RAD",
+                   joint_limiter_handover_trigger_rad_, 0.001, 0.5);
+      read_bounded("SONIC_JOINT_LIMITER_PRIME_DESIRED_ERROR_RAD",
+                   joint_limiter_prime_desired_error_rad_, 0.001, 1.0);
+      read_bounded("SONIC_JOINT_LIMITER_PRIME_TRACKING_ERROR_RAD",
+                   joint_limiter_prime_tracking_error_rad_, 0.001, 1.0);
+      read_bounded("SONIC_JOINT_LIMITER_PRIME_WINDOW_FRACTION",
+                   joint_limiter_prime_window_fraction_, 0.0, 1.0);
+      read_bounded("SONIC_JOINT_LIMITER_PRIME_STABLE_S",
+                   joint_limiter_prime_stable_duration_s_, 0.02, 10.0);
+      std::cout << "[JOINT-LIMITER-PRIME] config handover_s="
+                << joint_limiter_handover_duration_s_
+                << " handover_trigger_rad="
+                << joint_limiter_handover_trigger_rad_
+                << " desired_error_rad="
+                << joint_limiter_prime_desired_error_rad_
+                << " tracking_error_rad="
+                << joint_limiter_prime_tracking_error_rad_
+                << " window_fraction="
+                << joint_limiter_prime_window_fraction_
+                << " stable_s=" << joint_limiter_prime_stable_duration_s_
+                << std::endl;
+    }
+
+    void ResetJointLimiterPriming(
+        const std::array<double, G1_NUM_MOTOR>& measured) {
+      joint_limiter_handover_start_q_ = measured;
+      joint_limiter_handover_elapsed_s_ = 0.0;
+      joint_limiter_handover_alpha_ = 0.0;
+      joint_limiter_handover_started_ = false;
+      joint_limiter_handover_complete_logged_ = false;
+      joint_limiter_prime_stable_ticks_ = 0;
+      joint_limiter_prime_ready_tick_ = 0;
+      joint_limiter_prime_ready_ = false;
+      joint_limiter_prime_failed_ = false;
+      joint_limiter_prime_max_desired_error_rad_ = 0.0;
+      joint_limiter_prime_has_endpoint_error_ = false;
+      joint_limiter_prime_max_tracking_error_rad_ = 0.0;
+      joint_limiter_prime_max_window_fraction_ = 0.0;
+      joint_limiter_has_target_timestamp_ = false;
+      joint_limiter_last_target_timestamp_ = {};
+      joint_limiter_target_age_samples_ = 0;
+      joint_limiter_target_age_sum_ms_ = 0.0;
+      joint_limiter_target_age_max_ms_ = 0.0;
+      joint_limiter_timing_cursor_ = 0;
+      joint_limiter_timing_population_ = 0;
+      joint_limiter_timing_calls_ = 0;
+      joint_limiter_deadline_misses_ = 0;
+      joint_limiter_wall_timing_max_ns_ = 0;
+      joint_limiter_last_transition_log_tick_ = 0;
+    }
+
+    void ApplyJointLimiterContinuousHandover(
+        const std::array<double, G1_NUM_MOTOR>& desired,
+        const std::array<double, G1_NUM_MOTOR>& measured,
+        bool desired_fresh, bool new_target) {
+      if (!desired_fresh || joint_limiter_prime_ready_) return;
+      if (!joint_limiter_handover_started_) {
+        if (!new_target) return;
+        double max_raw_desired_delta = 0.0;
+        for (std::size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+          max_raw_desired_delta = std::max(
+              max_raw_desired_delta, std::abs(desired[i] - measured[i]));
+        }
+        // Fresh measured-position holds are published before the planner has
+        // produced its first real target. Do not consume the handover on that
+        // placeholder stream; wait for a material SONIC command transition.
+        if (max_raw_desired_delta < joint_limiter_handover_trigger_rad_) return;
+        joint_limiter_handover_start_q_ = measured;
+        joint_limiter_handover_elapsed_s_ = 0.0;
+        joint_limiter_handover_alpha_ = 0.0;
+        joint_limiter_handover_started_ = true;
+        std::cout << "[JOINT-LIMITER-PRIME] handover_started; first "
+                     "reference seeded at measured position; raw_delta_rad="
+                  << max_raw_desired_delta
+                  << std::endl;
+      }
+
+      // SONIC keeps evolving while support is present. The alpha gates support
+      // release only; it never blends or interpolates SONIC targets.
+      joint_limiter_handover_alpha_ = std::clamp(
+          joint_limiter_handover_elapsed_s_ /
+              joint_limiter_handover_duration_s_,
+          0.0, 1.0);
+      if (joint_limiter_handover_alpha_ >= 1.0 &&
+          !joint_limiter_handover_complete_logged_) {
+        joint_limiter_handover_complete_logged_ = true;
+        std::cout << "[JOINT-LIMITER-PRIME] handover_complete; limiter follows "
+                     "live SONIC targets"
+                  << std::endl;
+      }
+      joint_limiter_handover_elapsed_s_ = std::min(
+          joint_limiter_handover_duration_s_,
+          joint_limiter_handover_elapsed_s_ +
+              joint_limiter_.limits().writer_dt);
+    }
+
+    void UpdateJointLimiterPriming(
+        const std::array<double, G1_NUM_MOTOR>& desired,
+        const std::array<double, G1_NUM_MOTOR>& measured,
+        const sonic::safety::Output& limited,
+        bool desired_fresh) {
+      if (joint_limiter_prime_ready_ || !joint_limiter_handover_started_) return;
+      const auto& limits = joint_limiter_.limits();
+      double max_desired_error = 0.0;
+      double max_tracking_error = 0.0;
+      double max_window_fraction = 0.0;
+      std::size_t max_desired_error_joint = 0;
+      std::size_t max_tracking_error_joint = 0;
+      std::size_t max_window_fraction_joint = 0;
+      bool faulted = false;
+      bool tracking_converged = true;
+      for (std::size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+        // Priming evaluates whether the projected 500 Hz command has reached
+        // the current SONIC target. It does not require the static load-bearing
+        // command position to equal measured position.
+        const double desired_error =
+            std::abs(limited.position[i] - limited.target_position[i]);
+        if (desired_error > max_desired_error) {
+          max_desired_error = desired_error;
+          max_desired_error_joint = i;
+        }
+        // A transparent position command may intentionally remain separated
+        // from measured q to produce the static PD torque required for stance.
+        // In v5, readiness therefore means the projected command has caught
+        // the current SONIC target; requiring q_command ~= q_measured would
+        // reject ordinary load-bearing targets and recreate startup lag.
+        const double tracking_error =
+            limits.transparent_torque_projection
+                ? desired_error
+                : std::abs(measured[i] - limited.position[i]);
+        if (tracking_error > max_tracking_error) {
+          max_tracking_error = tracking_error;
+          max_tracking_error_joint = i;
+        }
+        tracking_converged &= tracking_error <= std::min(
+            limits.prime_tracking_error[i],
+            joint_limiter_prime_tracking_error_rad_);
+        const double full_window_budget =
+            limits.max_window_velocity[i] * limits.window_duration;
+        if (limits.enforce_position_window && full_window_budget > 0.0) {
+          const double window_fraction =
+              limited.window_motion[i] / full_window_budget;
+          if (window_fraction > max_window_fraction) {
+            max_window_fraction = window_fraction;
+            max_window_fraction_joint = i;
+          }
+        }
+        faulted |= limited.state[i] ==
+            sonic::safety::JointState::kJointFault;
+      }
+      if (limited.target_endpoint_sample) {
+        joint_limiter_prime_max_desired_error_rad_ = max_desired_error;
+        joint_limiter_prime_has_endpoint_error_ = true;
+      }
+      const double endpoint_desired_error =
+          joint_limiter_prime_has_endpoint_error_
+              ? joint_limiter_prime_max_desired_error_rad_
+              : std::numeric_limits<double>::infinity();
+      joint_limiter_prime_max_tracking_error_rad_ = max_tracking_error;
+      joint_limiter_prime_max_window_fraction_ = max_window_fraction;
+
+      if (faulted && !joint_limiter_prime_failed_) {
+        joint_limiter_prime_failed_ = true;
+        std::cout << "[JOINT-LIMITER-PRIME] failed joint_fault_before_release "
+                     "alpha="
+                  << joint_limiter_handover_alpha_
+                  << " endpoint_desired_error_rad=" << endpoint_desired_error
+                  << " max_tracking_error_rad=" << max_tracking_error
+                  << " max_window_fraction=" << max_window_fraction
+                  << std::endl;
+      }
+
+      const bool converged = desired_fresh && !faulted &&
+          joint_limiter_handover_alpha_ >= 1.0 &&
+          joint_limiter_prime_has_endpoint_error_ &&
+          endpoint_desired_error <= joint_limiter_prime_desired_error_rad_ &&
+          tracking_converged &&
+          max_window_fraction <= joint_limiter_prime_window_fraction_;
+      if (converged) {
+        ++joint_limiter_prime_stable_ticks_;
+      } else {
+        joint_limiter_prime_stable_ticks_ = 0;
+      }
+
+      const std::uint64_t tick = joint_limiter_.stats()[0].ticks;
+      if (tick % 250 == 0) {
+        std::cout << "[JOINT-LIMITER-PRIME] status tick=" << tick
+                  << " alpha=" << joint_limiter_handover_alpha_
+                  << " endpoint_desired_error_rad=" << endpoint_desired_error
+                  << " current_desired_error_joint="
+                  << max_desired_error_joint
+                  << " endpoint_sample=" << limited.target_endpoint_sample
+                  << " max_tracking_error_rad=" << max_tracking_error
+                  << " max_tracking_error_joint=" << max_tracking_error_joint
+                  << " max_window_fraction=" << max_window_fraction
+                  << " max_window_fraction_joint="
+                  << max_window_fraction_joint
+                  << " stable_ticks=" << joint_limiter_prime_stable_ticks_
+                  << " faulted=" << faulted << std::endl;
+      }
+
+      const std::uint64_t required_ticks = static_cast<std::uint64_t>(
+          std::ceil(joint_limiter_prime_stable_duration_s_ /
+                    limits.writer_dt));
+      if (joint_limiter_prime_stable_ticks_ >= required_ticks) {
+        joint_limiter_prime_ready_ = true;
+        joint_limiter_prime_ready_tick_ = tick;
+        std::cout << "[JOINT-LIMITER-PRIME] ready tick=" << tick
+                  << " alpha=" << joint_limiter_handover_alpha_
+                  << " endpoint_desired_error_rad=" << endpoint_desired_error
+                  << " max_tracking_error_rad=" << max_tracking_error
+                  << " max_window_fraction=" << max_window_fraction
+                  << " stable_s="
+                  << joint_limiter_prime_stable_ticks_ * limits.writer_dt
+                  << std::endl;
+      }
+    }
+
+    bool ReadJointLimiterLevel(double& level) const {
+      if (joint_limiter_level_file_.empty()) return false;
+      std::ifstream input(joint_limiter_level_file_);
+      double requested = 0.0;
+      if (!(input >> requested) || !std::isfinite(requested) ||
+          requested < 0.0 || requested > 1.0) {
+        return false;
+      }
+      level = requested;
+      return true;
+    }
+
+    static bool ReadBooleanEnvironment(const char* name, bool& value) {
+      const char* text = std::getenv(name);
+      if (!(text && *text)) return false;
+      if (std::strcmp(text, "1") == 0 || std::strcmp(text, "true") == 0) {
+        value = true;
+        return true;
+      }
+      if (std::strcmp(text, "0") == 0 || std::strcmp(text, "false") == 0) {
+        value = false;
+        return true;
+      }
+      std::cerr << "[JOINT-LIMITER] invalid " << name << "=" << text
+                << "; expected 0, 1, false, or true" << std::endl;
+      return false;
+    }
+
+    sonic::safety::Limits JointLimiterLimitsForLevel(double level) const {
+      auto limits = sonic::safety::SafetyLimitsForLevel(level);
+      limits.enforce_position_window =
+          joint_limiter_position_window_enabled_;
+      limits.enforce_delta_v_window =
+          joint_limiter_delta_v_window_enabled_;
+      return limits;
+    }
+
+    void ConfigureJointLimiterWindows() {
+      bool position_enabled = false;
+      bool delta_v_enabled = false;
+      ReadBooleanEnvironment("SONIC_JOINT_LIMITER_POSITION_WINDOW_ENABLED",
+                             position_enabled);
+      ReadBooleanEnvironment("SONIC_JOINT_LIMITER_DELTA_V_WINDOW_ENABLED",
+                             delta_v_enabled);
+      joint_limiter_position_window_enabled_ = position_enabled;
+      joint_limiter_delta_v_window_enabled_ = delta_v_enabled;
+      if (std::getenv("SONIC_JOINT_LIMITER_TASK_AUTHORITY_LEVEL") ||
+          std::getenv("SONIC_JOINT_LIMITER_WAIST_AUTHORITY_LEVEL")) {
+        std::cerr << "[JOINT-LIMITER] task-authority overrides are retired; "
+                     "using the invariant always-on envelope" << std::endl;
+      }
+      joint_limiter_ = sonic::safety::PerJointMotionLimiter(
+          JointLimiterLimitsForLevel(joint_limiter_level_));
+    }
+
+    void ConfigureJointLimiterLevelFile() {
+      const char* path = std::getenv("SONIC_JOINT_LIMITER_LEVEL_FILE");
+      if (!(path && *path)) return;
+      if (!disable_crc_check_) {
+        std::cerr << "[JOINT-LIMITER] ignoring simulation-only live level file "
+                  << "outside --disable-crc-check mode" << std::endl;
+        return;
+      }
+      joint_limiter_level_file_ = path;
+      double requested = 1.0;
+      if (ReadJointLimiterLevel(requested)) {
+        joint_limiter_level_ = requested;
+        joint_limiter_active_for_policy_.store(requested > 0.0);
+        if (requested > 0.0) {
+          joint_limiter_ = sonic::safety::PerJointMotionLimiter(
+              JointLimiterLimitsForLevel(requested));
+        }
+      }
+      joint_limiter_level_min_ = joint_limiter_level_;
+      joint_limiter_level_max_ = joint_limiter_level_;
+      std::cout << "[JOINT-LIMITER] simulation live level file="
+                << joint_limiter_level_file_ << std::endl;
+    }
+
+    void MaybeRefreshJointLimiterLevel(
+        const std::array<double, G1_NUM_MOTOR>& measured) {
+      if (joint_limiter_level_file_.empty()) return;
+      if (++joint_limiter_level_refresh_ticks_ < 50) return;
+      joint_limiter_level_refresh_ticks_ = 0;
+      double requested = joint_limiter_level_;
+      if (!ReadJointLimiterLevel(requested) ||
+          std::abs(requested - joint_limiter_level_) < 1.0e-12) {
+        return;
+      }
+
+      if (requested > 0.0) {
+        sonic::safety::PerJointMotionLimiter replacement(
+            JointLimiterLimitsForLevel(requested));
+        if (!replacement.Seed(measured)) {
+          std::cerr << "[JOINT-LIMITER] rejected live limiting level change; "
+                       "measured-state reseed failed" << std::endl;
+          return;
+        }
+        joint_limiter_ = std::move(replacement);
+        ResetJointLimiterPriming(measured);
+      } else {
+        // Level zero is an exact writer bypass. Replace the stateful limiter as
+        // well so telemetry after the change cannot be confused with the
+        // previous limited segment.
+        auto limits = sonic::safety::SharedSafetyLimits();
+        limits.enforce_position_window =
+            joint_limiter_position_window_enabled_;
+        limits.enforce_delta_v_window =
+            joint_limiter_delta_v_window_enabled_;
+        joint_limiter_ = sonic::safety::PerJointMotionLimiter(limits);
+      }
+      joint_limiter_level_ = requested;
+      joint_limiter_active_for_policy_.store(requested > 0.0);
+      joint_limiter_level_min_ =
+          std::min(joint_limiter_level_min_, requested);
+      joint_limiter_level_max_ =
+          std::max(joint_limiter_level_max_, requested);
+      ++joint_limiter_level_changes_;
+      joint_limiter_last_logged_state_.fill(
+          sonic::safety::JointState::kFollowing);
+      std::cout << "[JOINT-LIMITER] live limiting_level=" << requested
+                << " (" << requested * 100.0 << "%; ";
+      if (requested > 0.0) {
+        std::cout << "joints reseeded, windows and fault state cleared";
+      } else {
+        std::cout << "exact bypass, limiter state cleared";
+      }
+      std::cout << ')' << std::endl;
+    }
+
+    /// Live-refresh pred_horizon_s_ from PRED_HORIZON_FILE (default /tmp/pred_horizon)
+    /// ~every 0.5s so the prediction horizon can be swept without restarting the
+    /// deploy. Missing/invalid file leaves the current (env-seeded) value untouched.
+    void MaybeRefreshPredHorizon() {
+      static int c = 0;
+      if (++c < 50) return;
+      c = 0;
+      const char* f = std::getenv("PRED_HORIZON_FILE");
+      std::ifstream in(f ? f : "/tmp/pred_horizon");
+      double v;
+      if (in >> v && v >= 0.0 && v <= 0.2) pred_horizon_s_ = v;
+    }
+
+    /// First-order forward integration of an IMU orientation quaternion by its
+    /// own body-frame gyro over T seconds (q += 0.5*q(x)(0,omega)*T, renormalized).
+    /// Quaternion order is [w,x,y,z]; gyro is body-frame rad/s.
+    void PredictImuForward(IMUState_& imu, double T) {
+      auto& q = imu.quaternion();
+      const auto& g = imu.gyroscope();
+      double qw = q[0], qx = q[1], qy = q[2], qz = q[3];
+      double wx = g[0], wy = g[1], wz = g[2];
+      double dw = 0.5 * (-qx * wx - qy * wy - qz * wz);
+      double dx = 0.5 * ( qw * wx + qy * wz - qz * wy);
+      double dy = 0.5 * ( qw * wy - qx * wz + qz * wx);
+      double dz = 0.5 * ( qw * wz + qx * wy - qy * wx);
+      qw += dw * T; qx += dx * T; qy += dy * T; qz += dz * T;
+      double n = std::sqrt(qw * qw + qx * qx + qy * qy + qz * qz);
+      if (n > 1e-9) { qw /= n; qx /= n; qy /= n; qz /= n; }
+      q[0] = static_cast<float>(qw); q[1] = static_cast<float>(qx);
+      q[2] = static_cast<float>(qy); q[3] = static_cast<float>(qz);
+    }
+
+    /// Extrapolate a LowState forward by T seconds to cancel the round-trip
+    /// control-loop delay (network + async gaps): joint positions advance by
+    /// q += dq*T, and the pelvis IMU orientation is integrated by its gyro.
+    /// This restores the phase margin the stiff SONIC policy loses to loop delay.
+    /// Feature-flagged: T=0 is a no-op (real robot / MuJoCo unchanged).
+    void PredictLowStateForward(LowState_& ls, double T) {
+      if (T <= 0.0) return;
+      auto& ms = ls.motor_state();
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        ms[i].q() = static_cast<float>(ms[i].q() + ms[i].dq() * T);
+      }
+      PredictImuForward(ls.imu_state(), T);
     }
 
     /// DDS callback: receives a 500 Hz LowState message from the robot SDK.
@@ -2633,6 +3427,12 @@ class G1Deploy {
         error_monitor_.update(motorstates);
       }
 
+      // Cancel round-trip loop delay by extrapolating the freshly-received state
+      // forward (no-op when PRED_HORIZON_S=0). Applied after CRC so downstream
+      // consumers (all read low_state_buffer_ directly) see the predicted state.
+      MaybeRefreshPredHorizon();
+      PredictLowStateForward(low_state, pred_horizon_s_);
+
       low_state_buffer_.SetData(low_state);
 
       // update mode machine
@@ -2645,6 +3445,7 @@ class G1Deploy {
     /// DDS callback: receives secondary (torso) IMU data.
     void imuTorsoHandler(const void* message) {
       IMUState_ imu_torso = *(const IMUState_*)message;
+      if (pred_horizon_s_ > 0.0) PredictImuForward(imu_torso, pred_horizon_s_);
       imu_torso_buffer_.SetData(imu_torso);
     }
 
@@ -2653,34 +3454,597 @@ class G1Deploy {
      *
      * Reads the latest MotorCommand from motor_command_buffer_, packs it
      * into a LowCmd_ DDS message with CRC, and publishes via DDS.
-     * Also publishes Dex3 hand commands at the same cadence.
+     * Also publishes RH56E2 hand commands at the same cadence.
      */
-    void LowCommandWriter() {
+    void LowCommandWriter() { WriteLowCommand(false); }
+
+    void WriteLowCommand(bool force) {
+      if (!force && !SimulatorTickDue(publish_dt_, writer_next_sim_time_)) return;
       LowCmd_ dds_low_command;
       dds_low_command.mode_pr() = static_cast<uint8_t>(mode_pr_);
       dds_low_command.mode_machine() = mode_machine_;
 
-      const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
+      MaybeRefreshGainScale();
+      const auto mc_data = motor_command_buffer_.GetDataWithTime();
+      const std::shared_ptr<const MotorCommand> mc = mc_data.data;
       if (mc) {
+        sonic::safety::Output limited;
+        bool limiting_active =
+            joint_limiter_enabled_ && joint_limiter_level_ > 0.0;
+        if (joint_limiter_enabled_) {
+          const auto low_state_data = low_state_buffer_.GetDataWithTime();
+          if (!low_state_data.data ||
+              low_state_data.data->motor_state().size() < G1_NUM_MOTOR) {
+            static bool missing_state_logged = false;
+            if (!missing_state_logged) {
+              std::cerr << "[JOINT-LIMITER] no complete LowState; withholding "
+                           "all new body commands" << std::endl;
+              missing_state_logged = true;
+            }
+            if (limiting_active) {
+              return;
+            }
+          } else {
+            std::array<double, G1_NUM_MOTOR> desired{};
+            std::array<double, G1_NUM_MOTOR> raw_desired{};
+            std::array<double, G1_NUM_MOTOR> desired_velocity{};
+            std::array<double, G1_NUM_MOTOR> effective_kp{};
+            std::array<double, G1_NUM_MOTOR> effective_kd{};
+            std::array<double, G1_NUM_MOTOR> feedforward_torque{};
+            std::array<double, G1_NUM_MOTOR> measured{};
+            std::array<double, G1_NUM_MOTOR> measured_velocity{};
+            for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+              raw_desired[i] = mc->q_target.at(i);
+              desired[i] = raw_desired[i];
+              desired_velocity[i] = mc->dq_target.at(i);
+              effective_kp[i] = mc->kp.at(i) * gain_kp_scale_;
+              effective_kd[i] = mc->kd.at(i) * gain_kd_scale_;
+              feedforward_torque[i] = mc->tau_ff.at(i);
+              measured[i] = low_state_data.data->motor_state()[i].q();
+              measured_velocity[i] = low_state_data.data->motor_state()[i].dq();
+            }
+            MaybeRefreshJointLimiterLevel(measured);
+            limiting_active = joint_limiter_level_ > 0.0;
+            if (limiting_active) {
+              if (!joint_limiter_.seeded()) {
+                if (!joint_limiter_.Seed(measured)) {
+                  std::cerr << "[JOINT-LIMITER] measured-state seed rejected; "
+                               "withholding all new body commands" << std::endl;
+                  return;
+                }
+                ResetJointLimiterPriming(measured);
+                std::cout << "[JOINT-LIMITER] seeded all 29 joints from measured q; "
+                             "moving windows empty" << std::endl;
+              }
+              // The planner-to-POSE switch can pause MotorCommand production
+              // for more than 100 ms even though control is healthy. Treating
+              // that short gap as termination drags every q_out toward q and
+              // creates a second whole-body acceleration transient when the
+              // next fresh command arrives. A real termination remains
+              // immediate through joint_limiter_terminating_; the age guard
+              // still rejects a genuinely stalled producer after 500 ms.
+              const double motor_command_age_ms = mc_data.GetAgeMs();
+              const bool desired_fresh = motor_command_age_ms >= 0.0 &&
+                                         motor_command_age_ms <= 500.0;
+              const bool accept_desired =
+                  desired_fresh && !joint_limiter_terminating_;
+              bool new_target = false;
+              double target_interval_s = control_dt_;
+              if (accept_desired &&
+                  (!joint_limiter_has_target_timestamp_ ||
+                   mc_data.timestamp > joint_limiter_last_target_timestamp_)) {
+                new_target = true;
+                if (joint_limiter_has_target_timestamp_) {
+                  // DataBuffer timestamps are wall-clock values. In a gated
+                  // simulator the authoritative interval is the logical 50 Hz
+                  // control period because wall RTF varies with rendering and
+                  // policy load. Hardware has no simulation clock and uses the
+                  // measured monotonic publication interval.
+                  target_interval_s = sim_clock_path_.empty()
+                      ? std::chrono::duration<double>(
+                            mc_data.timestamp -
+                            joint_limiter_last_target_timestamp_)
+                                .count()
+                      : control_dt_;
+                }
+                joint_limiter_last_target_timestamp_ = mc_data.timestamp;
+                joint_limiter_has_target_timestamp_ = true;
+              }
+              if (motor_command_age_ms >= 0.0) {
+                ++joint_limiter_target_age_samples_;
+                joint_limiter_target_age_sum_ms_ += motor_command_age_ms;
+                joint_limiter_target_age_max_ms_ = std::max(
+                    joint_limiter_target_age_max_ms_, motor_command_age_ms);
+              }
+              ApplyJointLimiterContinuousHandover(
+                  desired, measured, accept_desired, new_target);
+              const auto limiter_start = std::chrono::steady_clock::now();
+              struct timespec limiter_cpu_start {};
+              struct timespec limiter_cpu_end {};
+              clock_gettime(CLOCK_THREAD_CPUTIME_ID, &limiter_cpu_start);
+              limited = joint_limiter_.StepWithServo(
+                  desired, desired_velocity, effective_kp, effective_kd,
+                  feedforward_torque, measured, measured_velocity,
+                  accept_desired, new_target, target_interval_s);
+              clock_gettime(CLOCK_THREAD_CPUTIME_ID, &limiter_cpu_end);
+              const auto limiter_wall_elapsed_ns =
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - limiter_start)
+                      .count();
+              const std::int64_t limiter_cpu_elapsed_ns =
+                  static_cast<std::int64_t>(
+                      limiter_cpu_end.tv_sec - limiter_cpu_start.tv_sec) *
+                      1000000000LL +
+                  (limiter_cpu_end.tv_nsec - limiter_cpu_start.tv_nsec);
+              const auto bounded_elapsed_ns = static_cast<std::uint32_t>(
+                  std::min<std::int64_t>(
+                      limiter_cpu_elapsed_ns,
+                      std::numeric_limits<std::uint32_t>::max()));
+              joint_limiter_timing_ns_[joint_limiter_timing_cursor_] =
+                  bounded_elapsed_ns;
+              joint_limiter_timing_cursor_ =
+                  (joint_limiter_timing_cursor_ + 1) %
+                  kJointLimiterTimingSamples;
+              joint_limiter_timing_population_ = std::min(
+                  joint_limiter_timing_population_ + 1,
+                  kJointLimiterTimingSamples);
+              ++joint_limiter_timing_calls_;
+              joint_limiter_wall_timing_max_ns_ = std::max<std::uint64_t>(
+                  joint_limiter_wall_timing_max_ns_,
+                  static_cast<std::uint64_t>(limiter_wall_elapsed_ns));
+              if (limiter_wall_elapsed_ns >= 2000000)
+                ++joint_limiter_deadline_misses_;
+              UpdateJointLimiterPriming(
+                  desired, measured, limited, accept_desired);
+              std::ostringstream transition_batch;
+              bool have_transition_batch = false;
+              const std::uint64_t transition_tick =
+                  joint_limiter_.stats()[0].ticks;
+              const bool transition_log_allowed =
+                  transition_tick >= joint_limiter_last_transition_log_tick_ +
+                                         50;
+              for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+                const auto state = limited.state[i];
+                const auto previous_state = joint_limiter_last_logged_state_[i];
+                const bool actual_motion_braking =
+                    std::abs(measured_velocity[i]) >
+                    joint_limiter_.limits().measured_velocity_brake[i];
+                // Log each entry into an active limiter state with enough
+                // context to distinguish command shaping, actual-motion
+                // braking, and a latched local joint fault. Normal-state
+                // transitions are intentionally silent to avoid changing
+                // control-loop timing through excessive stdout traffic.
+                if (state != previous_state &&
+                    state != sonic::safety::JointState::kFollowing) {
+                  const auto& limits = joint_limiter_.limits();
+                  const auto& stats = joint_limiter_.stats()[i];
+                  const auto fault_reason = joint_limiter_.fault_reasons()[i];
+                  const double elapsed_s =
+                      static_cast<double>(stats.ticks) * limits.writer_dt;
+                  const double window_budget =
+                      limits.max_window_velocity[i] * limits.window_duration;
+                  const double delta_v_budget =
+                      limits.max_window_acceleration[i] *
+                      limits.delta_v_window_duration;
+                  if (state != sonic::safety::JointState::kJointFault) {
+                    if (!transition_log_allowed) {
+                      joint_limiter_last_logged_state_[i] = state;
+                      continue;
+                    }
+                    // Fresh/stale target boundaries commonly transition all
+                    // joints together. Batch RATE_LIMITED and BRAKING events
+                    // into one stream write; flushing 29 detailed lines from
+                    // the 500 Hz writer can stall DDS and therefore physics.
+                    if (!have_transition_batch) {
+                      transition_batch
+                          << "[JOINT-LIMITER-TRANSITIONS] tick=" << stats.ticks
+                          << " t_s=" << elapsed_s << " joints=";
+                    } else {
+                      transition_batch << ',';
+                    }
+                    have_transition_batch = true;
+                    transition_batch
+                        << i << "(state="
+                        << sonic::safety::JointStateName(state)
+                        << ";fresh=" << limited.accepting_desired
+                        << ";flags="
+                        << (limited.step_limited[i] ? 'S' : '-')
+                        << (limited.acceleration_limited[i] ? 'A' : '-')
+                        << (limited.jerk_limited[i] ? 'J' : '-')
+                        << (limited.window_limited[i] ? 'W' : '-')
+                        << (limited.acceleration_window_limited[i] ? 'D' : '-')
+                        << (limited.tracking_limited[i] ? 'T' : '-')
+                        << ";reasons=" << limited.reasons[i]
+                        << ";q=" << measured[i]
+                        << ";raw=" << raw_desired[i]
+                        << ";shaped=" << desired[i]
+                        << ";goal=" << limited.target_position[i]
+                        << ";out=" << limited.position[i]
+                        << ";dq=" << measured_velocity[i]
+                        << ";dqout=" << limited.velocity[i]
+                        << ";window=" << limited.window_motion[i]
+                        << ";delta_v_window=" << limited.window_delta_v[i]
+                        << '/' << delta_v_budget << ')';
+                  } else {
+                    std::cout << "[JOINT-LIMITER-EVENT] tick=" << stats.ticks
+                            << " t_s=" << elapsed_s
+                            << " joint=" << i
+                            << " from="
+                            << sonic::safety::JointStateName(previous_state)
+                            << " state=" << sonic::safety::JointStateName(state)
+                            << " fault_reason="
+                            << sonic::safety::JointFaultReasonName(fault_reason)
+                            << " accepting_desired=" << limited.accepting_desired
+                            << " step_limited=" << limited.step_limited[i]
+                            << " acceleration_limited="
+                            << limited.acceleration_limited[i]
+                            << " jerk_limited=" << limited.jerk_limited[i]
+                            << " window_limited=" << limited.window_limited[i]
+                            << " delta_v_window_limited="
+                            << limited.acceleration_window_limited[i]
+                            << " tracking_limited=" << limited.tracking_limited[i]
+                            << " actual_motion_braking=" << actual_motion_braking
+                            << " reasons=" << limited.reasons[i]
+                            << " q_measured=" << measured[i]
+                            << " q_des_raw=" << raw_desired[i]
+                            << " q_des=" << desired[i]
+                            << " q_out=" << limited.position[i]
+                            << " dq_measured=" << measured_velocity[i]
+                            << " dq_out=" << limited.velocity[i]
+                            << " ddq_out=" << limited.acceleration[i]
+                            << " ddq_measured_filtered="
+                            << limited.measured_acceleration[i]
+                            << " window_motion=" << limited.window_motion[i]
+                            << " window_delta_v=" << limited.window_delta_v[i]
+                            << " requested_velocity="
+                            << limited.requested_velocity[i]
+                            << " permitted_velocity="
+                            << limited.permitted_velocity[i]
+                            << " requested_acceleration="
+                            << limited.requested_acceleration[i]
+                            << " drive_acceleration_limit="
+                            << limited.drive_acceleration_limit[i]
+                            << " burst_distance_factor="
+                            << limited.burst_distance_factor[i]
+                            << " burst_velocity_factor="
+                            << limited.burst_velocity_factor[i]
+                            << " instant_velocity_cap="
+                            << limits.max_instant_velocity[i]
+                            << " acceleration_cap=" << limits.max_acceleration[i]
+                            << " jerk_cap=" << limits.max_jerk[i]
+                            << " window_budget=" << window_budget
+                            << " tracking_error_cap="
+                            << limits.max_tracking_error[i]
+                            << " measured_velocity_brake="
+                            << limits.measured_velocity_brake[i]
+                            << " measured_velocity_fault="
+                            << limits.measured_velocity_fault[i]
+                            << " measured_acceleration_brake="
+                            << limits.measured_acceleration_brake[i]
+                            << " measured_acceleration_fault="
+                            << limits.measured_acceleration_fault[i]
+                            << " local_damping=" << limited.local_damping[i]
+                            << " other_joints_unaffected=true" << std::endl;
+                  }
+                }
+                joint_limiter_last_logged_state_[i] = state;
+              }
+              if (have_transition_batch) {
+                std::cout << transition_batch.str() << std::endl;
+                joint_limiter_last_transition_log_tick_ = transition_tick;
+              }
+            }
+          }
+          if (!limiting_active) ++joint_limiter_bypass_ticks_;
+        }
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
           dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
-          dds_low_command.motor_cmd().at(i).tau() = mc->tau_ff.at(i);
-          dds_low_command.motor_cmd().at(i).q() = mc->q_target.at(i);
-          dds_low_command.motor_cmd().at(i).dq() = mc->dq_target.at(i);
-          dds_low_command.motor_cmd().at(i).kp() = mc->kp.at(i);
-          dds_low_command.motor_cmd().at(i).kd() = mc->kd.at(i);
+          const bool local_damping =
+              limiting_active && limited.local_damping[i];
+          dds_low_command.motor_cmd().at(i).tau() =
+              local_damping ? 0.0 : mc->tau_ff.at(i);
+          dds_low_command.motor_cmd().at(i).q() = limiting_active
+              ? limited.position[i] : mc->q_target.at(i);
+          dds_low_command.motor_cmd().at(i).dq() =
+              local_damping ? 0.0 : mc->dq_target.at(i);
+          dds_low_command.motor_cmd().at(i).kp() = local_damping
+              ? 0.0 : mc->kp.at(i) * gain_kp_scale_;
+          dds_low_command.motor_cmd().at(i).kd() = local_damping
+              ? 8.0 : mc->kd.at(i) * gain_kd_scale_;
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-        lowcmd_publisher_->Write(dds_low_command);
+
+        if (actuate_robot_) {
+          lowcmd_publisher_->Write(dds_low_command);
+        } else {
+          // Log-only mode: print what we *would* have sent (very useful for validation)
+          static int log_counter = 0;
+          if ((log_counter++ % 50) == 0 && mc) {   // print every ~0.1s
+            std::cout << "[LOG-ONLY] Would send LowCmd (first 6 joints): ";
+            for (int j = 0; j < 6 && j < G1_NUM_MOTOR; ++j) {
+              std::cout << "q[" << j << "]=" << std::fixed << std::setprecision(3)
+                        << mc->q_target.at(j) << " ";
+            }
+            std::cout << "..." << std::endl;
+          }
+        }
       }
 
-      // Publish Dex3 hand commands at the same publish cadence
-      dex3_hands_.writeOnce();
+      // Publish the RH56E2 command at the same writer cadence.
+      hands_.writeOnce();
     }
 
-    /// Gracefully stop all threads and send a damping-only command.
+    void PrintJointLimiterSummary() const {
+      const auto& stats = joint_limiter_.stats();
+      const auto& faults = joint_limiter_.fault_reasons();
+      const auto& target_stats = joint_limiter_.target_stats();
+      std::vector<std::uint32_t> timing_samples;
+      timing_samples.reserve(joint_limiter_timing_population_);
+      for (std::size_t index = 0; index < joint_limiter_timing_population_;
+           ++index) {
+        timing_samples.push_back(joint_limiter_timing_ns_[index]);
+      }
+      std::sort(timing_samples.begin(), timing_samples.end());
+      const auto timing_percentile_us = [&](double fraction) {
+        if (timing_samples.empty()) return 0.0;
+        const auto index = static_cast<std::size_t>(
+            fraction * static_cast<double>(timing_samples.size() - 1));
+        return static_cast<double>(timing_samples[index]) / 1000.0;
+      };
+      std::cout << "[JOINT-LIMITER-SUMMARY] {\"enabled\":"
+                << (joint_limiter_enabled_ ? "true" : "false")
+                << ",\"schema_version\":4"
+                << ",\"algorithm\":\"state-dependent-torque-projection-v5\""
+                << ",\"profile\":\"" << joint_limiter_profile_ << "\""
+                << ",\"limiting_level\":" << joint_limiter_level_
+                << ",\"limiting_level_min\":" << joint_limiter_level_min_
+                << ",\"limiting_level_max\":" << joint_limiter_level_max_
+                << ",\"limiting_level_changes\":" << joint_limiter_level_changes_
+                << ",\"position_window_enforcing\":"
+                << (joint_limiter_.limits().enforce_position_window
+                        ? "true" : "false")
+                << ",\"transparent_torque_projection\":"
+                << (joint_limiter_.limits().transparent_torque_projection
+                        ? "true" : "false")
+                << ",\"delta_v_window_enforcing\":"
+                << (joint_limiter_.limits().enforce_delta_v_window
+                        ? "true" : "false")
+                << ",\"task_authority_enabled\":"
+                << (joint_limiter_task_authority_enabled_ ? "true" : "false")
+                << ",\"task_authority_level\":"
+                << (joint_limiter_task_authority_enabled_
+                        ? joint_limiter_task_authority_level_
+                        : joint_limiter_level_)
+                << ",\"waist_authority_level\":"
+                << (joint_limiter_task_authority_enabled_
+                        ? joint_limiter_waist_authority_level_
+                        : joint_limiter_level_)
+                << ",\"bypass_ticks\":" << joint_limiter_bypass_ticks_
+                << ",\"stats_since_level_change\":true"
+                << ",\"handover_duration_s\":"
+                << joint_limiter_handover_duration_s_
+                << ",\"handover_started\":"
+                << (joint_limiter_handover_started_ ? "true" : "false")
+                << ",\"handover_alpha\":" << joint_limiter_handover_alpha_
+                << ",\"prime_ready\":"
+                << (joint_limiter_prime_ready_ ? "true" : "false")
+                << ",\"prime_failed\":"
+                << (joint_limiter_prime_failed_ ? "true" : "false")
+                << ",\"prime_ready_tick\":"
+                << joint_limiter_prime_ready_tick_
+                << ",\"prime_max_desired_error_rad\":"
+                << joint_limiter_prime_max_desired_error_rad_
+                << ",\"prime_max_tracking_error_rad\":"
+                << joint_limiter_prime_max_tracking_error_rad_
+                << ",\"prime_max_window_fraction\":"
+                << joint_limiter_prime_max_window_fraction_
+                << ",\"window_s\":" << joint_limiter_.limits().window_duration
+                << ",\"measured_acceleration_window_s\":"
+                << joint_limiter_.limits().measured_acceleration_window
+                << ",\"measured_acceleration_filter_delay_s\":"
+                << joint_limiter_.measured_acceleration_filter_delay()
+                << ",\"measured_acceleration_enforcing\":"
+                << (joint_limiter_.limits().enforce_measured_acceleration
+                        ? "true" : "false")
+                << ",\"new_target_count\":" << target_stats.new_targets
+                << ",\"repeated_target_writer_ticks\":"
+                << target_stats.repeated_writer_ticks
+                << ",\"target_interval_min_s\":"
+                << (std::isfinite(target_stats.interval_min)
+                        ? target_stats.interval_min : 0.0)
+                << ",\"target_interval_mean_s\":"
+                << target_stats.interval_mean()
+                << ",\"target_interval_max_s\":"
+                << target_stats.interval_max
+                << ",\"target_age_mean_ms\":"
+                << (joint_limiter_target_age_samples_ > 0
+                        ? joint_limiter_target_age_sum_ms_ /
+                              static_cast<double>(joint_limiter_target_age_samples_)
+                        : 0.0)
+                << ",\"target_age_max_ms\":"
+                << joint_limiter_target_age_max_ms_
+                << ",\"limiter_timing_calls\":"
+                << joint_limiter_timing_calls_
+                << ",\"limiter_timing_clock\":\"thread_cpu\""
+                << ",\"limiter_timing_p50_us\":"
+                << timing_percentile_us(0.50)
+                << ",\"limiter_timing_p95_us\":"
+                << timing_percentile_us(0.95)
+                << ",\"limiter_timing_p99_us\":"
+                << timing_percentile_us(0.99)
+                << ",\"limiter_timing_p999_us\":"
+                << timing_percentile_us(0.999)
+                << ",\"limiter_timing_max_us\":"
+                << timing_percentile_us(1.0)
+                << ",\"limiter_wall_timing_max_us\":"
+                << static_cast<double>(joint_limiter_wall_timing_max_ns_) /
+                       1000.0
+                << ",\"limiter_deadline_misses\":"
+                << joint_limiter_deadline_misses_
+                << ",\"whole_body_damping_from_joint_faults\":0";
+      const auto print_u64 = [&](const char* name, auto getter) {
+        std::cout << ",\"" << name << "\":[";
+        for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+          if (i) std::cout << ',';
+          std::cout << getter(stats[i]);
+        }
+        std::cout << ']';
+      };
+      const auto print_double = [&](const char* name, auto getter) {
+        std::cout << ",\"" << name << "\":[";
+        for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+          if (i) std::cout << ',';
+          std::cout << getter(stats[i]);
+        }
+        std::cout << ']';
+      };
+      print_u64("command_limited_ticks",
+                [](const auto& s) { return s.command_limited_ticks; });
+      print_u64("measured_motion_braking_ticks",
+                [](const auto& s) { return s.measured_motion_braking_ticks; });
+      print_u64("lifecycle_hold_ticks",
+                [](const auto& s) { return s.lifecycle_hold_ticks; });
+      print_u64("fault_events", [](const auto& s) { return s.fault_events; });
+      print_u64("local_damping_ticks",
+                [](const auto& s) { return s.local_damping_ticks; });
+      print_u64("ticks", [](const auto& s) { return s.ticks; });
+      print_u64("max_command_limited_run_ticks",
+                [](const auto& s) { return s.max_command_limited_run; });
+      print_u64("emergency_tracking_corrections",
+                [](const auto& s) { return s.emergency_tracking_corrections; });
+      print_u64("mechanical_limit_ticks",
+                [](const auto& s) { return s.mechanical_limit_ticks; });
+      print_u64("target_offset_ticks",
+                [](const auto& s) { return s.target_offset_ticks; });
+      print_u64("tracking_limit_ticks",
+                [](const auto& s) { return s.tracking_limit_ticks; });
+      print_u64("velocity_limit_ticks",
+                [](const auto& s) { return s.velocity_limit_ticks; });
+      print_u64("acceleration_limit_ticks",
+                [](const auto& s) { return s.acceleration_limit_ticks; });
+      print_u64("peak_acceleration_limit_ticks",
+                [](const auto& s) { return s.peak_acceleration_limit_ticks; });
+      print_u64("sustained_acceleration_limit_ticks",
+                [](const auto& s) {
+                  return s.sustained_acceleration_limit_ticks;
+                });
+      print_u64("braking_acceleration_limit_ticks",
+                [](const auto& s) {
+                  return s.braking_acceleration_limit_ticks;
+                });
+      print_u64("jerk_limit_ticks",
+                [](const auto& s) { return s.jerk_limit_ticks; });
+      print_u64("position_window_limit_ticks",
+                [](const auto& s) { return s.position_window_limit_ticks; });
+      print_u64("delta_v_window_limit_ticks",
+                [](const auto& s) { return s.delta_v_window_limit_ticks; });
+      print_u64("measured_velocity_brake_ticks",
+                [](const auto& s) { return s.measured_velocity_brake_ticks; });
+      print_u64("measured_acceleration_brake_ticks",
+                [](const auto& s) { return s.measured_acceleration_brake_ticks; });
+      print_u64("target_stopping_ticks",
+                [](const auto& s) { return s.target_stopping_ticks; });
+      print_u64("stale_target_ticks",
+                [](const auto& s) { return s.stale_target_ticks; });
+      print_u64("termination_ticks",
+                [](const auto& s) { return s.termination_ticks; });
+      print_u64("servo_torque_limit_ticks",
+                [](const auto& s) { return s.servo_torque_limit_ticks; });
+      print_u64("torque_slew_ticks",
+                [](const auto& s) { return s.torque_slew_ticks; });
+      print_u64("mechanical_barrier_ticks",
+                [](const auto& s) { return s.mechanical_barrier_ticks; });
+      print_u64("velocity_energy_ticks",
+                [](const auto& s) { return s.velocity_energy_ticks; });
+      print_double("max_command_velocity_rad_s",
+                   [](const auto& s) { return s.max_command_velocity; });
+      print_double("max_command_acceleration_rad_s2",
+                   [](const auto& s) { return s.max_command_acceleration; });
+      print_double("max_command_jerk_rad_s3",
+                   [](const auto& s) { return s.max_command_jerk; });
+      print_double("max_window_motion_rad",
+                   [](const auto& s) { return s.max_window_motion; });
+      print_double("max_window_delta_v_rad_s",
+                   [](const auto& s) { return s.max_window_delta_v; });
+      print_double("max_measured_velocity_rad_s",
+                   [](const auto& s) { return s.max_measured_velocity; });
+      print_double("max_measured_acceleration_rad_s2",
+                   [](const auto& s) { return s.max_measured_acceleration; });
+      print_double("max_tracking_error_rad",
+                   [](const auto& s) { return s.max_tracking_error; });
+      print_double("max_requested_servo_torque_nm",
+                   [](const auto& s) { return s.max_requested_servo_torque; });
+      print_double("max_emitted_servo_torque_nm",
+                   [](const auto& s) { return s.max_emitted_servo_torque; });
+      print_double("max_servo_torque_step_nm",
+                   [](const auto& s) { return s.max_servo_torque_step; });
+      print_double("max_ordinary_servo_torque_step_nm",
+                   [](const auto& s) {
+                     return s.max_ordinary_servo_torque_step;
+                   });
+      const auto print_limit = [&](const char* name, const auto& values) {
+        std::cout << ",\"" << name << "\":[";
+        for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+          if (i) std::cout << ',';
+          std::cout << values[i];
+        }
+        std::cout << ']';
+      };
+      const auto& limits = joint_limiter_.limits();
+      print_limit("instant_velocity_caps_rad_s", limits.max_instant_velocity);
+      print_limit("peak_acceleration_caps_rad_s2", limits.peak_acceleration);
+      print_limit("sustained_acceleration_caps_rad_s2",
+                  limits.sustained_acceleration);
+      print_limit("braking_acceleration_caps_rad_s2",
+                  limits.braking_acceleration);
+      print_limit("burst_distance_rad", limits.burst_distance);
+      print_limit("burst_velocity_rad_s", limits.burst_velocity);
+      print_limit("acceleration_caps_rad_s2", limits.max_acceleration);
+      print_limit("jerk_caps_rad_s3", limits.max_jerk);
+      print_limit("window_velocity_caps_rad_s", limits.max_window_velocity);
+      print_limit("window_acceleration_caps_rad_s2",
+                  limits.max_window_acceleration);
+      print_limit("tracking_error_caps_rad", limits.max_tracking_error);
+      print_limit("prime_tracking_error_caps_rad",
+                  limits.prime_tracking_error);
+      print_limit("target_offset_caps_rad", limits.max_target_offset);
+      print_limit("mechanical_min_position_rad", limits.min_position);
+      print_limit("mechanical_max_position_rad", limits.max_position);
+      print_limit("mechanical_slowdown_distance_rad",
+                  limits.mechanical_slowdown_distance);
+      print_limit("minimum_convergence_time_s",
+                  limits.minimum_convergence_time);
+      print_limit("max_servo_torque_nm", limits.max_servo_torque);
+      print_limit("free_torque_step_nm", limits.free_torque_step);
+      print_limit("free_measured_velocity_rad_s",
+                  limits.free_measured_velocity);
+      print_limit("smoothing_measured_velocity_rad_s",
+                  limits.smoothing_measured_velocity);
+      print_limit("low_speed_torque_ramp_time_s",
+                  limits.low_speed_torque_ramp_time);
+      print_limit("high_speed_torque_ramp_time_s",
+                  limits.high_speed_torque_ramp_time);
+      print_limit("protective_braking_ramp_time_s",
+                  limits.protective_braking_ramp_time);
+      print_limit("measured_velocity_brake_rad_s", limits.measured_velocity_brake);
+      print_limit("measured_velocity_fault_rad_s", limits.measured_velocity_fault);
+      print_limit("measured_acceleration_brake_rad_s2",
+                  limits.measured_acceleration_brake);
+      print_limit("measured_acceleration_fault_rad_s2",
+                  limits.measured_acceleration_fault);
+      std::cout << ",\"fault_reasons\":[";
+      for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+        if (i) std::cout << ',';
+        std::cout << '\"' << sonic::safety::JointFaultReasonName(faults[i]) << '\"';
+      }
+      std::cout << "]}" << std::endl;
+    }
+
+    /// Stop accepting SONIC targets and independently settle each joint toward
+    /// its measured-position hold. No joint event triggers whole-body damping.
     void Stop() {
+      joint_limiter_terminating_ = true;
       operator_state.stop = true;
 
       if (control_thread_ptr_) {
@@ -2695,8 +4059,16 @@ class G1Deploy {
           planner_thread_ptr_.reset();
         }
       }
-      CreateDampingCommand();
-      LowCommandWriter();
+      if (joint_limiter_enabled_ && joint_limiter_level_ > 0.0 &&
+          joint_limiter_.seeded()) {
+        for (int tick = 0; tick < 100; ++tick) {
+          WriteLowCommand(true);
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+      } else {
+        WriteLowCommand(true);
+      }
+      PrintJointLimiterSummary();
       std::cout << "Stop" << std::endl;
     }
 
@@ -2720,7 +4092,7 @@ class G1Deploy {
      *        default standing angles over `duration_` seconds (linear interpolation).
      *
      * Called at 50 Hz until the ramp completes, at which point the state machine
-     * transitions to WAIT_FOR_CONTROL and the Dex3 hands open.
+     * transitions to WAIT_FOR_CONTROL and the hands open.
      * @return True once LowState data is available; false if not yet ready.
      */
     bool InitControl() {
@@ -2737,21 +4109,33 @@ class G1Deploy {
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
       }
+      if (joint_limiter_enabled_) {
+        for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+          motor_command_tmp.q_target.at(i) = ls->motor_state()[i].q();
+        }
+      }
       time_ += control_dt_;
       if (time_ < duration_) {
-        for (int i = 0; i < G1_NUM_MOTOR; i++) {
-          double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
-          double current_pos = ls->motor_state()[i].q();
-          motor_command_tmp.q_target.at(i) =
-              static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
+        if (!joint_limiter_enabled_) {
+          for (int i = 0; i < G1_NUM_MOTOR; i++) {
+            double ratio = std::clamp(time_ / duration_, 0.0, 1.0);
+            double current_pos = ls->motor_state()[i].q();
+            motor_command_tmp.q_target.at(i) = static_cast<float>(
+                current_pos * (1.0 - ratio) + default_angles[i] * ratio);
+          }
         }
-        dex3_hands_.close(true);
-        dex3_hands_.close(false);
+        // Keep the 30 N RH56E2 open throughout body initialization.
+        hands_.open(true);
+        hands_.open(false);
       } else {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
-        dex3_hands_.open(true);
-        dex3_hands_.open(false);
-        std::cout << "Init Done" << std::endl;
+        hands_.open(true);
+        hands_.open(false);
+        std::cout << "Init Done";
+        if (joint_limiter_enabled_) {
+          std::cout << " (measured-position seed; empty per-joint windows)";
+        }
+        std::cout << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
@@ -2766,12 +4150,33 @@ class G1Deploy {
         return false;
       }
 
+      // In MuJoCo/Isaac sim (--disable-crc-check) the LowState stream pauses during
+      // env.reset(), which would trip this staleness guard and abort control. There
+      // is no real robot to protect, so skip the staleness check in that mode.
       auto now = std::chrono::steady_clock::now();
-      if (now - low_state_data.timestamp > LOW_STATE_ABSENT_THRESHOLD) {
+      if (now - low_state_data.timestamp > LOW_STATE_ABSENT_THRESHOLD && !disable_crc_check_) {
         std::cout << "[ERROR] Lost LowState data connection from robot!" << std::endl;
         return false;
       }
 
+      return true;
+    }
+
+    /// Auto-recovery liveness check (SIM_RESILIENCE_PLAN.md Workstream B).
+    /// True iff LowState is both ARRIVING (age < auto_recover_absent_) and
+    /// ADVANCING (tick changed within that window). Unlike CheckSafety this is
+    /// active in sim mode too, and the tick test catches a frozen-but-present
+    /// feed (e.g. Zenoh re-delivering a stale sample after a reconnect) that a
+    /// pure arrival-age test would miss. Side-effect: updates the tick tracker.
+    bool FeedHealthy() {
+      auto d = low_state_buffer_.GetDataWithTime();
+      if (!d.data) return false;
+      auto now = std::chrono::steady_clock::now();
+      if (now - d.timestamp > auto_recover_absent_) return false;   // arrivals stopped
+      uint32_t tk = d.data->tick();
+      if (last_tick_change_.time_since_epoch().count() == 0) last_tick_change_ = now;
+      if (tk != last_health_tick_) { last_health_tick_ = tk; last_tick_change_ = now; }
+      if (now - last_tick_change_ > auto_recover_absent_) return false;  // frozen feed
       return true;
     }
 
@@ -2897,13 +4302,14 @@ class G1Deploy {
       std::array<double, 3> body_torso_ang_vel = float_to_double<3>(imu_torso->gyroscope());
       std::array<double, 3> body_torso_accel = float_to_double<3>(imu_torso->accelerometer());
 
-      // Collect hand states from Dex3 hands
+      // Collect state in the policy's seven-channel convention. The RH56E2
+      // backend converts Unitree Inspire normalized feedback into this form.
       std::array<double, 7> left_hand_q = {0.0};
       std::array<double, 7> left_hand_dq = {0.0};
       std::array<double, 7> right_hand_q = {0.0};
       std::array<double, 7> right_hand_dq = {0.0};
       
-      auto left_hand_state_ptr = dex3_hands_.getState(true);
+      auto left_hand_state_ptr = hands_.getState(true);
       if (left_hand_state_ptr) {
         for (int i = 0; i < 7; ++i) {
           left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
@@ -2911,7 +4317,7 @@ class G1Deploy {
         }
       }
       
-      auto right_hand_state_ptr = dex3_hands_.getState(false);
+      auto right_hand_state_ptr = hands_.getState(false);
       if (right_hand_state_ptr) {
         for (int i = 0; i < 7; ++i) {
           right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
@@ -2921,12 +4327,17 @@ class G1Deploy {
 
       // Log robot state for analysis and debugging
       if (state_logger_) {
+        std::array<double, G1_NUM_MOTOR> last_action_snapshot{};
+        {
+          std::lock_guard<std::mutex> lock(last_action_mutex_);
+          last_action_snapshot = last_action;
+        }
         // Get ROS timestamp if using ROS2 output interface (0.0 for non-ROS2 interfaces)
         double ros_timestamp = GetRosTimestamp();
         state_logger_->LogFullState(base_quat, base_ang_vel, base_accel, body_torso_quat, body_torso_ang_vel, body_torso_accel,
                                     std::span(body_q),
                                     std::span(body_dq),
-                                    std::span(last_action),
+                                    std::span(last_action_snapshot),
                                     std::span(motor_temperature),
                                     std::span(motor_error),
                                     std::span(motor_torque),
@@ -3114,19 +4525,275 @@ class G1Deploy {
       // Access actions from control policy's internal buffer (already populated by Infer)
       auto& action_buffer = policy_engine_->GetActionBuffer();
       float* floatarr = action_buffer.data();
-      
+
+      const bool make_first_target_continuous =
+          joint_limiter_enabled_ &&
+          joint_limiter_active_for_policy_.load() &&
+          continuous_first_policy_target_pending_.exchange(false);
+      const auto low_state = make_first_target_continuous
+          ? low_state_buffer_.GetDataWithTime().data
+          : nullptr;
+      const bool have_measured_start =
+          low_state && low_state->motor_state().size() >= G1_NUM_MOTOR;
+
       MotorCommand motor_command_tmp;
+      std::array<double, G1_NUM_MOTOR> requested_action{};
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
         const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
-        last_action[i] = static_cast<double>(floatarr[i]);
-        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i] + action_value);
+        requested_action[i] = static_cast<double>(floatarr[i]);
+        motor_command_tmp.q_target.at(i) = have_measured_start
+            ? low_state->motor_state()[i].q()
+            : static_cast<float>(default_angles[i] + action_value);
         motor_command_tmp.tau_ff.at(i) = 0.0;
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
       }
+      {
+        std::lock_guard<std::mutex> lock(last_action_mutex_);
+        if (have_measured_start) {
+          // last_action is stored in policy (IsaacLab) order. Seed the
+          // recurrent/history observation with the action corresponding to
+          // the measured pose, exactly matching the first emitted q_des.
+          for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+               ++hardware_joint) {
+            const int policy_joint = isaaclab_to_mujoco[hardware_joint];
+            last_action[policy_joint] =
+                (low_state->motor_state()[hardware_joint].q() -
+                 default_angles[hardware_joint]) /
+                g1_action_scale[hardware_joint];
+          }
+        } else {
+          last_action = requested_action;
+        }
+      }
+      if (have_measured_start) {
+        std::cout << "[SONIC-CONTINUOUS-START] first policy q_des equals "
+                     "measured startup pose; applied-action history seeded"
+                  << std::endl;
+      }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
+    }
+
+    /**
+     * Replace a newly accepted planner IDLE clip with a stationary reference
+     * matching the latest measured pose.  Must be called while the planner and
+     * current-motion mutexes are held, before planner_motion_ is published.
+     */
+    void ApplyLiveIdleReference(double pitch_bias_rad, double leg_blend) {
+      if (!idle_hold_baseline_valid_ || planner_motion_->timesteps <= 0) {
+        return;
+      }
+
+      auto base_quat = idle_hold_baseline_quat_;
+      if (pitch_bias_rad != 0.0) {
+        // Apply the trim in the robot's heading-local pitch axis: q_target =
+        // q_measured * q_pitch.  This changes only the reference seen by the
+        // policy; measured gravity and angular velocity remain untouched.
+        const double c = std::cos(0.5 * pitch_bias_rad);
+        const double s = std::sin(0.5 * pitch_bias_rad);
+        const auto q = base_quat;
+        base_quat = {
+            q[0] * c - q[2] * s,
+            q[1] * c - q[3] * s,
+            q[0] * s + q[2] * c,
+            q[1] * s + q[3] * c,
+        };
+      }
+      for (int frame = 0; frame < planner_motion_->timesteps; ++frame) {
+        for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+             ++hardware_joint) {
+          const int policy_joint = isaaclab_to_mujoco[hardware_joint];
+          const double measured_q = idle_hold_baseline_q_[hardware_joint];
+          // Hardware joints 0..11 are the two six-joint legs.  A partial blend
+          // is deliberately safer than substituting an arbitrary full-body
+          // pose: arms and waist retain the known-good measured reference.
+          const double reference_q = hardware_joint < 12
+              ? measured_q + leg_blend *
+                  (default_angles[hardware_joint] - measured_q)
+              : measured_q;
+          planner_motion_->JointPositions(frame)[policy_joint] =
+              reference_q;
+          planner_motion_->JointVelocities(frame)[policy_joint] = 0.0;
+        }
+        planner_motion_->BodyQuaternions(frame)[0] = base_quat;
+        if (planner_motion_->GetNumBodies() > 0) {
+          if (idle_hold_root_height_ > 0.0) {
+            planner_motion_->BodyPositions(frame)[0][2] = idle_hold_root_height_;
+          }
+          planner_motion_->BodyLinVelocities(frame)[0] = {0.0, 0.0, 0.0};
+          planner_motion_->BodyAngVelocities(frame)[0] = {0.0, 0.0, 0.0};
+        }
+      }
+    }
+
+    bool FreezeIdleReferenceAtMeasuredPose() {
+      if (!idle_hold_reference_enabled_ || planner_motion_->timesteps <= 0 ||
+          planner_motion_->GetNumJoints() < G1_NUM_MOTOR ||
+          planner_motion_->GetNumBodyQuaternions() < 1) {
+        return false;
+      }
+
+      const auto low_state = low_state_buffer_.GetDataWithTime().data;
+      if (!low_state || low_state->motor_state().size() < G1_NUM_MOTOR) {
+        std::cerr << "[idle-hold] cannot freeze reference: no complete LowState"
+                  << std::endl;
+        return false;
+      }
+
+      idle_hold_baseline_quat_ =
+          float_to_double<4>(low_state->imu_state().quaternion());
+      for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+           ++hardware_joint) {
+        idle_hold_baseline_q_[hardware_joint] =
+            low_state->motor_state()[hardware_joint].q();
+      }
+      idle_hold_baseline_valid_ = true;
+      idle_hold_motion_active_ = true;
+      ApplyLiveIdleReference(idle_hold_pitch_bias_rad_, idle_hold_leg_blend_);
+
+      std::cout << "[idle-hold] froze " << planner_motion_->timesteps
+                << " reference frames at measured standing pose (pitch bias="
+                << idle_hold_pitch_bias_rad_ * 180.0 / M_PI << " deg, leg blend="
+                << idle_hold_leg_blend_ << ")" << std::endl;
+      return true;
+    }
+
+    /** Refresh and smoothly apply a live stationary-IDLE reference target.
+     *
+     * Caller holds current_motion_mutex_ and planner_motion_mutex_.  Changes
+     * are ignored outside the frozen IDLE clip, so WALK references are never
+     * rewritten.  File polling is wall-clock limited and malformed files leave
+     * the last valid target untouched.
+     */
+    void MaybeRefreshLiveIdleReference() {
+      if (!idle_hold_reference_enabled_ || !idle_hold_motion_active_ ||
+          !idle_hold_baseline_valid_ || idle_reference_file_.empty() ||
+          !current_motion_ || current_motion_ != planner_motion_) {
+        return;
+      }
+
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= idle_reference_next_check_) {
+        idle_reference_next_check_ = now + std::chrono::milliseconds(500);
+        std::ifstream input(idle_reference_file_);
+        double pitch_degrees = 0.0;
+        double leg_blend = 0.0;
+        if (input >> pitch_degrees >> leg_blend) {
+          pitch_degrees = std::clamp(pitch_degrees, -20.0, 20.0);
+          leg_blend = std::clamp(leg_blend, 0.0, 1.0);
+          const double pitch_radians = pitch_degrees * M_PI / 180.0;
+          if (std::abs(pitch_radians - idle_target_pitch_bias_rad_) > 1e-9 ||
+              std::abs(leg_blend - idle_target_leg_blend_) > 1e-9) {
+            idle_target_pitch_bias_rad_ = pitch_radians;
+            idle_target_leg_blend_ = leg_blend;
+            std::cout << "[idle-hold] live target: pitch=" << pitch_degrees
+                      << " deg, leg blend=" << leg_blend << std::endl;
+          }
+        }
+      }
+
+      // Slew rather than step the reference so a file edit cannot inject an
+      // arbitrarily large discontinuity into the policy observation.
+      const double pitch_step = 0.25 * M_PI / 180.0;
+      const double blend_step = 0.01;
+      const auto approach = [](double current, double target, double step) {
+        return current + std::clamp(target - current, -step, step);
+      };
+      const double next_pitch = approach(
+          idle_hold_pitch_bias_rad_, idle_target_pitch_bias_rad_, pitch_step);
+      const double next_blend = approach(
+          idle_hold_leg_blend_, idle_target_leg_blend_, blend_step);
+      if (next_pitch != idle_hold_pitch_bias_rad_ ||
+          next_blend != idle_hold_leg_blend_) {
+        idle_hold_pitch_bias_rad_ = next_pitch;
+        idle_hold_leg_blend_ = next_blend;
+        ApplyLiveIdleReference(idle_hold_pitch_bias_rad_, idle_hold_leg_blend_);
+      }
+    }
+
+    /**
+     * Record one control-tick snapshot in hardware joint order.  The measured
+     * state is exactly the LowState snapshot used to build this tick's policy
+     * observation; the command is the policy result produced from it.  Keeping
+     * the reference, measurement, and command in one row avoids timestamp and
+     * joint-order ambiguity when diagnosing stationary balance.
+     */
+    void WriteIdleTelemetryRow(
+        const std::shared_ptr<const MotionSequence>& motion, int frame) {
+      if (!idle_telemetry_file_ || !motion || motion->timesteps <= 0 ||
+          motion->GetNumJoints() < G1_NUM_MOTOR ||
+          motion->GetNumBodyQuaternions() < 1 || motion->GetNumBodies() < 1) {
+        return;
+      }
+
+      const auto low_state = used_low_state_data_.data;
+      const auto command = motor_command_buffer_.GetDataWithTime().data;
+      if (!low_state || low_state->motor_state().size() < G1_NUM_MOTOR ||
+          !command) {
+        return;
+      }
+
+      frame = std::clamp(frame, 0, motion->timesteps - 1);
+      const auto movement = movement_state_buffer_.GetDataWithTime().data;
+      const int movement_mode = movement ? movement->locomotion_mode : -1;
+      const auto ref_pos = motion->BodyPositions(frame)[0];
+      const auto ref_quat = motion->BodyQuaternions(frame)[0];
+      const auto& measured_imu = low_state->imu_state();
+      const auto& measured_quat = measured_imu.quaternion();
+      const auto& measured_gyro = measured_imu.gyroscope();
+
+      auto& out = *idle_telemetry_file_;
+      out << std::fixed << std::setprecision(9)
+          << idle_telemetry_rows_ << ','
+          << idle_telemetry_rows_ * control_dt_ << ',' << frame << ','
+          << movement_mode << ',' << ref_pos[0] << ',' << ref_pos[1] << ','
+          << ref_pos[2] << ',' << ref_quat[0] << ',' << ref_quat[1] << ','
+          << ref_quat[2] << ',' << ref_quat[3] << ',' << measured_quat[0]
+          << ',' << measured_quat[1] << ',' << measured_quat[2] << ','
+          << measured_quat[3] << ',' << measured_gyro[0] << ','
+          << measured_gyro[1] << ',' << measured_gyro[2];
+
+      for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+           ++hardware_joint) {
+        const int policy_joint = isaaclab_to_mujoco[hardware_joint];
+        out << ',' << motion->JointPositions(frame)[policy_joint];
+      }
+      for (int hardware_joint = 0; hardware_joint < G1_NUM_MOTOR;
+           ++hardware_joint) {
+        const int policy_joint = isaaclab_to_mujoco[hardware_joint];
+        out << ',' << motion->JointVelocities(frame)[policy_joint];
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << low_state->motor_state()[i].q();
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << low_state->motor_state()[i].dq();
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << low_state->motor_state()[i].tau_est();
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << command->q_target[i];
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << command->dq_target[i];
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << command->tau_ff[i];
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << command->kp[i];
+      }
+      for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+        out << ',' << command->kd[i];
+      }
+      out << '\n';
+      ++idle_telemetry_rows_;
+      if (idle_telemetry_rows_ % 10 == 0) {
+        out.flush();
+      }
     }
 
     /**
@@ -3260,6 +4927,12 @@ class G1Deploy {
 
           if(success)
           {
+            if (next_planner_motion_is_idle_.load(std::memory_order_acquire)) {
+              FreezeIdleReferenceAtMeasuredPose();
+            } else {
+              idle_hold_motion_active_ = false;
+              idle_hold_baseline_valid_ = false;
+            }
             if(planner_motion_file_)
             {
               // log the motion that we just copied/blended over:
@@ -3288,80 +4961,19 @@ class G1Deploy {
             current_frame_ = 0;
             // Assign shared_ptr directly - planner_motion_ is already a shared_ptr
             current_motion_ = planner_motion_;
-            idle_readapt_stored_ = false;
             if(is_the_first_time) {
               reinitialize_heading_ = true;
             }
           }
         }
+
+        MaybeRefreshLiveIdleReference();
           
         // Frame advancement at control frequency (50Hz) for smooth playback
         if (current_motion_->timesteps > 0 && operator_state.play) {
           int new_frame = current_frame_ + 1;
             if (new_frame >= current_motion_->timesteps) {
               new_frame = current_motion_->timesteps - 1; // Clamp to last frame
-              // Error-based readaptation in idle mode with double-threshold state machine.
-              // IDLE: do nothing. ADAPTING: blend toward robot state. RECOVERING: blend toward planner target.
-              auto movement_state_data = movement_state_buffer_.GetDataWithTime().data;
-              if(movement_state_data && movement_state_data->locomotion_mode == static_cast<int>(LocomotionMode::IDLE)) {
-                auto low_state = low_state_buffer_.GetDataWithTime().data;
-                if (low_state) {
-                  auto motor_state = low_state->motor_state();
-
-                  // Store original planner targets on first entry
-                  if (!idle_readapt_stored_) {
-                    for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
-                      idle_readapt_original_targets_[idx] = planner_motion_->JointPositions(new_frame)[idx];
-                    }
-                    idle_readapt_stored_ = true;
-                    idle_readapt_state_ = IdleReadaptState::IDLE;
-                  }
-
-                  // Compute average error across all lower-body joints
-                  double total_error = 0.0;
-                  for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
-                    total_error += std::abs(planner_motion_->JointPositions(new_frame)[idx]
-                                            - motor_state[mujoco_to_isaaclab[idx]].q());
-                  }
-                  double avg_error = total_error / static_cast<double>(lower_body_joint_isaaclab_order_in_isaaclab_index.size());
-
-                  // State transitions
-                  switch (idle_readapt_state_) {
-                    case IdleReadaptState::IDLE:
-                      if (avg_error > kAdaptTrigger) {
-                        idle_readapt_state_ = IdleReadaptState::ADAPTING;
-                      } else if (avg_error < kRecoverTrigger) {
-                        idle_readapt_state_ = IdleReadaptState::RECOVERING;
-                      }
-                      break;
-                    case IdleReadaptState::ADAPTING:
-                      if (avg_error < kAdaptStop) {
-                        idle_readapt_state_ = IdleReadaptState::IDLE;
-                      }
-                      break;
-                    case IdleReadaptState::RECOVERING:
-                      if (avg_error > kAdaptTrigger) {
-                        idle_readapt_state_ = IdleReadaptState::ADAPTING;
-                      }
-                      break;
-                  }
-
-                  // Apply blend based on current state
-                  if (idle_readapt_state_ == IdleReadaptState::ADAPTING) {
-                    for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
-                      double actual = motor_state[mujoco_to_isaaclab[idx]].q();
-                      planner_motion_->JointPositions(new_frame)[idx] =
-                          0.98 * planner_motion_->JointPositions(new_frame)[idx] + 0.02 * actual;
-                    }
-                  } else if (idle_readapt_state_ == IdleReadaptState::RECOVERING) {
-                    for (int idx : lower_body_joint_isaaclab_order_in_isaaclab_index) {
-                      planner_motion_->JointPositions(new_frame)[idx] =
-                          0.98 * planner_motion_->JointPositions(new_frame)[idx] + 0.02 * idle_readapt_original_targets_[idx];
-                    }
-                  }
-                  // IDLE state: do nothing
-                }
-              }
             }
           current_frame_ = new_frame;
         }
@@ -3557,6 +5169,7 @@ class G1Deploy {
      */
     void Planner() {
       if (operator_state.stop) { return; }
+      if (!SimulatorTickDue(planner_dt_, planner_next_sim_time_)) return;
       auto low_state_data = low_state_buffer_.GetDataWithTime();
       const std::shared_ptr<const LowState_> ls = low_state_data.data;
       
@@ -3574,6 +5187,7 @@ class G1Deploy {
               for (int i = 0; i < G1_NUM_MOTOR; i++) {
                 joint_positions[i] = ls->motor_state()[i].q();
               }
+              next_planner_motion_is_idle_.store(true, std::memory_order_release);
               // Initialize planner with robot state
               if(!planner_->Initialize(base_quat, joint_positions)) {
                 throw std::runtime_error("Error when initializing planner");
@@ -3624,36 +5238,57 @@ class G1Deploy {
             bool movement_mode_changed = false;
             bool movement_speed_changed = false;
             bool movement_direction_changed = false;
-            bool under_static_motion_mode = is_static_motion_mode(static_cast<LocomotionMode>(last_movement_state_.locomotion_mode));
 
             // Read current movement mode from thread-safe buffer
             auto movement_state_data = movement_state_buffer_.GetDataWithTime();
+            MovementState requested_state = movement_state_data.data
+                ? *movement_state_data.data
+                : MovementState(static_cast<int>(LocomotionMode::IDLE),
+                                {0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, -1.0, -1.0);
 
-            if (movement_state_data.data) {
-              // bool of checking if facing direction is changed
-              facing_direction_changed = movement_state_data.data->facing_direction[0] != last_movement_state_.facing_direction[0] || 
-                                          movement_state_data.data->facing_direction[1] != last_movement_state_.facing_direction[1] || 
-                                          movement_state_data.data->facing_direction[2] != last_movement_state_.facing_direction[2];
-              // bool of checking if height is changed
-              height_changed = movement_state_data.data->height != last_movement_state_.height;
-              // bool of checking if movement mode is changed
-              movement_mode_changed = movement_state_data.data->locomotion_mode != last_movement_state_.locomotion_mode;
-              // bool of checking if movement speed is changed
-              movement_speed_changed = movement_state_data.data->movement_speed != last_movement_state_.movement_speed;
-              // bool of checking if movement direction is changed
-              movement_direction_changed = movement_state_data.data->movement_direction[0] != last_movement_state_.movement_direction[0] || 
-                                          movement_state_data.data->movement_direction[1] != last_movement_state_.movement_direction[1] || 
-                                          movement_state_data.data->movement_direction[2] != last_movement_state_.movement_direction[2];
-              // bool of checking if the last movement value is under the static motion mode
-              under_static_motion_mode = is_static_motion_mode(static_cast<LocomotionMode>(movement_state_data.data->locomotion_mode));
+            auto to_transition_command = [](const MovementState& state) {
+              return WalkToIdleCommand{
+                  state.locomotion_mode,
+                  state.movement_direction,
+                  state.facing_direction,
+                  state.movement_speed,
+                  state.height};
+            };
+            const bool stop_was_active = walk_to_idle_transition_.active();
+            const auto effective_command = walk_to_idle_transition_.Update(
+                to_transition_command(requested_state),
+                to_transition_command(last_planner_state_), planner_dt_);
+            const bool stop_is_active = walk_to_idle_transition_.active();
+            if (!stop_was_active && stop_is_active) {
+              std::cout << "[walk-to-idle] braking: WALK 0.8 -> SLOW_WALK 0.1 -> IDLE"
+                        << std::endl;
+            } else if (stop_was_active && !stop_is_active &&
+                       requested_state.locomotion_mode == static_cast<int>(LocomotionMode::IDLE)) {
+              std::cout << "[walk-to-idle] braking complete; requesting IDLE" << std::endl;
             }
-            bool is_running = movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RUN);
-            bool is_boxing = movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::LEFT_PUNCH) ||
-                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RIGHT_PUNCH) ||
-                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RANDOM_PUNCH) ||
-                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::LEFT_HOOK) ||
-                             movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::RIGHT_HOOK);
-            bool is_crawling = movement_state_data.data->locomotion_mode == static_cast<int>(LocomotionMode::CRAWLING);
+
+            MovementState planner_state(
+                effective_command.locomotion_mode,
+                effective_command.movement_direction,
+                effective_command.facing_direction,
+                effective_command.movement_speed,
+                effective_command.height);
+
+            facing_direction_changed = planner_state.facing_direction != last_planner_state_.facing_direction;
+            height_changed = planner_state.height != last_planner_state_.height;
+            movement_mode_changed = planner_state.locomotion_mode != last_planner_state_.locomotion_mode;
+            movement_speed_changed = planner_state.movement_speed != last_planner_state_.movement_speed;
+            movement_direction_changed = planner_state.movement_direction != last_planner_state_.movement_direction;
+            const bool under_static_motion_mode =
+                is_static_motion_mode(static_cast<LocomotionMode>(planner_state.locomotion_mode));
+
+            bool is_running = planner_state.locomotion_mode == static_cast<int>(LocomotionMode::RUN);
+            bool is_boxing = planner_state.locomotion_mode == static_cast<int>(LocomotionMode::LEFT_PUNCH) ||
+                             planner_state.locomotion_mode == static_cast<int>(LocomotionMode::RIGHT_PUNCH) ||
+                             planner_state.locomotion_mode == static_cast<int>(LocomotionMode::RANDOM_PUNCH) ||
+                             planner_state.locomotion_mode == static_cast<int>(LocomotionMode::LEFT_HOOK) ||
+                             planner_state.locomotion_mode == static_cast<int>(LocomotionMode::RIGHT_HOOK);
+            bool is_crawling = planner_state.locomotion_mode == static_cast<int>(LocomotionMode::CRAWLING);
             // increment replan interval counter
             replan_interval_counter_ += planner_dt_;
             // check if need to replan
@@ -3689,7 +5324,9 @@ class G1Deploy {
             
             if (movement_mode_changed || facing_direction_changed || height_changed) {
               need_replan = true;
-            } else if (!under_static_motion_mode && (movement_speed_changed || movement_direction_changed || (time_to_replan && movement_state_data.data->movement_speed != 0))) {
+            } else if (!under_static_motion_mode &&
+                       (movement_speed_changed || movement_direction_changed ||
+                        (time_to_replan && planner_state.movement_speed != 0))) {
               need_replan = true;
             }
 
@@ -3706,29 +5343,23 @@ class G1Deploy {
             float movement_speed = -1.0f;
             float target_height = -1.0f;
             
-            if (movement_state_data.data) {
-              current_mode = movement_state_data.data->locomotion_mode;
-              movement_direction[0] = movement_state_data.data->movement_direction[0];
-              movement_direction[1] = movement_state_data.data->movement_direction[1]; 
-              movement_direction[2] = movement_state_data.data->movement_direction[2];
-              facing_direction[0] = movement_state_data.data->facing_direction[0];
-              facing_direction[1] = movement_state_data.data->facing_direction[1];
-              facing_direction[2] = movement_state_data.data->facing_direction[2];
-              movement_speed = movement_state_data.data->movement_speed;
-              target_height = movement_state_data.data->height;
-
-              // Update last movement state for next iteration comparison (update here to avoid missing the update)
-              last_movement_state_.locomotion_mode = movement_state_data.data->locomotion_mode;
-              last_movement_state_.movement_direction = movement_state_data.data->movement_direction;
-              last_movement_state_.facing_direction = movement_state_data.data->facing_direction;
-              last_movement_state_.movement_speed = movement_state_data.data->movement_speed;
-              last_movement_state_.height = movement_state_data.data->height;
-            }
+            current_mode = planner_state.locomotion_mode;
+            movement_direction[0] = planner_state.movement_direction[0];
+            movement_direction[1] = planner_state.movement_direction[1];
+            movement_direction[2] = planner_state.movement_direction[2];
+            facing_direction[0] = planner_state.facing_direction[0];
+            facing_direction[1] = planner_state.facing_direction[1];
+            facing_direction[2] = planner_state.facing_direction[2];
+            movement_speed = planner_state.movement_speed;
+            target_height = planner_state.height;
             
             try {
               // Update planning with current movement parameters
 
               // gotta make sure planner_motion actually has data...
+              next_planner_motion_is_idle_.store(
+                  current_mode == static_cast<int>(LocomotionMode::IDLE),
+                  std::memory_order_release);
               if(!planner_->UpdatePlanning(
                 current_frame_,
                 planner_motion_,
@@ -3740,6 +5371,7 @@ class G1Deploy {
               )) {
                 throw std::runtime_error("Error when updating planner");
               }
+              last_planner_state_ = planner_state;
               
             } catch (const std::exception& e) {
               std::cout << "✗ Error during planning update: " << e.what() << std::endl;
@@ -3788,7 +5420,7 @@ class G1Deploy {
      *    3. GatherObservations — fill the policy observation vector.
      *    4. LogPostState — append encoder token to the latest log entry.
      *    5. CreatePolicyCommand — run TensorRT policy, produce MotorCommand.
-     *    6. Update Dex3 hands (max-close ratio + joint targets).
+     *    6. Update the RH56E2 hands (max-close ratio + joint targets).
      *    7. Publish state to all output interfaces (ZMQ / ROS2).
      *    8. Handle motion recording (streamed + planner).
      *    9. CurrentFrameAdvancement — advance playback cursor, blend planner.
@@ -3796,9 +5428,18 @@ class G1Deploy {
      */
     void Control() {
       if (operator_state.stop) { return; }
+      if (!SimulatorTickDue(control_dt_, control_next_sim_time_)) return;
 
       switch (program_state_) {
         case ProgramState::INIT:
+          // Auto-recovery re-arm: if the feed drops again mid-ramp, fall back to
+          // damping rather than ramping on a stale/absent state.
+          if (auto_resume_pending_ && auto_recover_enabled_ && !FeedHealthy()) {
+            std::cout << "[Recover] Feed dropped during re-arm ramp — back to damping." << std::endl;
+            feed_healthy_since_ = std::chrono::steady_clock::time_point{};
+            program_state_ = ProgramState::RECOVER_DAMPING;
+            break;
+          }
           if (!InitControl()) {
             std::cout << "LowState is not available, waiting for robot to be ready" << std::endl;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -3818,6 +5459,14 @@ class G1Deploy {
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
           for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
+          // Auto-recovery: the re-arm ramp finished, so resume CONTROL without an
+          // operator "start". Mode state (planner/encoder/current_motion_) was never
+          // torn down, so control resumes exactly where it left off.
+          if (auto_resume_pending_) {
+            auto_resume_pending_ = false;
+            operator_state.start = true;
+            std::cout << "[Recover] Re-arm ramp complete — auto-resuming CONTROL." << std::endl;
+          }
           if (operator_state.start) {
             // Warn if starting control in token mode without tokens, but allow it
             if (initial_encoder_mode_ == -1 && !first_token_received_) {
@@ -3828,13 +5477,60 @@ class G1Deploy {
               }
               warn_count++;
             }
+            if (joint_limiter_enabled_ &&
+                joint_limiter_active_for_policy_.load()) {
+              const auto low_state = low_state_buffer_.GetDataWithTime().data;
+              if (low_state &&
+                  low_state->motor_state().size() >= G1_NUM_MOTOR) {
+                std::lock_guard<std::mutex> lock(last_action_mutex_);
+                for (int hardware_joint = 0;
+                     hardware_joint < G1_NUM_MOTOR; ++hardware_joint) {
+                  const int policy_joint =
+                      isaaclab_to_mujoco[hardware_joint];
+                  last_action[policy_joint] =
+                      (low_state->motor_state()[hardware_joint].q() -
+                       default_angles[hardware_joint]) /
+                      g1_action_scale[hardware_joint];
+                }
+              }
+              continuous_first_policy_target_pending_.store(true);
+            }
             std::cout << "[Control] DEBUG: operator_state.start=true, transitioning to CONTROL state" << std::endl;
             program_state_ = ProgramState::CONTROL;
           }
           break;
 
+        case ProgramState::RECOVER_DAMPING: {
+          // Feed lost: hold the robot in damping (all threads stay alive) and watch
+          // for the feed to return fresh AND advancing for auto_recover_stable_,
+          // then soft-ramp back via INIT and auto-resume CONTROL (mode preserved) —
+          // no operator input. SIM_RESILIENCE_PLAN.md Workstream B.
+          CreateDampingCommand();
+          auto now = std::chrono::steady_clock::now();
+          if (FeedHealthy()) {
+            if (feed_healthy_since_.time_since_epoch().count() == 0) feed_healthy_since_ = now;
+            if (now - feed_healthy_since_ >= auto_recover_stable_) {
+              std::cout << "[Recover] LowState feed restored and stable — soft re-arm." << std::endl;
+              time_ = 0.0;                    // reset the INIT ramp timer
+              auto_resume_pending_ = true;    // INIT -> WAIT_FOR_CONTROL -> auto CONTROL
+              program_state_ = ProgramState::INIT;
+            }
+          } else {
+            feed_healthy_since_ = std::chrono::steady_clock::time_point{};  // reset debounce
+          }
+          break;
+        }
+
         case ProgramState::CONTROL: {
-          if (!CheckSafety()) {
+          if (auto_recover_enabled_) {
+            // Non-terminal loss handling: drop to damping and auto-resume later.
+            if (!FeedHealthy()) {
+              std::cout << "[Recover] LowState feed lost — entering damping; will auto-resume when it returns." << std::endl;
+              feed_healthy_since_ = std::chrono::steady_clock::time_point{};
+              program_state_ = ProgramState::RECOVER_DAMPING;
+              break;
+            }
+          } else if (!CheckSafety()) {
             std::cout << "[ERROR] Safety check failed, stopping control." << std::endl;
             operator_state.stop = true;
             break;
@@ -3945,14 +5641,15 @@ class G1Deploy {
             operator_state.stop = true;
             return;
           }
+          WriteIdleTelemetryRow(current_motion_copy, current_frame_copy);
           auto motor_command_end_time = std::chrono::steady_clock::now();
 
-          // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
-          dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
+          // Apply the policy-space close limit to the RH56E2 backend.
+          hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
           
           // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+          hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
+          hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
           
           // Update last hand actions for logging (use buffered data)
           for (int i = 0; i < 7; ++i) {
@@ -4069,7 +5766,7 @@ class G1Deploy {
             }
             
             // Print hand max close ratio (keyboard-controlled via X/C keys)
-            std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            std::cout << " | HandCloseRatio: " << hands_.GetMaxCloseRatio();
             
             std::cout << std::endl;
           }
@@ -4105,7 +5802,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "|ros2";
 #endif
     std::cout << ">: input interface type (default: keyboard)" << std::endl;
-    std::cout << "  --output-type <zmq|all";
+    std::cout << "  --output-type <zmq|all|log|none";
 #if HAS_ROS2
     std::cout << "|ros2";
 #endif
@@ -4113,6 +5810,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --target-motion-logfile <path>: write target motion to a csv file if provided" << std::endl;
     std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
+    std::cout << "  --idle-telemetry-logfile <path>: write synchronized reference, measured state, and motor command CSV" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
@@ -4159,6 +5857,7 @@ int main(int argc, char const* argv[]) {
   std::string targetMotionLogfile = "";
   std::string plannerMotionLogfile = "";
   std::string policyInputLogfile = "";
+  std::string idleTelemetryLogfile = "";
   std::string recordInputFile = "";
   std::string playbackInputFile = "";
   std::string inputType = "keyboard"; // Default to keyboard
@@ -4226,6 +5925,17 @@ int main(int argc, char const* argv[]) {
         std::cout << "[INFO] Using policy input logfile: " << policyInputLogfile << std::endl;
         i++; // Skip the next argument since it's the policy input logfile
       }
+    } else if (std::string(argv[i]) == "--idle-telemetry-logfile") {
+      if (i + 1 < argc) {
+        idleTelemetryLogfile = argv[i + 1];
+        std::cout << "[INFO] Using IDLE telemetry logfile: "
+                  << idleTelemetryLogfile << std::endl;
+        i++;
+      } else {
+        std::cerr << "Error: --idle-telemetry-logfile requires a path argument"
+                  << std::endl;
+        exit(1);
+      }
     } else if (std::string(argv[i]) == "--input-type") {
       if (i + 1 < argc) {
         inputType = argv[i + 1];
@@ -4255,12 +5965,13 @@ int main(int argc, char const* argv[]) {
     } else if (std::string(argv[i]) == "--output-type") {
       if (i + 1 < argc) {
         outputType = argv[i + 1];
-        bool valid_output = (outputType == "zmq" || outputType == "all");
+        bool valid_output = (outputType == "zmq" || outputType == "all" ||
+                             outputType == "log" || outputType == "none");
 #if HAS_ROS2
         valid_output = valid_output || (outputType == "ros2");
 #endif
         if (!valid_output) {
-          std::cerr << "Error: --output-type must be 'zmq', 'all'";
+          std::cerr << "Error: --output-type must be 'zmq', 'all', 'log', or 'none'";
 #if HAS_ROS2
           std::cerr << ", or 'ros2'";
 #endif
@@ -4270,7 +5981,7 @@ int main(int argc, char const* argv[]) {
         std::cout << "[INFO] Using output type: " << outputType << std::endl;
         i++; // Skip the next argument since it's the output type
       } else {
-        std::cerr << "Error: --output-type requires a type argument (zmq, all";
+        std::cerr << "Error: --output-type requires a type argument (zmq, all, log, none";
 #if HAS_ROS2
         std::cerr << ", or ros2";
 #endif
@@ -4421,6 +6132,7 @@ int main(int argc, char const* argv[]) {
     targetMotionLogfile,
     plannerMotionLogfile,
     policyInputLogfile,
+    idleTelemetryLogfile,
     inputType,
     outputType,
     recordInputFile,
@@ -4441,28 +6153,36 @@ int main(int argc, char const* argv[]) {
     initial_max_close_ratio
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
+
+  if (outputType == "log" || outputType == "none") {
+    custom.actuate_robot_ = false;
+    std::cout << "[INFO] *** LOG-ONLY MODE ENABLED ***  No motor commands will be sent to the G1." << std::endl;
+  }
   
   // Main application loop - check both operator_state.stop and ROS2 status if using ROS2
 #if HAS_ROS2
   if (inputType == "ros2") {
     while (!custom.operator_state.stop && rclcpp::ok()) { 
-      sleep(0.02); 
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     if (!rclcpp::ok()) {
       std::cout << "[INFO] ROS2 shutdown detected (Ctrl+C)" << std::endl;
     }
   } else {
-    while (!custom.operator_state.stop) { sleep(0.02); }
+    while (!custom.operator_state.stop) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
   }
 #else
-  while (!custom.operator_state.stop) { sleep(0.02); }
+  while (!custom.operator_state.stop) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;
   custom.Stop();
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;
-  sleep(0.5);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-

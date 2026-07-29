@@ -2,12 +2,35 @@
 
 import multiprocessing as mp
 from multiprocessing import shared_memory
+import os
+import struct
 import time
 from typing import Any, Dict
 
+import cv2
 import numpy as np
 
-from gear_sonic.utils.mujoco_sim.sensor_server import ImageMessageSchema, SensorServer
+from gear_sonic.utils.mujoco_sim.sensor_server import SensorServer
+
+_SIM_CLOCK = struct.Struct("<dd")
+
+
+def _camera_timestamp(wall_time: float) -> float:
+    """Return the MuJoCo capture clock when simulation timestamps are enabled."""
+    if os.environ.get("CAMERA_TIMESTAMP_CLOCK") != "sim":
+        return wall_time
+    path = os.environ.get("SIM_CLOCK_PATH", "/results/cloudwalk-sim-clock.bin")
+    try:
+        with open(path, "rb", buffering=0) as handle:
+            payload = handle.read(_SIM_CLOCK.size)
+        if len(payload) == _SIM_CLOCK.size:
+            episode_time, _active_time = _SIM_CLOCK.unpack(payload)
+            return float(episode_time)
+    except (FileNotFoundError, OSError, struct.error):
+        pass
+    # A wall-clock fallback would put the observation billions of seconds in
+    # the future relative to MuJoCo. Zero makes the frame safely stale instead.
+    return 0.0
 
 
 def get_multiprocessing_info(verbose: bool = True):
@@ -163,24 +186,32 @@ class ImagePublishProcess:
                     last_data_time = current_time
 
                     try:
-                        from gear_sonic.utils.mujoco_sim.sensor_server import ImageUtils
-
                         image_copies = {name: arr.copy() for name, arr in shared_arrays.items()}
-
-                        message_dict = {
-                            "images": image_copies,
-                            "timestamps": {name: current_time for name in image_copies.keys()},
-                        }
-
-                        image_msg = ImageMessageSchema(
-                            timestamps=message_dict.get("timestamps"),
-                            images=message_dict.get("images", None),
-                        )
-
-                        serialized_data = image_msg.serialize()
-
+                        capture_time = _camera_timestamp(current_time)
+                        encoded_images = {}
                         for camera_name, image_copy in image_copies.items():
-                            serialized_data[f"{camera_name}"] = ImageUtils.encode_image(image_copy)
+                            # MuJoCo returns RGB. Encode a standards-compliant JPEG
+                            # once and send its raw bytes. Camera clients already
+                            # decode byte payloads from BGR back to RGB, and the same
+                            # bytes can be reused by MJPEG and MCAP consumers.
+                            bgr_image = cv2.cvtColor(image_copy, cv2.COLOR_RGB2BGR)
+                            ok, encoded = cv2.imencode(
+                                ".jpg",
+                                bgr_image,
+                                [int(cv2.IMWRITE_JPEG_QUALITY), 80],
+                            )
+                            if not ok:
+                                raise RuntimeError(
+                                    f"Failed to encode {camera_name} as JPEG"
+                                )
+                            encoded_images[camera_name] = encoded.tobytes()
+
+                        serialized_data = {
+                            "images": encoded_images,
+                            "timestamps": {
+                                name: capture_time for name in encoded_images
+                            },
+                        }
 
                         sensor_server.send_message(serialized_data)
 

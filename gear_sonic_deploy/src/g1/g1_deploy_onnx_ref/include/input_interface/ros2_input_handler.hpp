@@ -102,7 +102,7 @@ struct ControlGoalMsg {
     bool toggle_policy_action = false;        ///< Edge-triggered toggle: maps to start/stop control.
     int locomotion_mode = 0;                  ///< 0 = slow walk (custom speed), 1 = fast walk (default speed).
     
-    /// Dex3 hand joint positions (7 DOF per hand).
+    /// RH56E2 policy channels (six actuators plus unused slot per hand).
     std::array<double, 7> left_hand_joint = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     std::array<double, 7> right_hand_joint = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
     bool has_hand_joints = false;  ///< True if hand joint data is present.

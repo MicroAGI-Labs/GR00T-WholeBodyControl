@@ -29,8 +29,8 @@
  *   dq.csv              | Joint velocities (hardware order)
  *   action.csv          | Policy actions (hardware order, scaled + offset)
  *   motor_temperature.csv | Motor temperatures (2 per motor: winding, driver)
- *   left_hand_q/dq.csv  | Left Dex3 hand positions / velocities
- *   right_hand_q/dq.csv | Right Dex3 hand positions / velocities
+ *   left_hand_q/dq.csv  | Left RH56E2 policy-space positions / velocities
+ *   right_hand_q/dq.csv | Right RH56E2 policy-space positions / velocities
  *   left/right_hand_action.csv | Hand actions
  *   token_state.csv     | Encoder token output
  *   encoder_mode.csv    | Encoder mode per tick
@@ -103,7 +103,7 @@ class StateLogger {
     // Motor estimated torque (one per motor, Nm)
     std::vector<double> motor_torque;  // size = num_joints
 
-    // Dex3 hands (7 motors each)
+    // RH56E2 policy channels (six actuators plus one unused checkpoint slot)
     std::vector<double> left_hand_q;       // size = 7 (q positions)
     std::vector<double> left_hand_dq;      // size = 7 (dq velocities)
     std::vector<double> right_hand_q;      // size = 7 (q positions)

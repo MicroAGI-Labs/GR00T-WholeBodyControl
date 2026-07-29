@@ -35,7 +35,7 @@
  *
  * ## Optional Fields (all versions)
  *
- *   - `left_hand_joints`, `right_hand_joints` – 7-DOF Dex3 joint values.
+ *   - `left_hand_joints`, `right_hand_joints` – RH56E2 close fractions plus unused slot.
  *   - `vr_position` (9 doubles) – enables VR 3-point tracking mode.
  *   - `vr_orientation` (12 doubles) – defaults used if absent.
  *   - `vr_compliance` (3 doubles) – **IGNORED** (compliance is keyboard-controlled).
@@ -88,7 +88,7 @@
 class ZMQEndpointInterface : public InputInterface {
 public:
     /// Compile-time toggle for debug log output.
-    static constexpr bool DEBUG_LOGGING = true;
+    static constexpr bool DEBUG_LOGGING = false;  // per-message decode logs; set true to debug
     
     // ------------------------------------------------------------------
     // Per-frame action flags (reset at the start of every update() call)
@@ -573,6 +573,17 @@ public:
     // Public method to trigger ZMQ mode toggle (for programmatic control from GamepadManager)
     void TriggerZMQToggle() {
         toggle_zmq_mode = true;
+    }
+
+    /// Enter network streaming without resetting the buffered first token or
+    /// pausing the active controller.  ZMQManager uses this only for the
+    /// planner-to-VLA continuous handoff after a fresh protocol-v4 message has
+    /// already arrived.
+    void ActivateStreamingForContinuousHandoff() {
+        use_zmq_stream = true;
+        toggle_zmq_mode = false;
+        std::cout << "[ZMQEndpointInterface] ZMQ streaming enabled "
+                     "(continuous control handoff)" << std::endl;
     }
 
     std::optional<std::chrono::steady_clock::time_point> GetLastUpdateTime() const override {
@@ -1468,14 +1479,16 @@ private:
             }
             
             // Print frame indices for protocol v3 (SMPL actions)
-            if (protocol_version == 3 && !frame_indices.empty()) {
-                if (frame_indices.size() == 1) {
-                    std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (single) - frame_index: " 
-                              << frame_indices[0] << std::endl;
-                } else {
-                    std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (chunk) - frames: " 
-                              << frame_indices[0] << " to " << frame_indices.back() 
-                              << ", chunk_size: " << frame_indices.size() << std::endl;
+            if constexpr (DEBUG_LOGGING) {
+                if (protocol_version == 3 && !frame_indices.empty()) {
+                    if (frame_indices.size() == 1) {
+                        std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (single) - frame_index: "
+                                  << frame_indices[0] << std::endl;
+                    } else {
+                        std::cout << "[ZMQEndpointInterface] Protocol v3: Received SMPL action (chunk) - frames: "
+                                  << frame_indices[0] << " to " << frame_indices.back()
+                                  << ", chunk_size: " << frame_indices.size() << std::endl;
+                    }
                 }
             }
         }
@@ -1810,10 +1823,12 @@ private:
         std::lock_guard<std::mutex> lock(data_mutex_);
         
         // Print message received info
-        std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic 
-                  << "', protocol_version: " << hdr.version 
-                  << ", num_fields: " << hdr.fields.size() 
-                  << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        if constexpr (DEBUG_LOGGING) {
+            std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic
+                      << "', protocol_version: " << hdr.version
+                      << ", num_fields: " << hdr.fields.size()
+                      << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        }
         
         // Buffer the received data for processing in handle_input (main thread)
         buffered_header_ = hdr;

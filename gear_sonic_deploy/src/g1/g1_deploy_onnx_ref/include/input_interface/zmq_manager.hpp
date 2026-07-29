@@ -226,7 +226,6 @@ class ZMQManager : public InputInterface {
       }
 
       // Translate received command to control flags and handle mode switching
-      bool trigger_zmq_toggle = false;
       {
         std::lock_guard<std::mutex> lock(command_mutex_);
         if (latest_command_.valid) {
@@ -242,13 +241,13 @@ class ZMQManager : public InputInterface {
           ManagedMode new_mode = latest_command_.planner ? ManagedMode::PLANNER : ManagedMode::STREAMED_MOTION;
           
           if (new_mode != active_mode_) {
-            // Trigger safety reset on mode switch
-            TriggerSafetyReset();
-            if (pose_interface_) {
-              pose_interface_->TriggerSafetyReset();
-            }
-
             if (new_mode == ManagedMode::PLANNER) {
+              // Returning from an untrusted stream is fail-safe and clears all
+              // buffered network state.
+              TriggerSafetyReset();
+              if (pose_interface_) {
+                pose_interface_->TriggerSafetyReset();
+              }
               std::cout << "[ZMQManager] Switched to: PLANNER mode (safety reset)" << std::endl;
               if (latest_planner_message_.valid) {
                 constexpr auto PLANNER_MESSAGE_TIMEOUT = std::chrono::milliseconds(100);
@@ -264,8 +263,14 @@ class ZMQManager : public InputInterface {
                 }
               }
             } else if (new_mode == ManagedMode::STREAMED_MOTION) {
-              std::cout << "[ZMQManager] Switched to: STREAMED MOTION mode (safety reset)" << std::endl;
-              trigger_zmq_toggle = true;
+              // Preserve the buffered first token and the live controller
+              // command.  Resetting here loses action zero and makes an exact
+              // pre-physics acknowledgement impossible.
+              std::cout << "[ZMQManager] Switched to: STREAMED MOTION mode "
+                           "(continuous handoff)" << std::endl;
+              if (pose_interface_) {
+                pose_interface_->ActivateStreamingForContinuousHandoff();
+              }
 
               // Clear planner buffer when switching away from planner mode
               {
@@ -289,10 +294,6 @@ class ZMQManager : public InputInterface {
       if (active_mode_ == ManagedMode::STREAMED_MOTION && pose_interface_) {
         // In streamed motion mode: update pose interface
         pose_interface_->update();
-        if (trigger_zmq_toggle) {
-          pose_interface_->TriggerZMQToggle();
-          std::cout << "[ZMQManager] ZMQ streaming enabled" << std::endl;
-        }
       }
     }
 
@@ -371,6 +372,15 @@ class ZMQManager : public InputInterface {
       } else {
         // Streamed motion mode: delegate to pose interface
         if (pose_interface_) {
+          // Stop planner generation without resetting operator playback or the
+          // current motor command; the buffered token takes over in this same
+          // input/control cycle.
+          if (planner_state.enabled) {
+            planner_state.enabled = false;
+            planner_state.initialized = false;
+            std::cout << "[ZMQManager] Planner disabled after continuous "
+                         "stream handoff" << std::endl;
+          }
           pose_interface_->handle_input(motion_reader, current_motion, current_frame,
                                        operator_state, reinitialize_heading,
                                        heading_state_buffer,
@@ -484,16 +494,14 @@ class ZMQManager : public InputInterface {
             planner_state.enabled = true;
             std::cout << "[ZMQManager] Planner enabled" << std::endl;
 
-            // Wait for planner to be initialized with timeout (5 seconds)
+            // Wait for planner initialization, not for planner_motion to be
+            // installed as current_motion.  The latter only happens once the
+            // control loop is allowed to run, so waiting on it here deadlocks
+            // the ZMQ startup path before the queued planner command can be
+            // applied.
             auto wait_start = std::chrono::steady_clock::now();
             constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
-            while (planner_state.enabled) {
-              {
-                std::lock_guard<std::mutex> lock(current_motion_mutex);
-                if (current_motion->name == "planner_motion") {
-                  break;
-                }
-              }
+            while (planner_state.enabled && !planner_state.initialized) {
               std::this_thread::sleep_for(std::chrono::milliseconds(100));
               auto elapsed = std::chrono::steady_clock::now() - wait_start;
               if (elapsed > PLANNER_INIT_TIMEOUT) {
@@ -538,17 +546,13 @@ class ZMQManager : public InputInterface {
           std::cout << "[ZMQManager] Planner enabled" << std::endl;
         }
         
-        // Wait for initialization
+        // Wait for the planner's initialization flag.  Do not wait for
+        // current_motion == planner_motion: that transition is performed by
+        // the control loop after this handler returns and processes the
+        // queued planner command.
         auto wait_start = std::chrono::steady_clock::now();
         constexpr auto PLANNER_INIT_TIMEOUT = std::chrono::seconds(5);
-        while (planner_state.enabled) {
-          {
-            std::lock_guard<std::mutex> lock(current_motion_mutex);
-            if (current_motion->name == "planner_motion") {
-              std::cout << "[ZMQManager] motion name is planner_motion" << std::endl;
-              break;
-            }
-          }
+        while (planner_state.enabled && !planner_state.initialized) {
           std::this_thread::sleep_for(std::chrono::milliseconds(100));
           auto elapsed = std::chrono::steady_clock::now() - wait_start;
           if (elapsed > PLANNER_INIT_TIMEOUT) {

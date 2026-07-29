@@ -1,9 +1,7 @@
-# copy from g1_43dof_hist.yaml
 ROBOT_TYPE: 'g1_29dof' # Robot name, "go2", "b2", "b2w", "h1", "go2w", "g1" 
-ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_43dof.xml" # Robot scene, for Sim2Sim
-# ROBOT_SCENE: "gear_sonic/data/robot_model/model_data/g1/scene_29dof_activated3dex.xml"
+ROBOT_SCENE: "gear_sonic/data/robots/g1/scene_29dof.xml"
 
-DOMAIN_ID: 0 # Domain id
+DOMAIN_ID: 2 # Domain id (set to 2 so MuJoCo runs concurrently with Isaac on domain 0)
 # Network Interface, "lo" for simulation and the one with "192.168.123.222" for real robot
 # INTERFACE: "enxe8ea6a9c4e09"
 # INTERFACE: "enxc8a3623c9cb7"
@@ -149,8 +147,6 @@ WeakMotorJointIndex:
 
 NUM_MOTORS: 29
 NUM_JOINTS: 29
-NUM_HAND_MOTORS: 7
-NUM_HAND_JOINTS: 7
 NUM_UPPER_BODY_JOINTS: 17
 
 DEFAULT_DOF_ANGLES: [
@@ -243,10 +239,8 @@ motor_effort_limit_list: [88.0, 88.0, 88.0, 139.0, 50.0, 50.0,
                         88.0, 50.0, 50.0,
                         25.0, 25.0, 25.0, 25.0, 
                         25.0, 5.0, 5.0,
-                        2.45, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7,
                         25.0, 25.0, 25.0, 25.0, 
-                        25.0, 5.0, 5.0,
-                        2.45, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7]
+                        25.0, 5.0, 5.0]
 history_config: {
                   base_ang_vel: 4,
                   projected_gravity: 4,

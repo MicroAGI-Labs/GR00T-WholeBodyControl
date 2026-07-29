@@ -132,7 +132,7 @@ public:
       return has_vr_5point_control_;
     }
 
-    /// @return True if this interface provides Dex3 hand joint targets (7 DOF per hand).
+    /// @return True if this interface provides RH56E2 policy targets (6 + unused).
     virtual bool HasHandJoints() const {
       return has_hand_joints_;
     }
@@ -258,7 +258,7 @@ public:
 
     // =========================================================================
     // Hand max close ratio control (keyboard-controlled via X/C keys)
-    // Controls how much the Dex3 hands can close (0.2 = 80% open, 1.0 = fully closed)
+    // Controls how much the RH56E2 hands can close (0.2 limited, 1.0 full)
     // =========================================================================
     
     // Get the current max close ratio (keyboard-controlled)
@@ -332,7 +332,7 @@ public:
     // ------------------------------------------------------------------
 
     /**
-     * @brief Get 7-DOF Dex3 hand joint positions.
+     * @brief Get RH56E2 policy channels (six close fractions + unused slot).
      * @param is_left  true → left hand, false → right hand.
      * @return {true, joints} if hand joint data is available; {false, defaults} otherwise.
      *         Default left  = {0, 0,  1.75, -1.57, -1.75, -1.57, -1.75}
@@ -460,7 +460,7 @@ protected:
     InputType type_ = InputType::UNKNOWN;             ///< Concrete input source tag.
     std::atomic<bool> has_vr_3point_control_{false};  ///< VR 3-point tracking available.
     std::atomic<bool> has_vr_5point_control_{false};  ///< VR 5-point tracking available.
-    std::atomic<bool> has_hand_joints_{false};        ///< Dex3 hand joint data available.
+    std::atomic<bool> has_hand_joints_{false};        ///< RH56E2 policy data available.
     std::atomic<bool> has_external_token_state_{false}; ///< External token-state vector available.
     std::atomic<bool> has_upper_body_control_{false}; ///< Upper-body 17-DOF targets available.
 
@@ -484,15 +484,15 @@ protected:
     /// Upper-body target joint velocities (17 DOF, rad/s).
     DataBuffer<std::array<double, 17>> upper_body_joint_velocities_;
     
-    /// Left-hand Dex3 joint positions (7 DOF).
+    /// Left RH56E2 close fractions plus unused checkpoint slot.
     DataBuffer<std::array<double, 7>> left_hand_joint_;
-    /// Right-hand Dex3 joint positions (7 DOF).
+    /// Right RH56E2 close fractions plus unused checkpoint slot.
     DataBuffer<std::array<double, 7>> right_hand_joint_;
     
     /// Arbitrary external token-state vector (e.g. latent codes from a remote model).
     DataBuffer<std::vector<double>> external_token_state_;
 
-    /// Keyboard-controlled max close ratio for Dex3 hands.
+    /// Keyboard-controlled maximum close ratio for RH56E2 hands.
     /// Adjusted via keyboard (X = +0.1, C = −0.1), clamped to [0.2, 1.0].
     /// 1.0 = fully closed allowed (default); use --max-close-ratio CLI arg to limit.
     std::atomic<double> max_close_ratio_{1.0};
