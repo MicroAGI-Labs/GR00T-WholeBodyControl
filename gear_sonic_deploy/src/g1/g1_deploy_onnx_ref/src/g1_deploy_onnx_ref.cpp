@@ -279,6 +279,7 @@ class G1Deploy {
     bool actuate_robot_;
     research_atlas::sonic::CommandSafety command_safety_;
     std::uint64_t rejected_command_ticks_ = 0;
+    std::uint64_t measured_state_samples_ = 0;
 
     // =========================================================================
     // External clients and peripheral managers
@@ -2166,7 +2167,7 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       bool no_actuate = false,
-      std::string joint_limiter_profile = "supported-commissioning",
+      std::string joint_limiter_profile = "simulation-parity-v5",
       int command_telemetry_port = 0,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0)
@@ -2685,16 +2686,29 @@ class G1Deploy {
       const std::shared_ptr<const MotorCommand> mc = motor_command_buffer_.GetDataWithTime().data;
       if (mc && low_state &&
           low_state->motor_state().size() >= G1_NUM_MOTOR) {
+        const std::uint64_t measured_state_sequence = measured_state_samples_++;
         std::array<double, G1_NUM_MOTOR> raw_q{};
+        std::array<double, G1_NUM_MOTOR> raw_dq{};
+        std::array<double, G1_NUM_MOTOR> raw_tau_ff{};
+        std::array<double, G1_NUM_MOTOR> kp{};
+        std::array<double, G1_NUM_MOTOR> kd{};
         std::array<double, G1_NUM_MOTOR> measured_q{};
         std::array<double, G1_NUM_MOTOR> measured_dq{};
         for (std::size_t i = 0; i < G1_NUM_MOTOR; ++i) {
           raw_q[i] = mc->q_target.at(i);
+          raw_dq[i] = mc->dq_target.at(i);
+          raw_tau_ff[i] = mc->tau_ff.at(i);
+          kp[i] = mc->kp.at(i);
+          kd[i] = mc->kd.at(i);
           measured_q[i] = low_state->motor_state()[i].q();
           measured_dq[i] = low_state->motor_state()[i].dq();
         }
+        // The torque limiter needs the whole servo command, not just the
+        // position: it reconstructs the torque those five fields imply before it
+        // can decide whether the torque is in bounds.
         const auto final_command = command_safety_.Step(
-            raw_q, measured_q, measured_dq, !operator_state.stop);
+            raw_q, raw_dq, raw_tau_ff, kp, kd, measured_q, measured_dq,
+            !operator_state.stop);
         if (!final_command.ready) {
           if ((rejected_command_ticks_++ % 500) == 0) {
             std::cerr << "[research-atlas] final command rejected (invalid "
@@ -2706,22 +2720,21 @@ class G1Deploy {
 
         for (size_t i = 0; i < G1_NUM_MOTOR; i++) {
           dds_low_command.motor_cmd().at(i).mode() = 1; // 1:Enable, 0:Disable
-          const bool limiter_enabled = command_safety_.limiter_enabled();
-          const bool local_damping =
-              limiter_enabled && final_command.local_damping[i];
-          dds_low_command.motor_cmd().at(i).tau() =
-              limiter_enabled ? 0.0 : mc->tau_ff.at(i);
+          // Publish the emitted triple as it came back. The kinematic limiter
+          // approved only a position, so zeroing dq and tau_ff was the safe
+          // completion of a partial answer. The torque limiter emits all three
+          // deliberately: together they reconstruct at the servo exactly the
+          // torque it checked, and zeroing two of them would put a different
+          // torque on the wire than the one that passed.
           dds_low_command.motor_cmd().at(i).q() = final_command.command_q[i];
-          dds_low_command.motor_cmd().at(i).dq() =
-              limiter_enabled ? 0.0 : mc->dq_target.at(i);
-          dds_low_command.motor_cmd().at(i).kp() =
-              local_damping ? 0.0 : mc->kp.at(i);
-          dds_low_command.motor_cmd().at(i).kd() =
-              local_damping ? 8.0 : mc->kd.at(i);
+          dds_low_command.motor_cmd().at(i).dq() = final_command.command_dq[i];
+          dds_low_command.motor_cmd().at(i).tau() = final_command.command_tau_ff[i];
+          dds_low_command.motor_cmd().at(i).kp() = final_command.command_kp[i];
+          dds_low_command.motor_cmd().at(i).kd() = final_command.command_kd[i];
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-        command_safety_.Publish(final_command);
+        command_safety_.Publish(final_command, measured_state_sequence);
         if (actuate_robot_) {
           lowcmd_publisher_->Write(dds_low_command);
         }
@@ -4175,8 +4188,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
     std::cout << "  --no-actuate: read LowState and run Sonic without constructing command publishers" << std::endl;
-    std::cout << "  --joint-limiter-profile <upstream-direct|simulation|supported-commissioning>" << std::endl;
-    std::cout << "  --command-telemetry-port <port>: publish exact final would-send q" << std::endl;
+    std::cout << "  --joint-limiter-profile <upstream-direct|simulation-parity-v5>" << std::endl;
+    std::cout << "  --command-telemetry-port <port>: publish schema-v3 final hybrid would-send command" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
@@ -4229,7 +4242,7 @@ int main(int argc, char const* argv[]) {
   bool plannerFp16 = false;
   bool policyFp16 = false;
   bool noActuate = false;
-  std::string jointLimiterProfile = "supported-commissioning";
+  std::string jointLimiterProfile = "simulation-parity-v5";
   int commandTelemetryPort = 0;
   std::string logsDir = "";
   bool enableCsvLogs = false;
@@ -4256,8 +4269,7 @@ int main(int argc, char const* argv[]) {
       }
       jointLimiterProfile = argv[++i];
       if (jointLimiterProfile != "upstream-direct" &&
-          jointLimiterProfile != "simulation" &&
-          jointLimiterProfile != "supported-commissioning") {
+          jointLimiterProfile != "simulation-parity-v5") {
         throw std::runtime_error("invalid --joint-limiter-profile");
       }
     } else if (std::string(argv[i]) == "--command-telemetry-port") {
